@@ -42,11 +42,11 @@ static BOOL const kPPDebugLabel = NO;
 // =====================================================================
 
 static UILabel        *gDebugLabel;
-static PPCAMLDocument *gDoc;            // poster on cover-sheet window (animates with swipe)
+static NSMutableArray<PPCAMLDocument *> *gDocs;       // cover-sheet docs (Background/Floating/Foreground)
 static CALayer        *gPosterLayer;     // our container CALayer (in window.layer)
 static __weak UIWindow *gHostWindow;     // SBCoverSheetWindow (host of poster layer)
 static __weak UIView  *gCoverSheetView;  // the sliding view (progress source only)
-static PPCAMLDocument *gHomeDoc;         // poster on home-screen window (frozen at Unlock)
+static NSMutableArray<PPCAMLDocument *> *gHomeDocs;   // home-screen docs (frozen at Unlock)
 static CALayer        *gHomePosterLayer; // home-screen container CALayer
 static __weak UIWindow *gHomeHostWindow; // SBHomeScreenWindow / app's main window
 static CADisplayLink  *gDisplayLink;
@@ -96,6 +96,7 @@ static NSString *PPFindFirstWallpaperBundle(void) {
     return nil;
 }
 
+__attribute__((unused))
 static NSString *PPFindFloatingCA(NSString *wallpaperBundle) {
     NSError *err = nil;
     NSArray *items = [[NSFileManager defaultManager]
@@ -112,6 +113,51 @@ static NSString *PPFindFloatingCA(NSString *wallpaperBundle) {
         }
     }
     return nil;
+}
+
+// PosterBoard wallpapers can ship up to three .ca bundles inside a
+// .wallpaper directory:
+//
+//   *_Background-WxH...ca   <- the bottom-most, often the actual content
+//   *_Floating-WxH...ca     <- the swipe-animated overlay (chest/lid/...)
+//   *_Foreground-WxH...ca   <- a top decoration layer
+//
+// In many community .tendies (Dark, PurpleShapes, MarioGalaxy...) the
+// Floating bundle is empty and the visible content lives entirely in
+// Background. So we MUST parse all three and stack them, otherwise these
+// wallpapers render as a black screen.
+//
+// Returns paths in z-order (back-to-front): Background, Floating, Foreground.
+// Any missing bundle is simply skipped.
+static NSArray<NSString *> *PPFindAllCABundles(NSString *wallpaperBundle) {
+    NSError *err = nil;
+    NSArray *items = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:wallpaperBundle error:&err];
+    if (!items) return @[];
+
+    NSMutableArray<NSString *> *result = [NSMutableArray array];
+    NSArray *order = @[@"Background", @"Floating", @"Foreground"];
+    NSMutableSet *taken = [NSMutableSet set];
+
+    for (NSString *kind in order) {
+        for (NSString *name in items) {
+            if (![name hasSuffix:@".ca"]) continue;
+            if (![name containsString:kind]) continue;
+            [result addObject:[wallpaperBundle stringByAppendingPathComponent:name]];
+            [taken addObject:name];
+            break;
+        }
+    }
+    // If we matched none of the three known kinds, fall back to any *.ca
+    // we can find so completely custom layouts still work.
+    if (result.count == 0) {
+        for (NSString *name in items) {
+            if ([name hasSuffix:@".ca"] && ![taken containsObject:name]) {
+                [result addObject:[wallpaperBundle stringByAppendingPathComponent:name]];
+            }
+        }
+    }
+    return result;
 }
 
 // =====================================================================
@@ -151,10 +197,13 @@ static void PPInstallDebugLabel(UIView *host) {
 // State resolution
 // =====================================================================
 
-static void PPResolveStates(PPCAMLDocument *doc) {
+// Picks state names to interpolate between. Looks at every doc in the
+// passed-in list (cover-sheet stack OR home stack) and chooses from the
+// first one that has at least 2 states.
+static void PPResolveStatesFromDocs(NSArray<PPCAMLDocument *> *docs) {
     gFromState = nil;
     gToState   = nil;
-    if (!doc) return;
+    if (docs.count == 0) return;
 
     NSArray *prefer = @[
         @[@"Locked",  @"Unlock"],
@@ -162,17 +211,28 @@ static void PPResolveStates(PPCAMLDocument *doc) {
         @[@"Sleep",   @"Wake"],
         @[@"Default", @"Activated"],
     ];
-    for (NSArray *pair in prefer) {
-        if (doc.states[pair[0]] && doc.states[pair[1]]) {
-            gFromState = pair[0];
-            gToState   = pair[1];
-            return;
+    for (PPCAMLDocument *d in docs) {
+        for (NSArray *pair in prefer) {
+            if (d.states[pair[0]] && d.states[pair[1]]) {
+                gFromState = pair[0];
+                gToState   = pair[1];
+                return;
+            }
         }
     }
+    for (PPCAMLDocument *d in docs) {
+        NSArray *names = d.stateOrder;
+        if (names.count >= 2) { gFromState = names[0]; gToState = names[1]; return; }
+        if (names.count == 1) { gFromState = nil; gToState = names[0]; return; }
+    }
+}
 
-    NSArray *names = doc.stateOrder;
-    if (names.count >= 2) { gFromState = names[0]; gToState = names[1]; }
-    else if (names.count == 1) { gFromState = nil; gToState = names[0]; }
+// Back-compat single-doc shim — used nowhere now but kept in case old
+// call sites remain.
+__attribute__((unused))
+static void PPResolveStates(PPCAMLDocument *doc) {
+    if (!doc) return;
+    PPResolveStatesFromDocs(@[doc]);
 }
 
 static void PPApplyProgress(CGFloat progress) {
@@ -188,18 +248,20 @@ static void PPApplyProgress(CGFloat progress) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
 
-    if (gDoc && gToState) {
-        if (gFromState) {
-            [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
-        } else {
-            [gDoc applyState:gToState progress:progress];
+    if (gToState) {
+        for (PPCAMLDocument *d in gDocs) {
+            if (gFromState) {
+                [d applyTransitionFromState:gFromState toState:gToState progress:progress];
+            } else {
+                [d applyState:gToState progress:progress];
+            }
         }
-    }
-    if (gHomeDoc && gToState) {
-        if (gFromState) {
-            [gHomeDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
-        } else {
-            [gHomeDoc applyState:gToState progress:progress];
+        for (PPCAMLDocument *d in gHomeDocs) {
+            if (gFromState) {
+                [d applyTransitionFromState:gFromState toState:gToState progress:progress];
+            } else {
+                [d applyState:gToState progress:progress];
+            }
         }
     }
 
@@ -220,19 +282,19 @@ static void PPApplyProgress(CGFloat progress) {
     // overriding both to 1.0 we guarantee identical poses across the
     // hand-off.
     BOOL fullyUnlocked = (progress >= 0.99);
-    if (fullyUnlocked) {
-        if (gDoc && gToState) {
+    if (fullyUnlocked && gToState) {
+        for (PPCAMLDocument *d in gDocs) {
             if (gFromState) {
-                [gDoc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+                [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
             } else {
-                [gDoc applyState:gToState progress:1.0];
+                [d applyState:gToState progress:1.0];
             }
         }
-        if (gHomeDoc && gToState) {
+        for (PPCAMLDocument *d in gHomeDocs) {
             if (gFromState) {
-                [gHomeDoc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+                [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
             } else {
-                [gHomeDoc applyState:gToState progress:1.0];
+                [d applyState:gToState progress:1.0];
             }
         }
     }
@@ -269,6 +331,51 @@ static CALayer *PPFindFloatingLayer(CALayer *root) {
     return nil;
 }
 
+// Builds a single CALayer subtree from one CAML file. Returns the
+// already-scaled layer ready to add as a sublayer of `container`, plus
+// (out) the parsed PPCAMLDocument so the caller can hold on to it for
+// state interpolation.
+//
+// `winSize` is the size of the host window in points; we scale-fit the
+// CAML's natural canvas (e.g. 390x844) to that.
+static CALayer *PPBuildScaledLayerFromCAML(NSString *caPath,
+                                           CGSize winSize,
+                                           PPCAMLDocument **outDoc) {
+    if (!caPath) { if (outDoc) *outDoc = nil; return nil; }
+    NSString *camlPath   = [caPath stringByAppendingPathComponent:@"main.caml"];
+    NSString *assetsPath = [caPath stringByAppendingPathComponent:@"assets"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) {
+        if (outDoc) *outDoc = nil;
+        return nil;
+    }
+    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
+    if (!doc || !doc.rootLayer) {
+        if (outDoc) *outDoc = nil;
+        return nil;
+    }
+
+    // Prefer the inner Floating sub-tree if present (iPad-canvas-with-
+    // iPhone-Floating layout), else use the doc's root.
+    CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
+    if (visibleRoot != doc.rootLayer) [visibleRoot removeFromSuperlayer];
+
+    CGRect rb = visibleRoot.bounds;
+    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+    CGFloat sx = winSize.width  / rb.size.width;
+    CGFloat sy = winSize.height / rb.size.height;
+    CGFloat s  = MAX(sx, sy);
+
+    visibleRoot.anchorPoint = CGPointMake(0.5, 0.5);
+    visibleRoot.position    = CGPointMake(winSize.width  / 2.0,
+                                          winSize.height / 2.0);
+    visibleRoot.transform   = CATransform3DMakeScale(s, s, 1.0);
+
+    [doc captureBaseValues];
+
+    if (outDoc) *outDoc = doc;
+    return visibleRoot;
+}
+
 static void PPInstallPosterIntoWindow(UIWindow *window) {
     if (!window) return;
     gHostWindow = window;
@@ -279,21 +386,11 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     }
 
     NSString *bundle  = PPFindFirstWallpaperBundle();
-    NSString *caPath  = bundle ? PPFindFloatingCA(bundle) : nil;
-    NSString *camlPath  = caPath ? [caPath stringByAppendingPathComponent:@"main.caml"] : nil;
-    NSString *assetsPath = caPath ? [caPath stringByAppendingPathComponent:@"assets"] : nil;
-
-    if (!camlPath || ![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) {
-        PPSetDebug(@"no caml at %@", camlPath ?: @"(nil)");
+    NSArray<NSString *> *caBundles = bundle ? PPFindAllCABundles(bundle) : @[];
+    if (caBundles.count == 0) {
+        PPSetDebug(@"no .ca bundles in %@", bundle ?: @"(no wallpaper)");
         return;
     }
-
-    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
-    if (!doc || !doc.rootLayer) {
-        PPSetDebug(@"caml parse failed");
-        return;
-    }
-    gDoc = doc;
 
     // Container fills the WINDOW. zPosition = -1 puts it behind cover-sheet
     // sibling views (which sit at default zPosition 0) but in front of any
@@ -302,9 +399,7 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     // geometryFlipped = YES compensates for UIWindow.layer's own
     // geometryFlipped (which is YES under UIKit). Setting it here gives
     // our subtree normal UIKit coordinates (origin top-left), without
-    // resorting to a Y scale-flip on the root layer. A Y scale-flip
-    // visually inverts but causes (a) the top edge to be clipped by
-    // its parent and (b) child rotations/anchors to read mirrored.
+    // resorting to a Y scale-flip on the root layer.
     CALayer *container = [CALayer layer];
     container.name = @"PocketPlayerLayer";
     container.bounds = window.bounds;
@@ -314,47 +409,44 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     container.masksToBounds = NO;
     container.geometryFlipped = YES;
 
-    // If the CAML wraps an iPhone-sized "Floating" sub-tree inside a
-    // larger (often iPad) canvas, prefer the inner Floating layer as
-    // our visible root. Authors put it at offset positions (e.g. 967,216
-    // inside a 3176x3176 canvas) which would render off-screen on a 6s
-    // if we used the outer root layer.
-    CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
-    if (visibleRoot != doc.rootLayer) {
-        // Detach from its iPad-canvas parent so our scaling math sees
-        // the inner bounds (e.g. 414x736) as the full sheet.
-        [visibleRoot removeFromSuperlayer];
+    // Stack all .ca bundles in z-order: Background, Floating, Foreground.
+    // Each becomes its own sublayer of `container`. Empty bundles are
+    // gracefully skipped.
+    NSMutableArray<PPCAMLDocument *> *docs = [NSMutableArray array];
+    NSMutableString *kindList = [NSMutableString string];
+    for (NSString *caPath in caBundles) {
+        PPCAMLDocument *doc = nil;
+        CALayer *l = PPBuildScaledLayerFromCAML(caPath, window.bounds.size, &doc);
+        if (!l) continue;
+        [container addSublayer:l];
+        [docs addObject:doc];
+        if (kindList.length) [kindList appendString:@"+"];
+        [kindList appendString:[caPath lastPathComponent]];
     }
+    if (docs.count == 0) {
+        PPSetDebug(@"all .ca parses failed");
+        return;
+    }
+    gDocs = docs;
 
-    CGRect rb = visibleRoot.bounds;
-    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
-    CGFloat sx = window.bounds.size.width  / rb.size.width;
-    CGFloat sy = window.bounds.size.height / rb.size.height;
-    CGFloat s  = MAX(sx, sy);
-
-    visibleRoot.anchorPoint = CGPointMake(0.5, 0.5);
-    visibleRoot.position    = CGPointMake(window.bounds.size.width  / 2.0,
-                                          window.bounds.size.height / 2.0);
-    visibleRoot.transform   = CATransform3DMakeScale(s, s, 1.0);
-
-    [container addSublayer:visibleRoot];
     [window.layer addSublayer:container];
     gPosterLayer = container;
 
-    [doc captureBaseValues];
-    PPResolveStates(doc);
+    PPResolveStatesFromDocs(docs);
 
-    NSArray *names = doc.stateOrder;
-    NSString *summary = [NSString stringWithFormat:@"states=[%@] from=%@ to=%@ count=%lu",
-        [names componentsJoinedByString:@","], gFromState ?: @"-", gToState ?: @"-",
-        (unsigned long)names.count];
+    NSMutableString *summary = [NSMutableString string];
+    for (NSUInteger i = 0; i < docs.count; i++) {
+        if (i) [summary appendString:@" | "];
+        [summary appendFormat:@"doc%lu states=[%@]", (unsigned long)i,
+            [docs[i].stateOrder componentsJoinedByString:@","]];
+    }
+    [summary appendFormat:@" | from=%@ to=%@", gFromState ?: @"-", gToState ?: @"-"];
     [summary writeToFile:@"/var/mobile/pocketplayer-states.log"
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     PPApplyProgress(0.0);
-    PPSetDebug(@"ready %@ st=%lu hostWin=%@",
-        [camlPath lastPathComponent],
-        (unsigned long)names.count,
+    PPSetDebug(@"ready %lu .ca hostWin=%@",
+        (unsigned long)docs.count,
         NSStringFromClass([window class]));
 }
 
@@ -419,14 +511,8 @@ static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
     }
 
     NSString *bundle  = PPFindFirstWallpaperBundle();
-    NSString *caPath  = bundle ? PPFindFloatingCA(bundle) : nil;
-    NSString *camlPath  = caPath ? [caPath stringByAppendingPathComponent:@"main.caml"] : nil;
-    NSString *assetsPath = caPath ? [caPath stringByAppendingPathComponent:@"assets"] : nil;
-    if (!camlPath || ![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) return;
-
-    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
-    if (!doc || !doc.rootLayer) return;
-    gHomeDoc = doc;
+    NSArray<NSString *> *caBundles = bundle ? PPFindAllCABundles(bundle) : @[];
+    if (caBundles.count == 0) return;
 
     CALayer *container = [CALayer layer];
     container.name = @"PocketPlayerHomeLayer";
@@ -439,33 +525,37 @@ static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
     container.masksToBounds = NO;
     container.geometryFlipped = YES;
 
-    CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
-    if (visibleRoot != doc.rootLayer) {
-        [visibleRoot removeFromSuperlayer];
+    NSMutableArray<PPCAMLDocument *> *docs = [NSMutableArray array];
+    for (NSString *caPath in caBundles) {
+        PPCAMLDocument *doc = nil;
+        CALayer *l = PPBuildScaledLayerFromCAML(caPath, window.bounds.size, &doc);
+        if (!l) continue;
+        [container addSublayer:l];
+        [docs addObject:doc];
     }
+    if (docs.count == 0) return;
+    gHomeDocs = docs;
 
-    CGRect rb = visibleRoot.bounds;
-    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
-    CGFloat sx = window.bounds.size.width  / rb.size.width;
-    CGFloat sy = window.bounds.size.height / rb.size.height;
-    CGFloat s  = MAX(sx, sy);
-
-    visibleRoot.anchorPoint = CGPointMake(0.5, 0.5);
-    visibleRoot.position    = CGPointMake(window.bounds.size.width  / 2.0,
-                                          window.bounds.size.height / 2.0);
-    visibleRoot.transform   = CATransform3DMakeScale(s, s, 1.0);
-
-    [container addSublayer:visibleRoot];
     [window.layer addSublayer:container];
     gHomePosterLayer = container;
 
-    // Capture base values so state interpolation has anchor points.
-    // Start at Locked (progress=0); the gesture will drive it open.
-    [doc captureBaseValues];
-    if (gFromState && gToState) {
-        [doc applyTransitionFromState:gFromState toState:gToState progress:gLastProgress];
-    } else if (gToState) {
-        [doc applyState:gToState progress:gLastProgress];
+    // Make sure state names are resolved using whichever stack first
+    // declares them (cover-sheet stack wins, but if it's empty the home
+    // stack provides them).
+    if (!gFromState && !gToState) {
+        PPResolveStatesFromDocs(docs);
+    }
+
+    // Apply current progress so a re-installed home poster catches up
+    // to whatever the gesture is doing right now.
+    if (gToState) {
+        for (PPCAMLDocument *d in docs) {
+            if (gFromState) {
+                [d applyTransitionFromState:gFromState toState:gToState progress:gLastProgress];
+            } else {
+                [d applyState:gToState progress:gLastProgress];
+            }
+        }
     }
 }
 
@@ -616,22 +706,24 @@ static void PPHideAllSystemWallpapers(void) {
         if (hw) PPInstallPosterIntoHomeWindow(hw);
     }
 
-    // Keep poster sized to the window on rotation.
+    // Keep poster sized to the window on rotation. We scale every direct
+    // child of `container` (each is a CAML root from one .ca bundle) to
+    // fit the new size.
     UIWindow *win = gHostWindow;
     if (gPosterLayer && win && gPosterLayer.superlayer == win.layer) {
         if (!CGSizeEqualToSize(gPosterLayer.bounds.size, win.bounds.size)) {
             gPosterLayer.bounds = win.bounds;
             gPosterLayer.position = CGPointMake(win.bounds.size.width / 2.0,
                                                  win.bounds.size.height / 2.0);
-            if (gDoc.rootLayer) {
-                CGRect rb = gDoc.rootLayer.bounds;
+            for (CALayer *root in gPosterLayer.sublayers) {
+                CGRect rb = root.bounds;
                 if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
                 CGFloat sx = win.bounds.size.width  / rb.size.width;
                 CGFloat sy = win.bounds.size.height / rb.size.height;
                 CGFloat s  = MAX(sx, sy);
-                gDoc.rootLayer.position = CGPointMake(win.bounds.size.width  / 2.0,
-                                                      win.bounds.size.height / 2.0);
-                gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+                root.position = CGPointMake(win.bounds.size.width  / 2.0,
+                                            win.bounds.size.height / 2.0);
+                root.transform = CATransform3DMakeScale(s, s, 1.0);
             }
         }
     }
@@ -643,15 +735,15 @@ static void PPHideAllSystemWallpapers(void) {
             gHomePosterLayer.bounds = hwin.bounds;
             gHomePosterLayer.position = CGPointMake(hwin.bounds.size.width / 2.0,
                                                     hwin.bounds.size.height / 2.0);
-            if (gHomeDoc.rootLayer) {
-                CGRect rb = gHomeDoc.rootLayer.bounds;
+            for (CALayer *root in gHomePosterLayer.sublayers) {
+                CGRect rb = root.bounds;
                 if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
                 CGFloat sx = hwin.bounds.size.width  / rb.size.width;
                 CGFloat sy = hwin.bounds.size.height / rb.size.height;
                 CGFloat s  = MAX(sx, sy);
-                gHomeDoc.rootLayer.position = CGPointMake(hwin.bounds.size.width  / 2.0,
-                                                          hwin.bounds.size.height / 2.0);
-                gHomeDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+                root.position = CGPointMake(hwin.bounds.size.width  / 2.0,
+                                            hwin.bounds.size.height / 2.0);
+                root.transform = CATransform3DMakeScale(s, s, 1.0);
             }
         }
     }
