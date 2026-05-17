@@ -74,25 +74,26 @@ export PATH="$THEOS/bin:$PATH"
 SDK_DIR="$THEOS/sdks"
 mkdir -p "$SDK_DIR"
 
-if ls "$SDK_DIR"/iPhoneOS15*.sdk >/dev/null 2>&1; then
-  say "iPhoneOS15 SDK already present"
+if ls -d "$SDK_DIR"/iPhoneOS15*.sdk >/dev/null 2>&1; then
+  say "iPhoneOS15 SDK already present: $(ls -d "$SDK_DIR"/iPhoneOS15*.sdk | head -1)"
 else
-  say "Downloading iPhoneOS15.5 SDK"
-  curl -L -o /tmp/ios15sdk.tar.xz \
-    https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
-  # The repo is huge; instead pull just the SDK we need via sparse checkout.
-  rm -f /tmp/ios15sdk.tar.xz
+  say "Fetching theos/sdks (full clone, ~65 MiB) to find an iPhoneOS15 SDK"
   TMP=$(mktemp -d)
-  git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$TMP/sdks"
-  git -C "$TMP/sdks" sparse-checkout set iPhoneOS15.5.sdk
-  if [ -d "$TMP/sdks/iPhoneOS15.5.sdk" ]; then
-    cp -R "$TMP/sdks/iPhoneOS15.5.sdk" "$SDK_DIR/"
-  else
-    warn "Could not fetch iPhoneOS15.5.sdk via sparse checkout — falling back to full clone"
-    git clone --depth=1 https://github.com/theos/sdks.git "$TMP/sdks_full"
-    cp -R "$TMP/sdks_full/iPhoneOS15.5.sdk" "$SDK_DIR/" || die "SDK copy failed"
+  trap "rm -rf $TMP" EXIT
+  git clone --depth=1 https://github.com/theos/sdks.git "$TMP/sdks" || die "git clone of theos/sdks failed"
+
+  FOUND_SDK="$(ls -d "$TMP/sdks"/iPhoneOS15*.sdk 2>/dev/null | sort -V | tail -1)"
+  if [ -z "$FOUND_SDK" ]; then
+    warn "theos/sdks has no iPhoneOS15*.sdk — falling back to xybp888/iOS-SDKs"
+    rm -rf "$TMP/sdks"
+    git clone --depth=1 https://github.com/xybp888/iOS-SDKs.git "$TMP/sdks" \
+      || die "Fallback clone failed; install an iOS 15 SDK manually into $SDK_DIR"
+    FOUND_SDK="$(ls -d "$TMP/sdks"/iPhoneOS15*.sdk 2>/dev/null | sort -V | tail -1)"
   fi
-  rm -rf "$TMP"
+  [ -n "$FOUND_SDK" ] || die "No iPhoneOS15 SDK found in any source"
+
+  say "Installing $(basename "$FOUND_SDK") -> $SDK_DIR"
+  cp -R "$FOUND_SDK" "$SDK_DIR/" || die "SDK copy failed"
 fi
 
 say "Done. Reload your shell (or 'source ~/.bashrc') so THEOS is exported."
