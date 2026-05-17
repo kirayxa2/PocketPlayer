@@ -1,0 +1,13 @@
+# Theos build artifacts
+.theos/
+packages/
+obj/
+*.dylib
+*.deb
+
+# macOS / editors
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
