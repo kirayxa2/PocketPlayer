@@ -545,8 +545,31 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
             newEm.position = pInRoot;
         }
 
-        // 7) Add to root, set beginTime AFTER add (in layer time-space).
-        [root addSublayer:newEm];
+        // 7) Pick the host layer.
+        //    PROVED: test-emitter on gCoverSheetView.layer DOES emit
+        //    on the lockscreen. Mario's emitter on gPosterLayer
+        //    (which lives on the cover-sheet WINDOW) does NOT —
+        //    because SpringBoard freezes layer-time on the cover-
+        //    sheet window during locked-presented state, but NOT
+        //    on the cover-sheet view itself.
+        //    So we attach emitters to the cover-sheet view's layer
+        //    when we have one. They'll slide up with the unlock
+        //    swipe (acceptable — the chest does too via the home
+        //    poster), but at least they're VISIBLE.
+        CALayer *emitterHost = root;
+        if (gCoverSheetView && gCoverSheetView.layer) {
+            emitterHost = gCoverSheetView.layer;
+        }
+
+        // Re-translate position into emitterHost's coordinate space.
+        if (emitterHost != root && window) {
+            CGPoint inWin = [root convertPoint:newEm.position toLayer:window.layer];
+            CGPoint inHost = [emitterHost convertPoint:inWin fromLayer:window.layer];
+            newEm.position = inHost;
+            newEm.zPosition = 9000;
+        }
+
+        [emitterHost addSublayer:newEm];
         newEm.beginTime = [newEm convertTime:CACurrentMediaTime() fromLayer:nil];
 
         // 8) Remove the old emitter completely so we don't have two.
