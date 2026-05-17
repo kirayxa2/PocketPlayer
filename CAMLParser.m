@@ -92,6 +92,84 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
     [layer setValue:target forKeyPath:keyPath];
 }
 
+// =====================================================================
+// Animation value parsing
+// =====================================================================
+//
+// CAML <animation>'s <values> children carry one of: <integer>, <real>,
+// <point>, <size>, <color>, <transform>. We boil all of these down to
+// either NSNumber (scalars) or NSValue (CG*) the way Core Animation
+// expects them when handed to a CABasicAnimation / CAKeyframeAnimation.
+//
+// keyPath "transform.rotation.*", "transform.scale*", "opacity",
+// "position.x", "position.y", "bounds.size.*" etc are all scalar.
+// "position" is CGPoint, "bounds" is CGRect, "bounds.size" is CGSize.
+// We don't try to be exhaustive - whatever we don't recognize, we
+// pass through as a raw scalar (val.doubleValue) which works for the
+// vast majority of community CAMLs.
+
+// Used while parsing a single <values>/<keyTimes> child element.
+static id PPCoerceAnimationValue(NSString *elementName,
+                                 NSDictionary<NSString *, NSString *> *attrs)
+{
+    NSString *v = attrs[@"value"];
+    if (!v.length) return nil;
+
+    if ([elementName isEqualToString:@"integer"] ||
+        [elementName isEqualToString:@"real"] ||
+        [elementName isEqualToString:@"number"]) {
+        return @(v.doubleValue);
+    }
+    if ([elementName isEqualToString:@"point"]) {
+        return [NSValue valueWithCGPoint:PPParsePoint(v)];
+    }
+    if ([elementName isEqualToString:@"size"]) {
+        NSArray<NSNumber *> *n = PPParseNumberList(v);
+        if (n.count >= 2) return [NSValue valueWithCGSize:CGSizeMake(n[0].doubleValue, n[1].doubleValue)];
+        return nil;
+    }
+    if ([elementName isEqualToString:@"rect"]) {
+        return [NSValue valueWithCGRect:PPParseRect(v)];
+    }
+    if ([elementName isEqualToString:@"color"]) {
+        UIColor *c = PPParseColor(v);
+        return c ? (id)c.CGColor : nil;
+    }
+    // Unknown wrapper - try as a scalar.
+    return @(v.doubleValue);
+}
+
+// Map a CAML "timingFunction" attribute to a CAMediaTimingFunction.
+//
+// Common values: "easeInEaseOut", "linear", "easeIn", "easeOut",
+// "default", or four floats "0.5 0 0.5 1" for a custom cubic Bezier.
+// This is what authoring tools like CAPlayground emit.
+static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
+    if (!spec.length) return nil;
+    NSString *s = [spec stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+    // Named?
+    if ([s isEqualToString:@"linear"])
+        return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    if ([s isEqualToString:@"easeIn"])
+        return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseIn];
+    if ([s isEqualToString:@"easeOut"])
+        return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    if ([s isEqualToString:@"easeInEaseOut"] ||
+        [s isEqualToString:@"easeInOut"])
+        return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    if ([s isEqualToString:@"default"])
+        return [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionDefault];
+
+    // Four floats?
+    NSArray<NSNumber *> *n = PPParseNumberList(s);
+    if (n.count >= 4) {
+        float c[4] = {n[0].floatValue, n[1].floatValue, n[2].floatValue, n[3].floatValue};
+        return [CAMediaTimingFunction functionWithControlPoints:c[0] :c[1] :c[2] :c[3]];
+    }
+    return nil;
+}
+
 #pragma mark - Models
 
 @implementation PPCAMLStateValue
@@ -198,6 +276,48 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
 
 @end
 
+#pragma mark - Pending animation (in-flight while parsing one <animation>)
+
+// While we're between <animation ...> and </animation>, we accumulate
+// state into one of these. On close we materialize a real CABasicAnimation
+// or CAKeyframeAnimation and addAnimation:forKey: on the owning layer.
+@interface PPPendingAnim : NSObject
+@property (nonatomic, copy)   NSString *type;            // "CABasicAnimation", "CAKeyframeAnimation", ...
+@property (nonatomic, copy)   NSString *keyPath;
+@property (nonatomic, assign) double duration;
+@property (nonatomic, assign) double beginTime;
+@property (nonatomic, assign) BOOL hasBeginTime;
+@property (nonatomic, assign) BOOL autoreverses;
+@property (nonatomic, assign) BOOL removedOnCompletion;
+@property (nonatomic, assign) BOOL hasRemovedOnCompletion;
+@property (nonatomic, assign) double speed;
+@property (nonatomic, assign) BOOL hasSpeed;
+@property (nonatomic, assign) double repeatCount;
+@property (nonatomic, assign) BOOL repeatInf;
+@property (nonatomic, copy)   NSString *fillMode;
+@property (nonatomic, copy)   NSString *calculationMode;
+@property (nonatomic, copy)   NSString *timingFunctionSpec;
+@property (nonatomic, copy)   NSString *fromValueLiteral;       // when given as attribute
+@property (nonatomic, copy)   NSString *toValueLiteral;         // when given as attribute
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *keyTimes;
+@property (nonatomic, strong) NSMutableArray *values;           // NSNumber/NSValue/CGColorRef-as-id
+@property (nonatomic, strong) NSMutableArray *timingFuncs;      // CAMediaTimingFunction, optional
+// Which child list we're currently appending to.
+@property (nonatomic, copy)   NSString *currentList;            // "values" / "keyTimes" / nil
+@end
+
+@implementation PPPendingAnim
+- (instancetype)init {
+    if ((self = [super init])) {
+        _duration = 0.25;
+        _speed = 1.0;
+        _repeatCount = 0;
+        _removedOnCompletion = YES;
+    }
+    return self;
+}
+@end
+
 #pragma mark - Parser
 
 @interface PPCAMLParser () <NSXMLParserDelegate>
@@ -214,6 +334,17 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
 @property (nonatomic, strong) PPCAMLState *currentState;
 @property (nonatomic, strong) NSMutableArray<PPCAMLStateValue *> *currentStateValues;
 @property (nonatomic, strong) PPCAMLStateValue *currentStateValue; // current LKStateSetValue being filled
+
+// Animation block parsing
+//
+// Depth-counted because <animations> can be nested via grouping (rare,
+// but a grouped CAAnimationGroup can technically contain another
+// <animations>). We only treat the OUTERMOST animations block as
+// "real" and let inner ones contribute their <animation> entries to
+// the same layer.
+@property (nonatomic, assign) NSInteger animationsDepth;
+@property (nonatomic, strong) PPPendingAnim *currentAnim;
+@property (nonatomic, assign) NSInteger animKeyCounter;          // for autogen anim key names
 @end
 
 @implementation PPCAMLParser
@@ -280,8 +411,134 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
                [key isEqualToString:@"transform.scale.x"] ||
                [key isEqualToString:@"transform.scale.y"]) {
         [layer setValue:@(val.doubleValue) forKeyPath:key];
+    } else if ([key isEqualToString:@"transform"]) {
+        // Handle the textual form authoring tools emit:
+        //
+        //   transform="scale(3, 3, 1)"
+        //   transform="rotate(45deg)"
+        //   transform="translate(10, 20)"
+        //   transform="rotate(0deg) rotate(0deg, 0, 1, 0) rotate(0deg, 1, 0, 0)"
+        //
+        // We compose simple single-call cases. Multi-op chained forms
+        // are supported left-to-right (CAML emits them already in
+        // the desired application order).
+        //
+        // Empty value => identity (we leave the layer alone).
+        NSString *trimmed = [val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!trimmed.length) return;
+
+        CATransform3D acc = CATransform3DIdentity;
+        BOOL anyOp = NO;
+        // Walk through "name(args)" tokens.
+        NSScanner *sc = [NSScanner scannerWithString:trimmed];
+        sc.charactersToBeSkipped = [NSCharacterSet whitespaceCharacterSet];
+        while (!sc.isAtEnd) {
+            NSString *fn = nil;
+            if (![sc scanUpToString:@"(" intoString:&fn]) break;
+            if (![sc scanString:@"(" intoString:NULL]) break;
+            NSString *argstr = nil;
+            if (![sc scanUpToString:@")" intoString:&argstr]) break;
+            [sc scanString:@")" intoString:NULL];
+
+            fn = [fn stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            NSArray<NSNumber *> *args = PPParseNumberList(argstr);
+            // Accept "Xdeg" as just X for rotate; PPParseNumberList
+            // already drops the trailing "deg" because doubleValue
+            // stops at the first non-numeric character.
+            if ([fn isEqualToString:@"scale"]) {
+                if (args.count >= 2) {
+                    acc = CATransform3DScale(acc, args[0].doubleValue, args[1].doubleValue,
+                                             args.count >= 3 ? args[2].doubleValue : 1.0);
+                } else if (args.count == 1) {
+                    double s = args[0].doubleValue;
+                    acc = CATransform3DScale(acc, s, s, 1.0);
+                }
+                anyOp = YES;
+            } else if ([fn isEqualToString:@"rotate"]) {
+                // "rotate(Xdeg)" -> Z rotation. With axis args
+                // "rotate(Xdeg, ax, ay, az)" -> arbitrary axis.
+                if (args.count >= 1) {
+                    double angleRad = args[0].doubleValue * M_PI / 180.0;
+                    if (args.count >= 4) {
+                        acc = CATransform3DRotate(acc, angleRad,
+                                                  args[1].doubleValue,
+                                                  args[2].doubleValue,
+                                                  args[3].doubleValue);
+                    } else {
+                        acc = CATransform3DRotate(acc, angleRad, 0, 0, 1);
+                    }
+                }
+                anyOp = YES;
+            } else if ([fn isEqualToString:@"translate"]) {
+                if (args.count >= 2) {
+                    acc = CATransform3DTranslate(acc, args[0].doubleValue, args[1].doubleValue,
+                                                 args.count >= 3 ? args[2].doubleValue : 0);
+                }
+                anyOp = YES;
+            }
+            // Unknown function: skip silently. There may be whitespace
+            // between functions; the loop's scanUpToString:@"(" will
+            // happily eat it on the next iteration.
+        }
+        if (anyOp) layer.transform = acc;
     }
-    // transform="rotate(0deg)" etc -- skipped, the rotation.* already covers it
+}
+
+#pragma mark Animation materialization
+
+// Build a CAAnimation from a fully-parsed PPPendingAnim and attach it
+// to `layer`. Apple's animator handles repeat/autoreverse/timing for
+// us frame-by-frame. We don't have to do anything per-tick.
+- (void)attachPendingAnim:(PPPendingAnim *)pa toLayer:(CALayer *)layer {
+    if (!pa || !pa.keyPath.length || !layer) return;
+
+    CAAnimation *anim = nil;
+
+    BOOL hasValueList = (pa.values.count > 0);
+    BOOL hasFromTo    = (pa.fromValueLiteral.length || pa.toValueLiteral.length);
+    BOOL isKeyframe   = [pa.type isEqualToString:@"CAKeyframeAnimation"] || hasValueList;
+
+    if (isKeyframe && hasValueList) {
+        CAKeyframeAnimation *ka = [CAKeyframeAnimation animationWithKeyPath:pa.keyPath];
+        ka.values = pa.values;
+        if (pa.keyTimes.count == pa.values.count) ka.keyTimes = pa.keyTimes;
+        if (pa.calculationMode.length) ka.calculationMode = pa.calculationMode;
+        if (pa.timingFuncs.count) ka.timingFunctions = pa.timingFuncs;
+        anim = ka;
+    } else if (hasFromTo || [pa.type isEqualToString:@"CABasicAnimation"]) {
+        CABasicAnimation *ba = [CABasicAnimation animationWithKeyPath:pa.keyPath];
+        // Try to coerce literal strings to NSNumber, falling back to
+        // raw string. iOS scalar key paths accept NSNumber.
+        if (pa.fromValueLiteral.length) ba.fromValue = @(pa.fromValueLiteral.doubleValue);
+        if (pa.toValueLiteral.length)   ba.toValue   = @(pa.toValueLiteral.doubleValue);
+        anim = ba;
+    } else {
+        // Unknown / empty animation block - skip.
+        return;
+    }
+
+    anim.duration = pa.duration > 0 ? pa.duration : 0.25;
+    if (pa.hasBeginTime && pa.beginTime > 0) {
+        // CAAnimation.beginTime is layer-time; convert from media time
+        // to the layer's timespace so beginTime="1e-100" doesn't get
+        // interpreted as "ages ago".
+        anim.beginTime = [layer convertTime:CACurrentMediaTime() fromLayer:nil] + pa.beginTime;
+    }
+    anim.autoreverses = pa.autoreverses;
+    if (pa.repeatInf) {
+        anim.repeatCount = HUGE_VALF;
+    } else if (pa.repeatCount > 0) {
+        anim.repeatCount = pa.repeatCount;
+    }
+    if (pa.fillMode.length) anim.fillMode = pa.fillMode;
+    if (pa.hasSpeed) anim.speed = pa.speed;
+    if (pa.hasRemovedOnCompletion) anim.removedOnCompletion = pa.removedOnCompletion;
+
+    CAMediaTimingFunction *tf = PPMakeTimingFunction(pa.timingFunctionSpec);
+    if (tf) anim.timingFunction = tf;
+
+    NSString *key = [NSString stringWithFormat:@"pp_%@_%ld", pa.keyPath, (long)(self.animKeyCounter++)];
+    [layer addAnimation:anim forKey:key];
 }
 
 #pragma mark NSXMLParserDelegate
@@ -339,6 +596,142 @@ didStartElement:(NSString *)elementName
         return;
     }
 
+    // ---------------- <animations> blocks ----------------
+    //
+    // Structure:
+    //   <CALayer ...>
+    //     <animations>
+    //       <animation type="CAKeyframeAnimation" keyPath="position.x"
+    //                  duration="2" repeatCount="inf" autoreverses="1">
+    //         <keyTimes>
+    //           <integer value="0"/>
+    //           <integer value="1"/>
+    //         </keyTimes>
+    //         <values>
+    //           <real value="100"/>
+    //           <real value="200"/>
+    //         </values>
+    //         <timingFunctions>
+    //           <CAMediaTimingFunction name="easeInEaseOut"/>
+    //         </timingFunctions>
+    //       </animation>
+    //       <animation type="CABasicAnimation" keyPath="opacity"
+    //                  duration="1" fromValue="0" toValue="1"/>
+    //       <p key="animation-1" type="CAKeyframeAnimation" .../> ← seen in
+    //                                                                Waves Bundle
+    //     </animations>
+    //   </CALayer>
+    //
+    // We attach the resulting CAAnimation directly to the layer via
+    // -addAnimation:forKey: on </animation>, so Core Animation drives
+    // it itself - no per-frame ticking from our side.
+    if ([elementName isEqualToString:@"animations"]) {
+        self.animationsDepth++;
+        return;
+    }
+    if (self.animationsDepth > 0) {
+        // Inside an <animations>: each direct child is one animation.
+        if ([elementName isEqualToString:@"animation"] ||
+            [elementName isEqualToString:@"p"]) {
+            // <p key="..."> is what some authoring tools emit; same shape.
+            self.currentAnim = [PPPendingAnim new];
+            self.currentAnim.type    = attrs[@"type"] ?: @"CABasicAnimation";
+            self.currentAnim.keyPath = attrs[@"keyPath"];
+            self.currentAnim.keyTimes = [NSMutableArray array];
+            self.currentAnim.values   = [NSMutableArray array];
+            self.currentAnim.timingFuncs = [NSMutableArray array];
+
+            NSString *dur = attrs[@"duration"];
+            if (dur.length) self.currentAnim.duration = dur.doubleValue;
+
+            NSString *bt = attrs[@"beginTime"];
+            if (bt.length) {
+                self.currentAnim.beginTime = bt.doubleValue;
+                // 1e-100 is the "start immediately" idiom in CAML;
+                // anything below ~1e-6 we treat as "no offset" so we
+                // don't pin the animation to time 0 in absolute media
+                // time (which would be ~years ago).
+                if (self.currentAnim.beginTime > 1e-6) {
+                    self.currentAnim.hasBeginTime = YES;
+                }
+            }
+
+            NSString *ar = attrs[@"autoreverses"];
+            if (ar.length) self.currentAnim.autoreverses = ar.boolValue;
+
+            NSString *roc = attrs[@"removedOnCompletion"];
+            if (roc.length) {
+                self.currentAnim.removedOnCompletion = roc.boolValue;
+                self.currentAnim.hasRemovedOnCompletion = YES;
+            }
+
+            NSString *spd = attrs[@"speed"];
+            if (spd.length) {
+                self.currentAnim.speed = spd.doubleValue;
+                self.currentAnim.hasSpeed = YES;
+            }
+
+            NSString *rc = attrs[@"repeatCount"];
+            if (rc.length) {
+                if ([rc isEqualToString:@"inf"] || [rc isEqualToString:@"infinity"]) {
+                    self.currentAnim.repeatInf = YES;
+                } else {
+                    self.currentAnim.repeatCount = rc.doubleValue;
+                }
+            }
+
+            self.currentAnim.fillMode        = attrs[@"fillMode"];
+            self.currentAnim.calculationMode = attrs[@"calculationMode"];
+            self.currentAnim.timingFunctionSpec = attrs[@"timingFunction"];
+            self.currentAnim.fromValueLiteral   = attrs[@"fromValue"];
+            self.currentAnim.toValueLiteral     = attrs[@"toValue"];
+            return;
+        }
+        if (!self.currentAnim) return;
+
+        // Sub-arrays of the animation
+        if ([elementName isEqualToString:@"keyTimes"]) {
+            self.currentAnim.currentList = @"keyTimes";
+            return;
+        }
+        if ([elementName isEqualToString:@"values"]) {
+            self.currentAnim.currentList = @"values";
+            return;
+        }
+        if ([elementName isEqualToString:@"timingFunctions"]) {
+            self.currentAnim.currentList = @"timingFunctions";
+            return;
+        }
+        if ([elementName isEqualToString:@"CAMediaTimingFunction"]) {
+            CAMediaTimingFunction *tf = nil;
+            NSString *named = attrs[@"name"];
+            if (named.length) {
+                tf = PPMakeTimingFunction(named);
+            } else {
+                NSString *pts = attrs[@"controlPoints"] ?: attrs[@"value"];
+                if (pts.length) tf = PPMakeTimingFunction(pts);
+            }
+            if (tf) [self.currentAnim.timingFuncs addObject:tf];
+            return;
+        }
+
+        // Element inside one of the lists
+        if ([self.currentAnim.currentList isEqualToString:@"keyTimes"]) {
+            id v = PPCoerceAnimationValue(elementName, attrs);
+            if ([v isKindOfClass:[NSNumber class]]) {
+                [self.currentAnim.keyTimes addObject:(NSNumber *)v];
+            }
+            return;
+        }
+        if ([self.currentAnim.currentList isEqualToString:@"values"]) {
+            id v = PPCoerceAnimationValue(elementName, attrs);
+            if (v) [self.currentAnim.values addObject:v];
+            return;
+        }
+        // Anything else inside an <animation>: ignore (filters, etc).
+        return;
+    }
+
     // ---------------- Layer tree ----------------
     if ([elementName isEqualToString:@"sublayers"]) {
         self.inSublayers = YES;
@@ -352,8 +745,9 @@ didStartElement:(NSString *)elementName
         CALayer *cur = self.layerStack.lastObject;
         NSString *src = attrs[@"src"];
         if (cur && src.length) {
-            NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[src lastPathComponent]];
-            // src might be "assets/foo.png" - lastPathComponent gives "foo.png"
+            // src might be "assets/foo.png" or URL-encoded "Screenshot%20188.png".
+            NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
+            NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
             UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
             if (img) {
                 cur.contents = (__bridge id)img.CGImage;
@@ -365,12 +759,23 @@ didStartElement:(NSString *)elementName
 
     if ([elementName isEqualToString:@"CALayer"] ||
         [elementName isEqualToString:@"CATransformLayer"] ||
-        [elementName isEqualToString:@"CAShapeLayer"]) {
+        [elementName isEqualToString:@"CAShapeLayer"] ||
+        [elementName isEqualToString:@"CAEmitterLayer"]) {
 
         CALayer *layer;
-        if ([elementName isEqualToString:@"CATransformLayer"]) layer = [CATransformLayer layer];
-        else if ([elementName isEqualToString:@"CAShapeLayer"]) layer = [CAShapeLayer layer];
-        else layer = [CALayer layer];
+        if ([elementName isEqualToString:@"CATransformLayer"]) {
+            layer = [CATransformLayer layer];
+        } else if ([elementName isEqualToString:@"CAShapeLayer"]) {
+            layer = [CAShapeLayer layer];
+        } else if ([elementName isEqualToString:@"CAEmitterLayer"]) {
+            // We don't (yet) parse CAEmitterCell. The wrapper CAEmitterLayer
+            // is allocated as itself anyway so future emitter-cell support
+            // can attach without reparenting; today it just renders nothing,
+            // which is correct compared to crashing or skipping the layer.
+            layer = [CAEmitterLayer layer];
+        } else {
+            layer = [CALayer layer];
+        }
 
         // Apply attributes
         for (NSString *k in attrs) {
@@ -425,12 +830,38 @@ didStartElement:(NSString *)elementName
         return;
     }
 
+    // Animation block close
+    if ([elementName isEqualToString:@"animations"]) {
+        if (self.animationsDepth > 0) self.animationsDepth--;
+        return;
+    }
+    if (self.animationsDepth > 0) {
+        if ([elementName isEqualToString:@"keyTimes"] ||
+            [elementName isEqualToString:@"values"] ||
+            [elementName isEqualToString:@"timingFunctions"]) {
+            self.currentAnim.currentList = nil;
+            return;
+        }
+        if ([elementName isEqualToString:@"animation"] ||
+            [elementName isEqualToString:@"p"]) {
+            // The <animations> block is a direct child of the layer it
+            // applies to, so the *current* layer on the stack is the
+            // owner. Materialize and attach.
+            CALayer *owner = self.layerStack.lastObject;
+            [self attachPendingAnim:self.currentAnim toLayer:owner];
+            self.currentAnim = nil;
+            return;
+        }
+        return;
+    }
+
     if ([elementName isEqualToString:@"sublayers"]) { self.inSublayers = NO; return; }
     if ([elementName isEqualToString:@"contents"])  { self.inContents = NO;  return; }
 
     if ([elementName isEqualToString:@"CALayer"] ||
         [elementName isEqualToString:@"CATransformLayer"] ||
-        [elementName isEqualToString:@"CAShapeLayer"]) {
+        [elementName isEqualToString:@"CAShapeLayer"] ||
+        [elementName isEqualToString:@"CAEmitterLayer"]) {
         if (self.layerStack.count) [self.layerStack removeLastObject];
         return;
     }
