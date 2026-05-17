@@ -377,9 +377,30 @@ static void PPStartDisplayLink(void) {
 //     actually instantiates. We then filter to LOCK-SCREEN context only,
 //     so the home-screen wallpaper stays untouched.
 
+// Build a "Class<-Class<-...<-Window" diagnostic string for the view chain.
+static NSString *PPViewChain(UIView *v) {
+    NSMutableArray *parts = [NSMutableArray array];
+    UIView *cur = v;
+    int hop = 0;
+    while (cur && hop < 12) {
+        [parts addObject:NSStringFromClass([cur class])];
+        cur = cur.superview;
+        hop++;
+    }
+    return [parts componentsJoinedByString:@"<-"];
+}
+
 static void PPMaybeInstallIntoWallpaper(UIView *v) {
     if (!v.window) return;
-    if (!PPViewIsInLockScreen(v)) return;
+
+    // Always log the chain so we can see exactly where each _UIWallpaperView
+    // lives. After the first lock cycle we'll know which class names to
+    // accept/reject.
+    NSString *chain = PPViewChain(v);
+    BOOL isLock = PPViewIsInLockScreen(v);
+    PPSetDebug(@"wp%@ %@", isLock ? @"!" : @"?", chain);
+
+    if (!isLock) return;
 
     // Skip if we already installed into THIS view.
     for (CALayer *l in v.layer.sublayers) {
@@ -388,11 +409,32 @@ static void PPMaybeInstallIntoWallpaper(UIView *v) {
     PPInstallPosterIntoWallpaperView(v);
 }
 
+// Walk up from a view to its window and remove ANY PocketPlayerLayer found
+// in the subtree of that window other than the one on `keepHost`. This kills
+// stale layers left behind by previous tweak versions (e.g. the one that
+// hosted into CSCoverSheetView).
+static void PPCleanupStaleLayers(UIView *keepHost) {
+    UIWindow *w = keepHost.window;
+    if (!w) return;
+    void (^__block walk)(CALayer *) = nil;
+    walk = ^(CALayer *l) {
+        for (CALayer *child in [l.sublayers copy]) {
+            if ([child.name isEqualToString:@"PocketPlayerLayer"] && child != gPosterLayer) {
+                [child removeFromSuperlayer];
+            } else {
+                walk(child);
+            }
+        }
+    };
+    walk(w.layer);
+}
+
 %hook _UIWallpaperView
 
 - (void)didMoveToWindow {
     %orig;
     PPMaybeInstallIntoWallpaper(self);
+    PPCleanupStaleLayers(self);
 }
 
 - (void)layoutSubviews {
@@ -437,6 +479,15 @@ static void PPMaybeInstallIntoWallpaper(UIView *v) {
     if (self.window == nil) return;
     gCoverSheetView = self;
     gFallbackBaselineY = -1.0; // re-establish baseline after relayout
+
+    // Snipe any stale PocketPlayerLayer that an older build left attached
+    // to the cover sheet itself.
+    for (CALayer *l in [self.layer.sublayers copy]) {
+        if ([l.name isEqualToString:@"PocketPlayerLayer"] && l != gPosterLayer) {
+            [l removeFromSuperlayer];
+        }
+    }
+
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
 }
