@@ -2,26 +2,24 @@
 //
 // Architecture (PosterBoard-style, iOS 15 backport):
 //
-//   [SBHomeScreenWindow / wallpaper window]    <- never moves
-//      └── _UIWallpaperView                    <- our CALayer tree lives HERE
-//           └── PocketPlayerLayer
-//                └── <CAML root layer>
+//   [SBCoverSheetWindow]                       <- this whole subtree slides up on swipe
+//      └── CSCoverSheetView                    <- progress source
+//      └── _UIWallpaperView (lock context)     <- WE HOST HERE
+//           └── PocketPlayerLayer (container)  <- counter-translated each frame
+//                └── <CAML root layer>         <- holds the chest, scaled to fit
 //                     ├── Bottom_chest.png
 //                     ├── Top_chest.png        <- animated by Locked->Unlock states
 //                     ├── Lock.png             <- animated
 //                     └── ...
 //
-//   [SBCoverSheetWindow]                       <- this is what slides up on swipe
-//      └── CSCoverSheetView                    <- only used to track swipe progress
-//
-// Why:
-//   On real PosterBoard the wallpaper sits in its own window that does NOT move
-//   during unlock. The cover sheet (clock, notifications, passcode) is a
-//   separate window that slides off the top. So:
-//     - wallpaper = static, only its inner layers animate via state interpolation
-//     - cover sheet = full-screen translation, drives the progress value
-//   Putting our layer inside CSCoverSheetView like before made the whole thing
-//   slide up together with the clock, which is wrong.
+// Why counter-translate:
+//   On iOS 17+ the lock-screen wallpaper sits in its OWN window that does NOT
+//   move during unlock. iOS 15 is different: the wallpaper view lives INSIDE
+//   the cover sheet, so the whole subtree slides up. To get the PosterBoard
+//   look on iOS 15 we apply an opposite Y translation to the poster container
+//   each frame, equal to how far the cover sheet has moved. Net effect:
+//   container stays put on screen while the cover sheet (clock, notifications,
+//   passcode) slides off — exactly like PosterBoard on iOS 17.
 //
 // Progress is fed from whichever of these gets called first:
 //   1) CSCoverSheetViewController _updatePresentationProgress:withOffset:presentationState:
@@ -55,11 +53,12 @@ static BOOL const kPPDebugLabel = YES;
 
 static UILabel        *gDebugLabel;
 static PPCAMLDocument *gDoc;
-static CALayer        *gPosterLayer;     // our container CALayer (zPosition handled below)
-static __weak UIView  *gWallpaperView;   // the static wallpaper view we host into
-static __weak UIView  *gCoverSheetView;  // the sliding view used only as progress source
+static CALayer        *gPosterLayer;     // our container CALayer (counter-translated each frame)
+static __weak UIView  *gWallpaperView;   // the wallpaper view we host into
+static __weak UIView  *gCoverSheetView;  // the sliding view, progress + counter-translate source
 static CADisplayLink  *gDisplayLink;
 static CGFloat         gLastProgress = 0.0;
+static CGFloat         gLastCounterY = 0.0; // last counter-translate Y applied
 static CGFloat         gFallbackBaselineY = -1.0;
 static NSString       *gFromState;
 static NSString       *gToState;
@@ -223,6 +222,18 @@ static void PPApplyProgress(CGFloat progress) {
     }
 }
 
+// Apply a counter-translate Y on the poster container, so it visually stays
+// in place while the parent wallpaper view slides up with the cover sheet.
+static void PPApplyCounterTranslate(CGFloat ty) {
+    if (!gPosterLayer) return;
+    if (fabs(ty - gLastCounterY) < 0.5) return;
+    gLastCounterY = ty;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    gPosterLayer.transform = CATransform3DMakeTranslation(0, ty, 0);
+    [CATransaction commit];
+}
+
 // =====================================================================
 // Poster install (into the static wallpaper view)
 // =====================================================================
@@ -253,12 +264,16 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
     }
     gDoc = doc;
 
-    // Container scaled to fit the wallpaper view (= screen).
+    // Container fills the wallpaper view. Use bounds+position (not frame)
+    // because we'll be setting a transform on it (counter-translate) and
+    // setting `frame` while a transform is non-identity is undefined.
     CALayer *container = [CALayer layer];
     container.name = @"PocketPlayerLayer";
-    container.frame = wallpaper.bounds;
+    container.bounds = wallpaper.bounds;
+    container.position = CGPointMake(wallpaper.bounds.size.width / 2.0,
+                                     wallpaper.bounds.size.height / 2.0);
     container.zPosition = 100; // above the wallpaper image
-    container.masksToBounds = YES;
+    container.masksToBounds = NO; // let the chest peek if container shifts
 
     CGRect rb = doc.rootLayer.bounds;
     if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
@@ -280,6 +295,7 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
     [container addSublayer:doc.rootLayer];
     [wallpaper.layer addSublayer:container];
     gPosterLayer = container;
+    gLastCounterY = 0.0;
 
     [doc captureBaseValues];
     PPResolveStates(doc);
@@ -299,7 +315,7 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
 }
 
 // =====================================================================
-// Fallback: CADisplayLink — reads the cover-sheet view position to derive 0..1
+// CADisplayLink — drives BOTH state interpolation AND counter-translate
 // =====================================================================
 
 @interface PPDisplayLinkTarget : NSObject
@@ -309,26 +325,38 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
 @implementation PPDisplayLinkTarget
 - (void)tick:(CADisplayLink *)link {
     UIView *cs = gCoverSheetView;
-    if (!cs.window) return;
+    if (!cs.window) {
+        // Cover sheet is gone (we're on home screen). Reset transform so the
+        // next lock cycle starts clean.
+        if (gPosterLayer && gLastCounterY != 0.0) PPApplyCounterTranslate(0.0);
+        return;
+    }
 
-    // Convert center to window coords. While unlocking, the cover sheet view
-    // (or one of its ancestors) translates upward off-screen.
+    // Cover sheet center in window coords. While unlocking, one of its
+    // ancestors translates upward.
     CGPoint center = [cs.superview convertPoint:cs.center toView:nil];
     CGFloat y = center.y;
 
+    // Baseline = the highest y we've ever seen (= fully presented / locked).
     if (gFallbackBaselineY < 0 || y > gFallbackBaselineY) gFallbackBaselineY = y;
 
-    CGFloat h = cs.bounds.size.height;
-    if (h <= 1) return;
-
     CGFloat travel = gFallbackBaselineY - y;
-    CGFloat progress = travel / h;
-    progress = MAX(0.0, MIN(1.0, progress));
+    if (travel < 0) travel = 0;
 
-    if (fabs(progress - gLastProgress) > 0.001) {
-        PPApplyProgress(progress);
-        PPSetDebug(@"fb p=%.2f %@->%@ y=%.1f", progress,
-            gFromState ?: @"-", gToState ?: @"-", y);
+    // Counter-translate the poster container DOWN by `travel`, so visually
+    // it stays put while its parent slides up.
+    PPApplyCounterTranslate(travel);
+
+    // Derive 0..1 progress for state interpolation from the same travel.
+    CGFloat h = cs.bounds.size.height;
+    if (h > 1) {
+        CGFloat progress = travel / h;
+        progress = MAX(0.0, MIN(1.0, progress));
+        if (fabs(progress - gLastProgress) > 0.001) {
+            PPApplyProgress(progress);
+            PPSetDebug(@"fb p=%.2f %@->%@ ty=%.0f", progress,
+                gFromState ?: @"-", gToState ?: @"-", travel);
+        }
     }
 }
 @end
@@ -370,7 +398,12 @@ static void PPMaybeInstallIntoWallpaper(UIView *v) {
 - (void)layoutSubviews {
     %orig;
     if (gPosterLayer && gPosterLayer.superlayer == self.layer) {
-        gPosterLayer.frame = self.bounds;
+        // Resize the container WITHOUT clobbering its transform (we use it
+        // for counter-translate). Setting `frame` would clear the transform
+        // implicitly; setting bounds+position keeps the transform alive.
+        gPosterLayer.bounds = self.bounds;
+        gPosterLayer.position = CGPointMake(self.bounds.size.width / 2.0,
+                                             self.bounds.size.height / 2.0);
         if (gDoc.rootLayer) {
             CGRect rb = gDoc.rootLayer.bounds;
             if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
