@@ -32,7 +32,10 @@
 static NSString *const kPPWallpaperRoot =
     @"/var/mobile/Library/PosterPlayer/active/versions/1/contents";
 
-static BOOL const kPPDebugLabel = YES;
+// Set to YES during development to show the on-screen progress label
+// and write per-frame log entries to /var/mobile/pocketplayer.log.
+// In a release build this should stay NO.
+static BOOL const kPPDebugLabel = NO;
 
 // =====================================================================
 // State
@@ -207,8 +210,33 @@ static void PPApplyProgress(CGFloat progress) {
     // toggling .hidden is invisible to the user — they perceive the same
     // chest staying put while icons spawn on top via the standard iOS
     // home-screen reveal animation.
+    //
+    // Important: force BOTH posters to the exact final state (1.0)
+    // before snapping. _updatePresentationProgress: doesn't always
+    // deliver an exact 1.0 - it can stop at 0.992, 0.997 etc - and a
+    // sub-pixel pose mismatch between the two posters at the moment of
+    // the snap shows up as a tiny visible "cut" in the recording. By
+    // overriding both to 1.0 we guarantee identical poses across the
+    // hand-off.
+    BOOL fullyUnlocked = (progress >= 0.99);
+    if (fullyUnlocked) {
+        if (gDoc && gToState) {
+            if (gFromState) {
+                [gDoc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+            } else {
+                [gDoc applyState:gToState progress:1.0];
+            }
+        }
+        if (gHomeDoc && gToState) {
+            if (gFromState) {
+                [gHomeDoc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+            } else {
+                [gHomeDoc applyState:gToState progress:1.0];
+            }
+        }
+    }
     if (gPosterLayer) {
-        gPosterLayer.hidden = (progress >= 0.99);
+        gPosterLayer.hidden = fullyUnlocked;
     }
 
     [CATransaction commit];
@@ -531,10 +559,15 @@ static void PPHideAllSystemWallpapers(void) {
     UIView *cs = gCoverSheetView;
     if (!cs.window) return;
 
-    // Re-hide system wallpaper views every frame — iOS occasionally
-    // un-hides them during the unlock transition, which would let the
-    // user's background bleed through over our poster.
-    PPHideAllSystemWallpapers();
+    // Re-hide system wallpaper views — iOS occasionally un-hides them
+    // during the unlock transition. Throttled to ~3x per second, since
+    // walking every window every frame is wasted work.
+    static CFTimeInterval sLastWPHide = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - sLastWPHide > 0.3) {
+        PPHideAllSystemWallpapers();
+        sLastWPHide = now;
+    }
 
     // Install / re-install the home-screen poster lazily, since the
     // home window may not exist when the cover-sheet first comes up.
