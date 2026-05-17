@@ -23,6 +23,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <notify.h>
 #import "CAMLParser.h"
 
 // =====================================================================
@@ -366,6 +367,116 @@ static void PPStartDisplayLink(void) {
 }
 
 // =====================================================================
+// Apply bridge — listen for "com.vortex.pocketplayer.apply" Darwin
+// notifications from the PocketPoster app. When fired, copy the
+// manifest's source bundle into the active PosterPlayer slot and
+// reload the poster live (no respring).
+// =====================================================================
+
+static NSString *const kPPApplyManifestPath =
+    @"/var/mobile/Library/PocketPlayer/apply.plist";
+static const char *const kPPApplyDarwinName =
+    "com.vortex.pocketplayer.apply";
+
+// Atomically replace the .wallpaper bundle inside
+//     /var/mobile/Library/PosterPlayer/active/versions/1/contents/
+// with the one at `srcBundle`. Returns YES on success.
+//
+// We intentionally do NOT touch sibling files (Wallpaper.plist etc.)
+// that PosterPlayer manages -- only the .wallpaper folder swaps in.
+static BOOL PPInstallBundleIntoActiveSlot(NSString *srcBundle) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!srcBundle.length) return NO;
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:srcBundle isDirectory:&isDir] || !isDir) return NO;
+
+    NSString *contents = kPPWallpaperRoot;
+    [fm createDirectoryAtPath:contents
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    // Remove any pre-existing *.wallpaper sibling to avoid PosterPlayer
+    // glomming two bundles together. Same scan PPFindFirstWallpaperBundle
+    // uses, just in delete mode.
+    for (NSString *kid in [fm contentsOfDirectoryAtPath:contents error:NULL]) {
+        if ([kid hasSuffix:@".wallpaper"]) {
+            NSString *victim = [contents stringByAppendingPathComponent:kid];
+            [fm removeItemAtPath:victim error:NULL];
+        }
+    }
+
+    NSString *dstName = [srcBundle lastPathComponent];
+    NSString *dstPath = [contents stringByAppendingPathComponent:dstName];
+
+    NSError *err = nil;
+    if (![fm copyItemAtPath:srcBundle toPath:dstPath error:&err]) {
+        NSString *msg = [NSString stringWithFormat:@"copy failed: %@",
+            err.localizedDescription ?: @"?"];
+        [msg writeToFile:@"/var/mobile/pocketplayer-apply.log"
+              atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return NO;
+    }
+    return YES;
+}
+
+static void PPHandleApplyNotification(void) {
+    @autoreleasepool {
+        NSDictionary *manifest =
+            [NSDictionary dictionaryWithContentsOfFile:kPPApplyManifestPath];
+        NSString *src = manifest[@"sourceBundlePath"];
+        if (!src.length) {
+            PPSetDebug(@"apply: no manifest");
+            return;
+        }
+
+        if (!PPInstallBundleIntoActiveSlot(src)) {
+            PPSetDebug(@"apply: copy failed src=%@", src);
+            return;
+        }
+
+        // Re-install the poster from disk. Existing PocketPlayerLayer is
+        // removed by PPInstallPosterIntoWindow itself; this gives us a
+        // brand-new PPCAMLDocument bound to the new bundle. No respring.
+        UIWindow *win = gHostWindow;
+        if (win) {
+            PPInstallPosterIntoWindow(win);
+            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+            PPRebuildMirrorEmitters();
+            PPSetDebug(@"apply OK: %@",
+                manifest[@"displayName"] ?: [src lastPathComponent]);
+        } else {
+            PPSetDebug(@"apply: no host window yet, manifest staged");
+        }
+
+        // Manifest is one-shot -- delete so a stale one doesn't trigger
+        // re-applies on the next boot.
+        [[NSFileManager defaultManager] removeItemAtPath:kPPApplyManifestPath
+                                                   error:NULL];
+    }
+}
+
+static void PPRegisterApplyListener(void) {
+    static dispatch_once_t once;
+    static int token;
+    dispatch_once(&once, ^{
+        notify_register_dispatch(kPPApplyDarwinName,
+                                 &token,
+                                 dispatch_get_main_queue(),
+                                 ^(int t) { PPHandleApplyNotification(); });
+        // If the app fired its notification before we could subscribe
+        // (e.g. user tapped Apply seconds before SpringBoard finished
+        // booting), the manifest will still be sitting on disk. Pick
+        // it up on first install.
+        if ([[NSFileManager defaultManager] fileExistsAtPath:kPPApplyManifestPath]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                PPHandleApplyNotification();
+            });
+        }
+    });
+}
+
+// =====================================================================
 // Hooks
 // =====================================================================
 
@@ -383,6 +494,7 @@ static void PPStartDisplayLink(void) {
 
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
+    PPRegisterApplyListener();
 
     // Install poster directly on the cover sheet WINDOW. The window does
     // not move during unlock; only the cover sheet view (its child) does.

@@ -1,20 +1,21 @@
 // PPApplyBridge — talks to the PocketPlayer tweak running inside SpringBoard.
 //
-// V0.1 contract (what the tweak needs to honour, separately):
-//   1. The app writes a "request manifest" plist to a shared path:
-//        /var/jb/var/mobile/Library/PocketPlayer/apply.plist
-//      with keys:
-//        sourceBundlePath : NSString  — absolute path to the .wallpaper folder in our Documents
+// Contract:
+//   1. App writes a request manifest to a SHARED path that both the app
+//      (with platform-application entitlement) and the tweak inside
+//      SpringBoard can read:
+//          /var/mobile/Library/PocketPlayer/apply.plist
+//      Keys:
+//        sourceBundlePath : NSString  — absolute path to the .wallpaper folder
+//        displayName      : NSString
+//        itemID           : NSString
 //        timestamp        : NSDate
-//   2. The app posts a Darwin notification: "com.vortex.pocketplayer.apply"
-//   3. The tweak (next iteration) listens for that notification, reads
-//      the manifest, copies the bundle into the active PosterPlayer
-//      slot, and applies it without respring.
 //
-// For now (v0.1 of the app) we only implement steps 1 and 2. The tweak
-// side of the contract isn't there yet — applying will only take effect
-// once we add the listener to Tweak.x. This way the UI is fully working
-// and the wiring is a small follow-up.
+//   2. App posts Darwin notification: "com.vortex.pocketplayer.apply"
+//
+//   3. Tweak's notify_register_dispatch handler picks it up, copies the
+//      bundle into the PosterPlayer active slot, and reloads the poster
+//      live -- no respring.
 
 #import <Foundation/Foundation.h>
 
@@ -22,8 +23,10 @@
 
 @interface PPApplyBridge : NSObject
 
-// Returns YES if the manifest was written and the notification posted.
-// Does NOT mean the wallpaper actually applied (see header comment).
+// Write manifest + post notification. Returns YES if the manifest was
+// written and the notification posted. Returns NO + populates `error`
+// if even step 1 failed (e.g. sandbox blocking the shared path -- which
+// would mean entitlements aren't being honoured).
 + (BOOL)applyItem:(PPWallpaperItem *)item error:(NSError **)error;
 
 @end
