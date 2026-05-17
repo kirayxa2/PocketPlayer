@@ -23,10 +23,28 @@ if command -v apt >/dev/null 2>&1; then
   sudo apt update
   sudo apt install -y \
     build-essential fakeroot rsync curl wget git perl \
-    ldid xz-utils zip unzip libplist-utils \
+    xz-utils zip unzip libplist-utils \
     libtinfo5 libncurses5 dpkg-dev openssh-client
 else
-  warn "apt not found — install build-essential, perl, ldid, dpkg-dev manually"
+  warn "apt not found — install build-essential, perl, dpkg-dev manually"
+fi
+
+# 1b. ldid (not in Ubuntu repos — fetch ProcursusTeam prebuilt) ---------------
+if command -v ldid >/dev/null 2>&1; then
+  say "ldid already installed: $(command -v ldid)"
+else
+  say "Installing ldid (ProcursusTeam prebuilt)"
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64)  LDID_BIN="ldid_linux_x86_64" ;;
+    aarch64) LDID_BIN="ldid_linux_aarch64" ;;
+    *) die "Unsupported arch '$ARCH' for prebuilt ldid — install manually" ;;
+  esac
+  sudo curl -L --fail -o /usr/local/bin/ldid \
+    "https://github.com/ProcursusTeam/ldid/releases/latest/download/$LDID_BIN" \
+    || die "ldid download failed"
+  sudo chmod +x /usr/local/bin/ldid
+  ldid -v >/dev/null 2>&1 || warn "ldid installed but '-v' check failed (still may be fine)"
 fi
 
 # 2. Theos --------------------------------------------------------------------
