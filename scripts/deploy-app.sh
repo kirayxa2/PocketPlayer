@@ -25,12 +25,12 @@ cd "$(dirname "$0")/.."
 export THEOS
 
 say "Building PocketPoster.app (theos at $THEOS)"
-make -C app package FINALPACKAGE=0 2>&1 | tail -5
+make -C app clean >/dev/null 2>&1 || true
+make -C app package FINALPACKAGE=0 2>&1 | tail -8
 
-# Theos puts the deb under ../packages relative to app/Makefile, so the
-# repo's packages/ directory.
-DEB="$(ls -t packages/com.vortex.pocketposter_*.deb 2>/dev/null | head -1)"
-[ -n "$DEB" ] || { warn "no PocketPoster .deb produced (looked in packages/)"; exit 1; }
+# Theos default packages dir is alongside its Makefile, so app/packages/.
+DEB="$(ls -t app/packages/com.vortex.pocketposter_*.deb 2>/dev/null | head -1)"
+[ -n "$DEB" ] || { warn "no PocketPoster .deb produced (looked in app/packages/)"; exit 1; }
 say "Built $DEB"
 
 say "scp -> $PP_HOST"
