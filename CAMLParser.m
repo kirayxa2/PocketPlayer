@@ -106,6 +106,7 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
 @property (nonatomic, strong) CALayer *rootLayer;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, CALayer *> *mLayersById;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, PPCAMLState *> *mStates;
+@property (nonatomic, strong) NSMutableArray<NSString *> *mStateOrder;
 // base[layerId][keyPath] = baseValue
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, id> *> *baseValues;
 @end
@@ -116,6 +117,7 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
     if ((self = [super init])) {
         _mLayersById = [NSMutableDictionary dictionary];
         _mStates     = [NSMutableDictionary dictionary];
+        _mStateOrder = [NSMutableArray array];
         _baseValues  = [NSMutableDictionary dictionary];
     }
     return self;
@@ -123,6 +125,7 @@ static void PPApplyInterpolated(CALayer *layer, NSString *keyPath, id base, id t
 
 - (NSDictionary<NSString *, CALayer *> *)layersById { return _mLayersById; }
 - (NSDictionary<NSString *, PPCAMLState *> *)states { return _mStates; }
+- (NSArray<NSString *> *)stateOrder { return _mStateOrder; }
 
 - (void)captureBaseValues {
     [_baseValues removeAllObjects];
@@ -403,6 +406,9 @@ didStartElement:(NSString *)elementName
         if ([elementName isEqualToString:@"LKState"]) {
             if (self.currentState && self.currentState.name) {
                 self.currentState.values = [self.currentStateValues copy] ?: @[];
+                if (!self.doc.mStates[self.currentState.name]) {
+                    [self.doc.mStateOrder addObject:self.currentState.name];
+                }
                 self.doc.mStates[self.currentState.name] = self.currentState;
             }
             self.currentState = nil;
