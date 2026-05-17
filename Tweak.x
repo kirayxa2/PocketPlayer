@@ -434,6 +434,11 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
         newEm.speed     = 1.0;
         newEm.scale     = 1.0;
         newEm.masksToBounds = NO;
+        // Render emitter ABOVE the rest of the CAML tree (Mario, planet,
+        // chest etc.) so particles aren't z-occluded by static layers.
+        // 9000 < 9999 (debug label), well above any CAML layer's
+        // implicit zPosition=0.
+        newEm.zPosition = 9000;
 
         // 4) Build fresh cells from captured CAML cells.
         NSMutableArray<CAEmitterCell *> *newCells = [NSMutableArray array];
@@ -558,6 +563,21 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     }
 }
 
+// Re-prime every CAEmitterLayer's beginTime in `root`'s subtree.
+// Must be called after any hide/show cycle of the parent layer,
+// because on iOS 15 a hidden CAEmitterLayer pauses its timeline
+// at the moment of the hide and does not restart cleanly when
+// .hidden goes back to NO. Without this, after the first
+// unlock-then-relock the lockscreen poster shows zero particles.
+static void PPRePrimeEmittersIn(CALayer *root) {
+    if (!root) return;
+    NSMutableArray *emitters = [NSMutableArray array];
+    PPCollectEmittersRecursive(root, emitters);
+    for (CAEmitterLayer *em in emitters) {
+        em.beginTime = [em convertTime:CACurrentMediaTime() fromLayer:nil];
+    }
+}
+
 // =====================================================================
 // State resolution
 // =====================================================================
@@ -664,7 +684,16 @@ static void PPApplyProgress(CGFloat progress) {
         }
     }
     if (gPosterLayer) {
+        BOOL wasHidden = gPosterLayer.hidden;
         gPosterLayer.hidden = fullyUnlocked;
+        // Going from hidden -> visible (i.e. user just locked the
+        // device again, cover sheet is being re-presented). Re-prime
+        // every emitter's beginTime, otherwise their timeline is
+        // still paused at the moment we hid the poster, and they
+        // emit zero particles until the next respring.
+        if (wasHidden && !fullyUnlocked) {
+            PPRePrimeEmittersIn(gPosterLayer);
+        }
     }
 
     [CATransaction commit];
@@ -1204,7 +1233,13 @@ static void PPStartDisplayLink(void) {
     // re-lock-after-unlock, the user is now looking at the lock screen
     // and our poster must be visible. The snap-hide in PPApplyProgress
     // only fires at progress >= 0.99.
-    if (gPosterLayer) gPosterLayer.hidden = NO;
+    if (gPosterLayer) {
+        gPosterLayer.hidden = NO;
+        // Re-prime emitters every time the cover sheet remounts —
+        // covers the case of unlock-then-relock where the previous
+        // cycle paused the emitter timeline.
+        PPRePrimeEmittersIn(gPosterLayer);
+    }
 }
 
 - (void)layoutSubviews {
