@@ -249,6 +249,61 @@ static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {
     }
 }
 
+// Recursively walks a CALayer tree and removes any sublayer named
+// "PocketPlayerLayer" that isn't the one we want to keep. Plain C, no
+// blocks, to avoid -Warc-retain-cycles on self-referential captures.
+static void PPNukeStaleLayersInTree(CALayer *root, CALayer *keep) {
+    if (!root) return;
+    for (CALayer *l in [root.sublayers copy]) {
+        if ([l.name isEqualToString:@"PocketPlayerLayer"] && l != keep) {
+            [l removeFromSuperlayer];
+            continue;
+        }
+        PPNukeStaleLayersInTree(l, keep);
+    }
+}
+
+// Same idea, but for the UIView hierarchy (since debug labels and any
+// older-build container UIViews live there).
+static void PPNukeStaleViewsInTree(UIView *root) {
+    if (!root) return;
+    for (UIView *v in [root.subviews copy]) {
+        if (v.tag == 0xCAFE && v != gDebugLabel) {
+            [v removeFromSuperview];
+            continue;
+        }
+        PPNukeStaleViewsInTree(v);
+    }
+}
+
+// Walk every UIWindow in the active scene and reap any stale poster
+// layers that older builds may have parented to wallpaper views,
+// cover-sheet views, or other windows entirely. Run this on every
+// install so a newer build always wins decisively.
+static void PPNukeAllStaleLayersEverywhere(CALayer *keep) {
+    NSArray<UIWindow *> *windows = nil;
+    if (@available(iOS 15.0, *)) {
+        NSMutableArray *all = [NSMutableArray array];
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                [all addObjectsFromArray:((UIWindowScene *)s).windows];
+            }
+        }
+        windows = all;
+    }
+    if (windows.count == 0) {
+        // Last-resort fallback (deprecated but works on jailbroken 15).
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        windows = [UIApplication sharedApplication].windows;
+        #pragma clang diagnostic pop
+    }
+    for (UIWindow *w in windows) {
+        PPNukeStaleLayersInTree(w.layer, keep);
+        PPNukeStaleViewsInTree(w);
+    }
+}
+
 // =====================================================================
 // CADisplayLink — drives state interpolation only
 // =====================================================================
@@ -322,12 +377,9 @@ static void PPStartDisplayLink(void) {
     gCoverSheetView = self;
     gFallbackBaselineY = -1.0;
 
-    // Remove any leftover layers from older builds (cover sheet view itself).
-    for (CALayer *l in [self.layer.sublayers copy]) {
-        if ([l.name isEqualToString:@"PocketPlayerLayer"] && l != gPosterLayer) {
-            [l removeFromSuperlayer];
-        }
-    }
+    // Kill any zombies left by older builds anywhere in the SpringBoard
+    // process — wallpaper views, other windows, our own cover sheet view.
+    PPNukeAllStaleLayersEverywhere(gPosterLayer);
 
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
@@ -338,6 +390,9 @@ static void PPStartDisplayLink(void) {
     if (win && (!gPosterLayer || gPosterLayer.superlayer != win.layer)) {
         PPInstallPosterIntoWindow(win);
         PPCleanupStaleLayersInWindow(win, gPosterLayer);
+        // One more sweep AFTER install, so anything that was lurking in
+        // a sibling window is removed even if it tried to reattach.
+        PPNukeAllStaleLayersEverywhere(gPosterLayer);
     }
 }
 
@@ -349,6 +404,7 @@ static void PPStartDisplayLink(void) {
     UIWindow *win = self.window;
     if (win && (!gPosterLayer || gPosterLayer.superlayer != win.layer)) {
         PPInstallPosterIntoWindow(win);
+        PPNukeAllStaleLayersEverywhere(gPosterLayer);
     }
 }
 
