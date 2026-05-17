@@ -99,15 +99,48 @@ static void PPSetDebug(NSString *fmt, ...) {
         atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// State names cached per loaded document. We try the canonical PosterBoard names first
+// (Locked/Unlocked), then fall back to whatever the .caml actually defines, in document order.
+static NSString *gFromState;
+static NSString *gToState;
+
+static void PPResolveStates(PPCAMLDocument *doc) {
+    gFromState = nil;
+    gToState   = nil;
+    if (!doc) return;
+
+    // Preferred canonical pairs in PosterBoard
+    NSArray *prefer = @[
+        @[@"Locked",   @"Unlocked"],
+        @[@"Sleep",    @"Wake"],
+        @[@"Default",  @"Activated"],
+    ];
+    for (NSArray *pair in prefer) {
+        if (doc.states[pair[0]] && doc.states[pair[1]]) {
+            gFromState = pair[0];
+            gToState   = pair[1];
+            return;
+        }
+    }
+
+    // Otherwise: take the first two states we see (parser preserves declaration order).
+    NSArray *names = doc.stateOrder;
+    if (names.count >= 2) { gFromState = names[0]; gToState = names[1]; }
+    else if (names.count == 1) { gFromState = nil;  gToState = names[0]; }
+}
+
 // progress: 0 = locked (cover sheet covers screen), 1 = fully unlocked (cover sheet gone)
 static void PPApplyProgress(CGFloat progress) {
     progress = MAX(0.0, MIN(1.0, progress));
     gLastProgress = progress;
-    if (!gDoc) return;
+    if (!gDoc || !gToState) return;
 
-    // Standard PosterBoard semantics: Locked -> Unlocked.
-    // If the wallpaper doesn't define one of these states, applyTransition no-ops.
-    [gDoc applyTransitionFromState:@"Locked" toState:@"Unlocked" progress:progress];
+    if (gFromState) {
+        [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
+    } else {
+        // Only one state defined -> interpolate base -> that state.
+        [gDoc applyState:gToState progress:progress];
+    }
 }
 
 // =====================================================================
@@ -168,10 +201,21 @@ static void PPInstallPosterIntoView(UIView *coverSheet) {
     // Make sure base values reflect what's currently in the layer tree.
     [doc captureBaseValues];
 
+    // Pick which two states drive our 0..1 transition.
+    PPResolveStates(doc);
+
+    // Log discovered states so we know exactly what the .caml exposes.
+    NSArray *names = doc.stateOrder;
+    NSString *summary = [NSString stringWithFormat:@"states=[%@] from=%@ to=%@ count=%lu",
+        [names componentsJoinedByString:@","], gFromState ?: @"-", gToState ?: @"-",
+        (unsigned long)names.count];
+    [summary writeToFile:@"/var/mobile/pocketplayer-states.log"
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
     // Apply locked state initially (progress 0).
     PPApplyProgress(0.0);
 
-    PPSetDebug(@"poster ready (%@)", [camlPath lastPathComponent]);
+    PPSetDebug(@"ready %@ st=%lu", [camlPath lastPathComponent], (unsigned long)names.count);
 }
 
 // =====================================================================
