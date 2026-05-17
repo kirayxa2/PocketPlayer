@@ -61,6 +61,21 @@ static NSString *const kCellID = @"WP";
         [self.emptyLabel.widthAnchor   constraintLessThanOrEqualToAnchor:self.view.widthAnchor
                                                               constant:-40],
     ]];
+
+    // Async preview renders post this when they land; refresh the grid
+    // so the new thumbnail appears without the user having to scroll.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(previewDidUpdate:)
+                                                 name:@"PPWallpaperPreviewDidUpdate"
+                                               object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)previewDidUpdate:(NSNotification *)note {
+    [self.grid reloadData];
 }
 
 - (void)viewWillAppear:(BOOL)animated {

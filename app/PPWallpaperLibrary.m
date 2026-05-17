@@ -1,4 +1,5 @@
 #import "PPWallpaperLibrary.h"
+#import "PPPreviewRenderer.h"
 
 @implementation PPWallpaperItem
 @end
@@ -278,6 +279,25 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
     };
     [meta writeToFile:[itemDir stringByAppendingPathComponent:@"meta.plist"]
             atomically:YES];
+
+    // Render a still preview off the main thread so the import call
+    // returns quickly. Failure here is non-fatal; the gallery will
+    // just show a placeholder until next attempt.
+    NSString *previewPath = [itemDir stringByAppendingPathComponent:@"preview.png"];
+    NSString *bundleForPreview = [bundlePath copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [PPPreviewRenderer renderPreviewForBundle:bundleForPreview
+                                             size:CGSizeMake(360, 640)
+                                          outPath:previewPath
+                                            error:NULL];
+        // Notify the UI a preview just landed so any visible cells
+        // can refresh without the user having to scroll.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"PPWallpaperPreviewDidUpdate"
+                              object:nil];
+        });
+    });
 
     [self reload];
     for (PPWallpaperItem *it in self.cache) {

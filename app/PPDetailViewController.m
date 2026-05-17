@@ -1,9 +1,11 @@
 #import "PPDetailViewController.h"
 #import "PPWallpaperLibrary.h"
 #import "PPApplyBridge.h"
+#import "PPPreviewRenderer.h"
 
 @interface PPDetailViewController ()
 @property (nonatomic, strong) PPWallpaperItem *item;
+@property (nonatomic, weak)   UIImageView     *iv;
 @end
 
 @implementation PPDetailViewController
@@ -36,6 +38,27 @@
                     ? [UIImage imageWithContentsOfFile:self.item.previewPath]
                     : nil;
     [self.view addSubview:iv];
+    self.iv = iv;
+
+    // No preview yet? Render one lazily and swap it in when ready.
+    if (!iv.image) {
+        NSString *bundle = self.item.bundlePath;
+        NSString *out    = self.item.previewPath;
+        __weak typeof(self) wself = self;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [PPPreviewRenderer renderPreviewForBundle:bundle
+                                                 size:CGSizeMake(720, 1280)
+                                              outPath:out
+                                                error:NULL];
+            UIImage *img = [UIImage imageWithContentsOfFile:out];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                wself.iv.image = img;
+                [[NSNotificationCenter defaultCenter]
+                    postNotificationName:@"PPWallpaperPreviewDidUpdate"
+                                  object:nil];
+            });
+        });
+    }
 
     UILabel *path = [UILabel new];
     path.translatesAutoresizingMaskIntoConstraints = NO;

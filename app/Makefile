@@ -31,12 +31,18 @@ PocketPoster_FILES = \
     PPRootViewController.m \
     PPDetailViewController.m \
     PPWallpaperLibrary.m \
-    PPApplyBridge.m
+    PPApplyBridge.m \
+    PPPreviewRenderer.m \
+    ../CAMLParser.m
 
 PocketPoster_FRAMEWORKS    = UIKit Foundation CoreGraphics QuartzCore UniformTypeIdentifiers
 PocketPoster_PRIVATE_FRAMEWORKS =
 PocketPoster_LIBRARIES     = z
+# CAMLParser.h lives one directory up; pulling it in lets the app
+# reuse the same parser that runs in SpringBoard, so any wallpaper
+# the tweak can play, the app can also generate a preview for.
 PocketPoster_CFLAGS        = -fobjc-arc \
+                             -I.. \
                              -Wno-deprecated-declarations \
                              -Wno-unused-variable
 # We don't sandbox-escape; standard entitlements are fine. If we later
