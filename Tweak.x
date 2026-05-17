@@ -455,7 +455,16 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     PPApplyProgress(0.0);
-    PPSetDebug(@"%lu .ca: %@", (unsigned long)docs.count, kindList);
+    NSInteger imgs = 0, miss = 0, em = 0, cells = 0;
+    for (PPCAMLDocument *d in docs) {
+        imgs  += d.imagesLoaded;
+        miss  += d.imagesMissing;
+        em    += d.emittersBuilt;
+        cells += d.cellsBuilt;
+    }
+    PPSetDebug(@"%lu .ca img=%ld miss=%ld em=%ld cells=%ld",
+               (unsigned long)docs.count,
+               (long)imgs, (long)miss, (long)em, (long)cells);
 }
 
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {

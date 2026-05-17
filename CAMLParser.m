@@ -1,7 +1,73 @@
 // CAMLParser.m
 #import "CAMLParser.h"
+#import <ImageIO/ImageIO.h>
+#import <MobileCoreServices/MobileCoreServices.h>
 
 #pragma mark - Helpers
+
+// Diagnostics counters (reset per-parse). Tweak.x reads these via the
+// document so it can show "imgs=12 emitters=1 cells=1 missing=0" in the
+// debug label and figure out whether emitters never got their texture.
+static NSInteger gPPImagesLoaded = 0;
+static NSInteger gPPImagesMissing = 0;
+static NSInteger gPPEmittersBuilt = 0;
+static NSInteger gPPCellsBuilt = 0;
+
+// Robust image loader. +[UIImage imageWithContentsOfFile:] on iOS 15
+// can fail on .webp because it dispatches by extension and not by
+// magic bytes. Falls back to ImageIO (which understands webp via
+// system codecs since iOS 14).
+//
+// Also: tries common substitutions (.webp -> .png) because some
+// authoring tools rename the texture but keep the original src in the
+// CAML.
+static UIImage *PPLoadImageAtPath(NSString *path) {
+    if (!path.length) return nil;
+
+    // Fast path.
+    UIImage *img = [UIImage imageWithContentsOfFile:path];
+    if (img) return img;
+
+    // ImageIO path (handles webp, heic, etc.)
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (src) {
+        CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        CFRelease(src);
+        if (cg) {
+            UIImage *out = [UIImage imageWithCGImage:cg scale:[UIScreen mainScreen].scale orientation:UIImageOrientationUp];
+            CGImageRelease(cg);
+            if (out) return out;
+        }
+    }
+
+    // Last resort: try swapping extension. Authors frequently keep an
+    // .png src after re-encoding to webp (or vice versa).
+    NSString *ext = path.pathExtension.lowercaseString;
+    NSArray *alts = nil;
+    if ([ext isEqualToString:@"webp"]) alts = @[@"png", @"jpg", @"jpeg", @"heic"];
+    else if ([ext isEqualToString:@"png"]) alts = @[@"webp", @"jpg", @"jpeg"];
+    else if ([ext isEqualToString:@"jpg"] || [ext isEqualToString:@"jpeg"]) alts = @[@"png", @"webp"];
+    NSString *base = [path stringByDeletingPathExtension];
+    for (NSString *e in alts) {
+        NSString *p2 = [base stringByAppendingPathExtension:e];
+        UIImage *im = [UIImage imageWithContentsOfFile:p2];
+        if (im) return im;
+        // ImageIO again on the alt-extension path.
+        NSURL *u2 = [NSURL fileURLWithPath:p2];
+        CGImageSourceRef s2 = CGImageSourceCreateWithURL((__bridge CFURLRef)u2, NULL);
+        if (s2) {
+            CGImageRef cg = CGImageSourceCreateImageAtIndex(s2, 0, NULL);
+            CFRelease(s2);
+            if (cg) {
+                UIImage *out = [UIImage imageWithCGImage:cg scale:[UIScreen mainScreen].scale orientation:UIImageOrientationUp];
+                CGImageRelease(cg);
+                if (out) return out;
+            }
+        }
+    }
+    return nil;
+}
 
 static NSArray<NSNumber *> *PPParseNumberList(NSString *s) {
     if (!s.length) return @[];
@@ -380,6 +446,13 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
         return nil;
     }
 
+    // Reset diagnostic counters per-parse (Tweak.x reads them into
+    // its debug label).
+    gPPImagesLoaded  = 0;
+    gPPImagesMissing = 0;
+    gPPEmittersBuilt = 0;
+    gPPCellsBuilt    = 0;
+
     PPCAMLParser *p = [PPCAMLParser new];
     p.assetsPath = assetsPath;
     p.doc = [PPCAMLDocument new];
@@ -394,6 +467,11 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
     }
 
     [p.doc captureBaseValues];
+    // Stash counters on the doc so callers can show them.
+    p.doc.imagesLoaded  = gPPImagesLoaded;
+    p.doc.imagesMissing = gPPImagesMissing;
+    p.doc.emittersBuilt = gPPEmittersBuilt;
+    p.doc.cellsBuilt    = gPPCellsBuilt;
     return p.doc;
 }
 
@@ -886,8 +964,9 @@ didStartElement:(NSString *)elementName
         if (src.length) {
             NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
             NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
-            UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
+            UIImage *img = PPLoadImageAtPath(imgPath);
             if (img) {
+                gPPImagesLoaded++;
                 if (self.cellStack.count) {
                     CAEmitterCell *cell = self.cellStack.lastObject;
                     cell.contents = (__bridge id)img.CGImage;
@@ -899,6 +978,9 @@ didStartElement:(NSString *)elementName
                         cur.contentsScale = img.scale;
                     }
                 }
+            } else {
+                gPPImagesMissing++;
+                NSLog(@"[PocketPlayer] missing image: %@", imgPath);
             }
         }
         return;
@@ -911,8 +993,9 @@ didStartElement:(NSString *)elementName
         if (src.length) {
             NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
             NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
-            UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
+            UIImage *img = PPLoadImageAtPath(imgPath);
             if (img) {
+                gPPImagesLoaded++;
                 if (self.cellStack.count) {
                     CAEmitterCell *cell = self.cellStack.lastObject;
                     cell.contents = (__bridge id)img.CGImage;
@@ -924,6 +1007,9 @@ didStartElement:(NSString *)elementName
                         cur.contentsScale = img.scale;
                     }
                 }
+            } else {
+                gPPImagesMissing++;
+                NSLog(@"[PocketPlayer] missing image: %@", imgPath);
             }
         }
         return;
@@ -945,6 +1031,7 @@ didStartElement:(NSString *)elementName
     }
     if ([elementName isEqualToString:@"CAEmitterCell"]) {
         CAEmitterCell *cell = [CAEmitterCell emitterCell];
+        gPPCellsBuilt++;
         for (NSString *k in attrs) {
             PPApplyEmitterCellAttribute(cell, k, attrs[k]);
         }
@@ -986,6 +1073,14 @@ didStartElement:(NSString *)elementName
             layer = [CAShapeLayer layer];
         } else if ([elementName isEqualToString:@"CAEmitterLayer"]) {
             layer = [CAEmitterLayer layer];
+            gPPEmittersBuilt++;
+            // CAEmitterLayer needs a non-zero beginTime to start
+            // emitting once attached. Without this the emitter sits
+            // at timeline=0 and never produces particles, even with
+            // birthRate > 0. We assign here on creation; if Apple's
+            // anim system later overrides via the CAML <animations>
+            // block, that's fine -- ours just primes the timeline.
+            ((CAEmitterLayer *)layer).beginTime = CACurrentMediaTime();
         } else {
             layer = [CALayer layer];
         }

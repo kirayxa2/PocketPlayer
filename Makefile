@@ -17,7 +17,7 @@ TWEAK_NAME = PocketPlayer
 
 PocketPlayer_FILES        = Tweak.x CAMLParser.m
 PocketPlayer_CFLAGS       = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
-PocketPlayer_FRAMEWORKS   = UIKit QuartzCore Foundation CoreGraphics
+PocketPlayer_FRAMEWORKS   = UIKit QuartzCore Foundation CoreGraphics ImageIO MobileCoreServices
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
