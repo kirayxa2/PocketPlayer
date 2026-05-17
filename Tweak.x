@@ -442,11 +442,32 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
             nc.name              = oldCell.name ?: @"cell";
             nc.contents          = oldCell.contents;
             nc.contentsRect      = oldCell.contentsRect;
-            // Don't copy contentsScale: the CAML's "16.67" is a CAML-
-            // private convention. Apple's renderer interprets it
-            // literally and sub-pixelates the particle. Force 1.0
-            // and use scale to size the particle instead.
-            nc.contentsScale     = 1.0;
+            // contentsScale is critical — it divides the texture's
+            // pixel size by this number to get the on-screen point
+            // size. CAML wallpapers ship huge retina textures (e.g.
+            // Mario's starbit.webp is 403x467px) and rely on a high
+            // contentsScale (e.g. 16.67) to bring the particle down
+            // to ~24x28pt on screen. If we force contentsScale=1.0
+            // the particle becomes 403x467 POINTS — a screen-filling
+            // square. So preserve whatever the cell came in with;
+            // fall back to a sensible auto-scale only when CAML
+            // gave us nothing.
+            CGFloat oldCS = oldCell.contentsScale;
+            if (oldCS > 0.5 && oldCS < 200.0) {
+                nc.contentsScale = oldCS;
+            } else {
+                // Auto-compute so the particle is at most ~32pt on
+                // screen, regardless of the texture's pixel size.
+                CGFloat px = 0;
+                if ([oldCell.contents respondsToSelector:@selector(width)]) {
+                    px = (CGFloat)CGImageGetWidth((__bridge CGImageRef)oldCell.contents);
+                }
+                if (px > 64.0) {
+                    nc.contentsScale = px / 32.0;
+                } else {
+                    nc.contentsScale = 1.0;
+                }
+            }
             nc.birthRate         = oldCell.birthRate;
             nc.lifetime          = oldCell.lifetime > 0 ? oldCell.lifetime : 4.0;
             nc.lifetimeRange     = oldCell.lifetimeRange;
