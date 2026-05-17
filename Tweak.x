@@ -1,16 +1,36 @@
 // PocketPlayer — animated lockscreen wallpapers (.ca bundles) for iOS 15.
 //
-// Hierarchy on iOS 15 (Dopamine, rootless):
-//   SBCoverSheetWindow
-//     └── CSCoverSheetView   <-- we attach our CALayer tree here (zPosition = -1, behind clock)
+// Architecture (PosterBoard-style, iOS 15 backport):
+//
+//   [SBHomeScreenWindow / wallpaper window]    <- never moves
+//      └── _UIWallpaperView                    <- our CALayer tree lives HERE
+//           └── PocketPlayerLayer
+//                └── <CAML root layer>
+//                     ├── Bottom_chest.png
+//                     ├── Top_chest.png        <- animated by Locked->Unlock states
+//                     ├── Lock.png             <- animated
+//                     └── ...
+//
+//   [SBCoverSheetWindow]                       <- this is what slides up on swipe
+//      └── CSCoverSheetView                    <- only used to track swipe progress
+//
+// Why:
+//   On real PosterBoard the wallpaper sits in its own window that does NOT move
+//   during unlock. The cover sheet (clock, notifications, passcode) is a
+//   separate window that slides off the top. So:
+//     - wallpaper = static, only its inner layers animate via state interpolation
+//     - cover sheet = full-screen translation, drives the progress value
+//   Putting our layer inside CSCoverSheetView like before made the whole thing
+//   slide up together with the clock, which is wrong.
 //
 // Progress is fed from whichever of these gets called first:
 //   1) CSCoverSheetViewController _updatePresentationProgress:withOffset:presentationState:
 //   2) SBCoverSheetSlidingViewController <same selector>
-//   3) SBDashBoardViewController <same selector>   (older private name used on some 15.x)
-//   4) Fallback: CADisplayLink reading presentationLayer.position.y of the cover sheet window.
+//   3) SBDashBoardViewController <same selector>   (older private name on some 15.x)
+//   4) Fallback: CADisplayLink reading the cover-sheet view's window-space y.
 //
-// All four are installed at once, so we don't have to rebuild to "guess" the right class.
+// All four are installed at once, so we don't have to rebuild to "guess" the
+// right one for a given iOS 15.x point release.
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -20,8 +40,8 @@
 // Configuration
 // =====================================================================
 
-// Path to the active wallpaper bundle. Change here if you ship a different default.
-// Layout: <bundle>/contents/<name>.wallpaper/<name>_Floating-WxH@3x~iphone.ca/main.caml
+// Path to the active wallpaper bundle.
+// Layout: <root>/<name>.wallpaper/<name>_Floating-WxH@3x~iphone.ca/main.caml
 static NSString *const kPPWallpaperRoot =
     @"/var/mobile/Library/PosterPlayer/active/versions/1/contents";
 
@@ -33,30 +53,41 @@ static BOOL const kPPDebugLabel = YES;
 // State
 // =====================================================================
 
-static UILabel       *gDebugLabel;
+static UILabel        *gDebugLabel;
 static PPCAMLDocument *gDoc;
-static CALayer       *gPosterLayer;     // root we added under CSCoverSheetView.layer
-static __weak UIView *gCoverSheetView;
-static CADisplayLink *gDisplayLink;
-static CGFloat        gLastProgress = 0.0;
-static CGFloat        gFallbackBaselineY = -1.0; // y position of cover sheet when fully presented
+static CALayer        *gPosterLayer;     // our container CALayer (zPosition handled below)
+static __weak UIView  *gWallpaperView;   // the static wallpaper view we host into
+static __weak UIView  *gCoverSheetView;  // the sliding view used only as progress source
+static CADisplayLink  *gDisplayLink;
+static CGFloat         gLastProgress = 0.0;
+static CGFloat         gFallbackBaselineY = -1.0;
+static NSString       *gFromState;
+static NSString       *gToState;
 
 // =====================================================================
-// Helpers
+// Private class forward decls (so the compiler is happy under -fobjc-arc)
 // =====================================================================
 
 @interface CSCoverSheetView : UIView
 @end
 
-// Forward-declare the private classes we hook so the compiler is happy.
 @interface CSCoverSheetViewController        : UIViewController @end
 @interface SBCoverSheetSlidingViewController : UIViewController @end
 @interface SBDashBoardViewController         : UIViewController @end
 
+// _UIWallpaperView lives in UIKit. SBFWallpaperView is its SpringBoard-private
+// subclass on iOS 15 and is the one actually placed on the lock screen.
+@interface _UIWallpaperView : UIView @end
+@interface SBFWallpaperView : _UIWallpaperView @end
+
+// =====================================================================
+// Helpers: filesystem
+// =====================================================================
+
 static NSString *PPFindFirstWallpaperBundle(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
-    NSArray *items = [fm contentsOfDirectoryAtPath:kPPWallpaperRoot error:&err];
+    NSArray *items = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:kPPWallpaperRoot error:&err];
     if (!items) return nil;
     for (NSString *name in items) {
         if ([name hasSuffix:@".wallpaper"]) {
@@ -67,11 +98,10 @@ static NSString *PPFindFirstWallpaperBundle(void) {
 }
 
 static NSString *PPFindFloatingCA(NSString *wallpaperBundle) {
-    NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
-    NSArray *items = [fm contentsOfDirectoryAtPath:wallpaperBundle error:&err];
+    NSArray *items = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:wallpaperBundle error:&err];
     if (!items) return nil;
-    // Prefer the *_Floating*.ca bundle; fall back to any .ca bundle.
     for (NSString *name in items) {
         if ([name hasSuffix:@".ca"] && [name containsString:@"Floating"]) {
             return [wallpaperBundle stringByAppendingPathComponent:name];
@@ -85,6 +115,10 @@ static NSString *PPFindFloatingCA(NSString *wallpaperBundle) {
     return nil;
 }
 
+// =====================================================================
+// Debug label / log
+// =====================================================================
+
 static void PPSetDebug(NSString *fmt, ...) {
     if (!kPPDebugLabel) return;
     va_list args;
@@ -94,136 +128,9 @@ static void PPSetDebug(NSString *fmt, ...) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gDebugLabel) gDebugLabel.text = s;
     });
-    // Also persist last line, useful when no debug label is shown.
     [s writeToFile:@"/var/mobile/pocketplayer.log"
         atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
-
-// State names cached per loaded document. We try the canonical PosterBoard names first
-// (Locked/Unlocked), then fall back to whatever the .caml actually defines, in document order.
-static NSString *gFromState;
-static NSString *gToState;
-
-static void PPResolveStates(PPCAMLDocument *doc) {
-    gFromState = nil;
-    gToState   = nil;
-    if (!doc) return;
-
-    // Preferred canonical pairs in PosterBoard.
-    // Names vary across communities — "Unlock" (no -ed) is common in Posterboard
-    // wallpapers, "Unlocked" is what Apple uses internally.
-    NSArray *prefer = @[
-        @[@"Locked",   @"Unlock"],
-        @[@"Locked",   @"Unlocked"],
-        @[@"Sleep",    @"Wake"],
-        @[@"Default",  @"Activated"],
-    ];
-    for (NSArray *pair in prefer) {
-        if (doc.states[pair[0]] && doc.states[pair[1]]) {
-            gFromState = pair[0];
-            gToState   = pair[1];
-            return;
-        }
-    }
-
-    // Otherwise: take the first two states we see (parser preserves declaration order).
-    NSArray *names = doc.stateOrder;
-    if (names.count >= 2) { gFromState = names[0]; gToState = names[1]; }
-    else if (names.count == 1) { gFromState = nil;  gToState = names[0]; }
-}
-
-// progress: 0 = locked (cover sheet covers screen), 1 = fully unlocked (cover sheet gone)
-static void PPApplyProgress(CGFloat progress) {
-    progress = MAX(0.0, MIN(1.0, progress));
-    gLastProgress = progress;
-    if (!gDoc || !gToState) return;
-
-    if (gFromState) {
-        [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
-    } else {
-        // Only one state defined -> interpolate base -> that state.
-        [gDoc applyState:gToState progress:progress];
-    }
-}
-
-// =====================================================================
-// Setup / teardown of the poster layer
-// =====================================================================
-
-static void PPInstallPosterIntoView(UIView *coverSheet) {
-    if (!coverSheet) return;
-    gCoverSheetView = coverSheet;
-
-    // Remove any previous instance.
-    for (CALayer *l in [coverSheet.layer.sublayers copy]) {
-        if ([l.name isEqualToString:@"PocketPlayerLayer"]) [l removeFromSuperlayer];
-    }
-
-    NSString *bundle  = PPFindFirstWallpaperBundle();
-    NSString *caPath  = bundle ? PPFindFloatingCA(bundle) : nil;
-    NSString *camlPath = caPath ? [caPath stringByAppendingPathComponent:@"main.caml"] : nil;
-    NSString *assetsPath = caPath ? [caPath stringByAppendingPathComponent:@"assets"] : nil;
-
-    if (!camlPath || ![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) {
-        PPSetDebug(@"no caml at %@", camlPath ?: @"(nil)");
-        return;
-    }
-
-    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
-    if (!doc || !doc.rootLayer) {
-        PPSetDebug(@"caml parse failed");
-        return;
-    }
-    gDoc = doc;
-
-    // Wrap rootLayer in a container so we can scale to the actual screen.
-    CALayer *container = [CALayer layer];
-    container.name = @"PocketPlayerLayer";
-    container.frame = coverSheet.bounds;
-    container.zPosition = -1; // behind clock & notifications
-    container.masksToBounds = YES;
-
-    // The CAML was authored for 390x844. Fit-to-bounds scale.
-    CGRect rb = doc.rootLayer.bounds;
-    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
-    CGFloat sx = coverSheet.bounds.size.width  / rb.size.width;
-    CGFloat sy = coverSheet.bounds.size.height / rb.size.height;
-    CGFloat s  = MAX(sx, sy); // fill (may crop horizontally on narrow phones)
-
-    doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
-    doc.rootLayer.position    = CGPointMake(coverSheet.bounds.size.width  / 2.0,
-                                            coverSheet.bounds.size.height / 2.0);
-    // CAML coords are top-left origin; CALayer is top-left too on iOS, so no flip needed
-    // for raw rendering. We DON'T flip geometry so child coordinates match the source.
-    doc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
-
-    [container addSublayer:doc.rootLayer];
-    [coverSheet.layer addSublayer:container];
-    gPosterLayer = container;
-
-    // Make sure base values reflect what's currently in the layer tree.
-    [doc captureBaseValues];
-
-    // Pick which two states drive our 0..1 transition.
-    PPResolveStates(doc);
-
-    // Log discovered states so we know exactly what the .caml exposes.
-    NSArray *names = doc.stateOrder;
-    NSString *summary = [NSString stringWithFormat:@"states=[%@] from=%@ to=%@ count=%lu",
-        [names componentsJoinedByString:@","], gFromState ?: @"-", gToState ?: @"-",
-        (unsigned long)names.count];
-    [summary writeToFile:@"/var/mobile/pocketplayer-states.log"
-              atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    // Apply locked state initially (progress 0).
-    PPApplyProgress(0.0);
-
-    PPSetDebug(@"ready %@ st=%lu", [camlPath lastPathComponent], (unsigned long)names.count);
-}
-
-// =====================================================================
-// Debug label
-// =====================================================================
 
 static void PPInstallDebugLabel(UIView *host) {
     if (!kPPDebugLabel) return;
@@ -242,7 +149,118 @@ static void PPInstallDebugLabel(UIView *host) {
 }
 
 // =====================================================================
-// Fallback: CADisplayLink reading presentationLayer y
+// State resolution
+// =====================================================================
+
+static void PPResolveStates(PPCAMLDocument *doc) {
+    gFromState = nil;
+    gToState   = nil;
+    if (!doc) return;
+
+    // Preferred canonical pairs. Community PosterBoard wallpapers usually use
+    // "Unlock" (no -ed); Apple's tooling uses "Unlocked".
+    NSArray *prefer = @[
+        @[@"Locked",  @"Unlock"],
+        @[@"Locked",  @"Unlocked"],
+        @[@"Sleep",   @"Wake"],
+        @[@"Default", @"Activated"],
+    ];
+    for (NSArray *pair in prefer) {
+        if (doc.states[pair[0]] && doc.states[pair[1]]) {
+            gFromState = pair[0];
+            gToState   = pair[1];
+            return;
+        }
+    }
+
+    NSArray *names = doc.stateOrder;
+    if (names.count >= 2) { gFromState = names[0]; gToState = names[1]; }
+    else if (names.count == 1) { gFromState = nil; gToState = names[0]; }
+}
+
+// progress: 0 = locked, 1 = fully unlocked
+static void PPApplyProgress(CGFloat progress) {
+    progress = MAX(0.0, MIN(1.0, progress));
+    gLastProgress = progress;
+    if (!gDoc || !gToState) return;
+    if (gFromState) {
+        [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
+    } else {
+        [gDoc applyState:gToState progress:progress];
+    }
+}
+
+// =====================================================================
+// Poster install (into the static wallpaper view)
+// =====================================================================
+
+static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
+    if (!wallpaper) return;
+    gWallpaperView = wallpaper;
+
+    // Remove any previous instance (we get re-installed on relayout).
+    for (CALayer *l in [wallpaper.layer.sublayers copy]) {
+        if ([l.name isEqualToString:@"PocketPlayerLayer"]) [l removeFromSuperlayer];
+    }
+
+    NSString *bundle  = PPFindFirstWallpaperBundle();
+    NSString *caPath  = bundle ? PPFindFloatingCA(bundle) : nil;
+    NSString *camlPath  = caPath ? [caPath stringByAppendingPathComponent:@"main.caml"] : nil;
+    NSString *assetsPath = caPath ? [caPath stringByAppendingPathComponent:@"assets"] : nil;
+
+    if (!camlPath || ![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) {
+        PPSetDebug(@"no caml at %@", camlPath ?: @"(nil)");
+        return;
+    }
+
+    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
+    if (!doc || !doc.rootLayer) {
+        PPSetDebug(@"caml parse failed");
+        return;
+    }
+    gDoc = doc;
+
+    // Container scaled to fit the wallpaper view (= screen).
+    CALayer *container = [CALayer layer];
+    container.name = @"PocketPlayerLayer";
+    container.frame = wallpaper.bounds;
+    container.zPosition = 100; // above the wallpaper image
+    container.masksToBounds = YES;
+
+    CGRect rb = doc.rootLayer.bounds;
+    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+    CGFloat sx = wallpaper.bounds.size.width  / rb.size.width;
+    CGFloat sy = wallpaper.bounds.size.height / rb.size.height;
+    CGFloat s  = MAX(sx, sy); // fill
+
+    doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
+    doc.rootLayer.position    = CGPointMake(wallpaper.bounds.size.width  / 2.0,
+                                            wallpaper.bounds.size.height / 2.0);
+    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+
+    [container addSublayer:doc.rootLayer];
+    [wallpaper.layer addSublayer:container];
+    gPosterLayer = container;
+
+    [doc captureBaseValues];
+    PPResolveStates(doc);
+
+    NSArray *names = doc.stateOrder;
+    NSString *summary = [NSString stringWithFormat:@"states=[%@] from=%@ to=%@ count=%lu",
+        [names componentsJoinedByString:@","], gFromState ?: @"-", gToState ?: @"-",
+        (unsigned long)names.count];
+    [summary writeToFile:@"/var/mobile/pocketplayer-states.log"
+              atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    PPApplyProgress(0.0);
+    PPSetDebug(@"ready %@ st=%lu host=%@",
+        [camlPath lastPathComponent],
+        (unsigned long)names.count,
+        NSStringFromClass([wallpaper class]));
+}
+
+// =====================================================================
+// Fallback: CADisplayLink — reads the cover-sheet view position to derive 0..1
 // =====================================================================
 
 @interface PPDisplayLinkTarget : NSObject
@@ -253,21 +271,18 @@ static void PPInstallDebugLabel(UIView *host) {
 - (void)tick:(CADisplayLink *)link {
     UIView *cs = gCoverSheetView;
     if (!cs.window) return;
-    CALayer *pl = (CALayer *)[cs.layer presentationLayer];
-    if (!pl) return;
 
-    // The window/view that holds CSCoverSheetView slides up during unlock.
-    // We track our own view's position in window coordinates.
+    // Convert center to window coords. While unlocking, the cover sheet view
+    // (or one of its ancestors) translates upward off-screen.
     CGPoint center = [cs.superview convertPoint:cs.center toView:nil];
     CGFloat y = center.y;
 
-    // Establish baseline lazily as the highest y we ever see (= fully presented / locked).
     if (gFallbackBaselineY < 0 || y > gFallbackBaselineY) gFallbackBaselineY = y;
 
     CGFloat h = cs.bounds.size.height;
     if (h <= 1) return;
 
-    CGFloat travel = gFallbackBaselineY - y; // how far up we've moved
+    CGFloat travel = gFallbackBaselineY - y;
     CGFloat progress = travel / h;
     progress = MAX(0.0, MIN(1.0, progress));
 
@@ -282,7 +297,6 @@ static void PPInstallDebugLabel(UIView *host) {
 static void PPStartDisplayLink(void) {
     if (gDisplayLink) return;
     PPDisplayLinkTarget *t = [PPDisplayLinkTarget new];
-    // Retain target by associating with the link (CADisplayLink retains target).
     gDisplayLink = [CADisplayLink displayLinkWithTarget:t selector:@selector(tick:)];
     [gDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
@@ -291,27 +305,56 @@ static void PPStartDisplayLink(void) {
 // Hooks
 // =====================================================================
 
+// (1) Wallpaper view — STATIC host. Hook the SpringBoard-private subclass
+//     SBFWallpaperView and the generic _UIWallpaperView, so we work on every
+//     iOS 15.x build regardless of which one shows up first.
+
+%hook SBFWallpaperView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window == nil) return;
+    // Only the lockscreen wallpaper view is what we want; on iOS 15 it is
+    // typically inside the SBHomeScreenWindow stack and visible while locked.
+    PPInstallPosterIntoWallpaperView(self);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    if (gPosterLayer && gPosterLayer.superlayer == self.layer) {
+        gPosterLayer.frame = self.bounds;
+        if (gDoc.rootLayer) {
+            CGRect rb = gDoc.rootLayer.bounds;
+            if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+            CGFloat sx = self.bounds.size.width  / rb.size.width;
+            CGFloat sy = self.bounds.size.height / rb.size.height;
+            CGFloat s  = MAX(sx, sy);
+            gDoc.rootLayer.position = CGPointMake(self.bounds.size.width / 2.0,
+                                                  self.bounds.size.height / 2.0);
+            gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+        }
+    }
+}
+
+%end
+
+// (2) Cover sheet view — used ONLY to:
+//       - capture the view ref so the CADisplayLink can read its position
+//       - host the debug label
+
 %hook CSCoverSheetView
 
 - (void)didMoveToWindow {
     %orig;
     if (self.window == nil) return;
-
-    PPInstallPosterIntoView(self);
+    gCoverSheetView = self;
+    gFallbackBaselineY = -1.0; // re-establish baseline after relayout
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
 }
 
 - (void)layoutSubviews {
     %orig;
-    // Keep our container sized to the view.
-    if (gPosterLayer && gPosterLayer.superlayer == self.layer) {
-        gPosterLayer.frame = self.bounds;
-        if (gDoc.rootLayer) {
-            gDoc.rootLayer.position = CGPointMake(self.bounds.size.width / 2.0,
-                                                  self.bounds.size.height / 2.0);
-        }
-    }
     if (gDebugLabel.superview == self) {
         gDebugLabel.frame = CGRectMake(8, 60, self.bounds.size.width - 16, 22);
     }
@@ -319,16 +362,17 @@ static void PPStartDisplayLink(void) {
 
 %end
 
-// Three different controllers expose the same selector across iOS 15.x point releases.
-// We hook all three; only the one in use will be matched at runtime by libhooker/ellekit.
+// (3) Three potential progress sources. Whichever exists at runtime gets matched.
 
 %hook CSCoverSheetViewController
 - (void)_updatePresentationProgress:(CGFloat)progress
                          withOffset:(CGFloat)offset
                   presentationState:(NSInteger)state {
     %orig;
-    PPApplyProgress(1.0 - progress); // CS reports 1=presented(locked), 0=dismissed(unlocked) — invert
-    PPSetDebug(@"CS p=%.3f off=%.1f st=%ld", progress, (double)offset, (long)state);
+    PPApplyProgress(1.0 - progress); // CS reports 1=locked, 0=unlocked
+    PPSetDebug(@"CS p=%.2f %@->%@ off=%.0f st=%ld",
+        1.0 - progress, gFromState ?: @"-", gToState ?: @"-",
+        (double)offset, (long)state);
 }
 %end
 
@@ -338,7 +382,9 @@ static void PPStartDisplayLink(void) {
                   presentationState:(NSInteger)state {
     %orig;
     PPApplyProgress(1.0 - progress);
-    PPSetDebug(@"Sl p=%.3f off=%.1f st=%ld", progress, (double)offset, (long)state);
+    PPSetDebug(@"Sl p=%.2f %@->%@ off=%.0f st=%ld",
+        1.0 - progress, gFromState ?: @"-", gToState ?: @"-",
+        (double)offset, (long)state);
 }
 %end
 
@@ -348,13 +394,14 @@ static void PPStartDisplayLink(void) {
                   presentationState:(NSInteger)state {
     %orig;
     PPApplyProgress(1.0 - progress);
-    PPSetDebug(@"DB p=%.3f off=%.1f st=%ld", progress, (double)offset, (long)state);
+    PPSetDebug(@"DB p=%.2f %@->%@ off=%.0f st=%ld",
+        1.0 - progress, gFromState ?: @"-", gToState ?: @"-",
+        (double)offset, (long)state);
 }
 %end
 
 %ctor {
     @autoreleasepool {
-        // Init only if loaded into SpringBoard (filter ensures this, but be safe).
         NSString *exe = [[[NSBundle mainBundle] executablePath] lastPathComponent];
         if (![exe isEqualToString:@"SpringBoard"]) return;
         %init;
