@@ -1,0 +1,9 @@
+Package: com.vortex.pocketposter
+Name: PocketPoster
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Companion app for PocketPlayer — import .tendies wallpapers and apply them without SSH.
+Maintainer: vortex
+Author: vortex
+Section: Applications
+Depends: firmware (>= 15.0)

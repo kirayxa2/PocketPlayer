@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Bare-minimum entitlements for an unsigned jailbroken app. We don't
+        need any TCC or sandbox-escape grants for the v0.1 skeleton; the
+        Documents directory we read/write is the app's own.
+
+        If we later add a privileged helper that copies into
+        /var/mobile/Library/PosterPlayer/, the helper gets its own plist
+        with com.apple.private.security.no-sandbox there, NOT here.
+    -->
+    <key>com.apple.private.security.container-required</key>
+    <false/>
+</dict>
+</plist>

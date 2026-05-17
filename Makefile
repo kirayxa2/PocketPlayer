@@ -22,7 +22,18 @@ PocketPlayer_FRAMEWORKS   = UIKit QuartzCore Foundation CoreGraphics
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # Convenience target: clean + build
-.PHONY: rebuild
+.PHONY: rebuild app app-clean app-deploy
 rebuild:
 	$(MAKE) clean
 	$(MAKE) package
+
+# Build the PocketPoster companion app (separate .deb).
+app:
+	$(MAKE) -C app package
+
+app-clean:
+	$(MAKE) -C app clean
+
+# End-to-end: build + scp + install + uicache.
+app-deploy:
+	./scripts/deploy-app.sh
