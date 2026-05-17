@@ -1270,13 +1270,19 @@ didStartElement:(NSString *)elementName
         return;
     }
 
-    if ([elementName isEqualToString:@"CALayer"] ||
-        [elementName isEqualToString:@"CATransformLayer"] ||
-        [elementName isEqualToString:@"CAShapeLayer"] ||
-        [elementName isEqualToString:@"CAEmitterLayer"]) {
-        if (self.layerStack.count) [self.layerStack removeLastObject];
-        return;
-    }
-}
+@end
 
+#pragma mark - Debug: emitter collection
+
+@implementation CALayer (PPDebug)
+- (NSArray<CAEmitterLayer *> *)pp_collectEmitters {
+    NSMutableArray *out = [NSMutableArray array];
+    if ([self isKindOfClass:[CAEmitterLayer class]]) {
+        [out addObject:(CAEmitterLayer *)self];
+    }
+    for (CALayer *l in self.sublayers) {
+        [out addObjectsFromArray:[l pp_collectEmitters]];
+    }
+    return out;
+}
 @end
