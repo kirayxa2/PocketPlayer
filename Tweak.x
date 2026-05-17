@@ -322,6 +322,9 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
 - (void)tick:(CADisplayLink *)link;
 @end
 
+// Forward declaration: implementation lives below in the Hooks section.
+static void PPTryInstallFromCoverSheet(UIView *coverSheet);
+
 @implementation PPDisplayLinkTarget
 - (void)tick:(CADisplayLink *)link {
     UIView *cs = gCoverSheetView;
@@ -330,6 +333,35 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
         // next lock cycle starts clean.
         if (gPosterLayer && gLastCounterY != 0.0) PPApplyCounterTranslate(0.0);
         return;
+    }
+
+    // Lazy-discover the wallpaper view if we haven't already.
+    if (!gPosterLayer || !gPosterLayer.superlayer) {
+        PPTryInstallFromCoverSheet(cs);
+    }
+
+    // Keep poster sized correctly on relayout (orientation, etc.).
+    UIView *wp = gWallpaperView;
+    if (gPosterLayer && wp && gPosterLayer.superlayer == wp.layer) {
+        if (!CGSizeEqualToSize(gPosterLayer.bounds.size, wp.bounds.size)) {
+            gPosterLayer.bounds = wp.bounds;
+            gPosterLayer.position = CGPointMake(wp.bounds.size.width / 2.0,
+                                                 wp.bounds.size.height / 2.0);
+            if (gDoc.rootLayer) {
+                CGRect rb = gDoc.rootLayer.bounds;
+                if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+                CGFloat sx = wp.bounds.size.width  / rb.size.width;
+                CGFloat sy = wp.bounds.size.height / rb.size.height;
+                CGFloat s  = MAX(sx, sy);
+                CATransform3D t = CATransform3DMakeScale(s, s, 1.0);
+                if (wp.layer.geometryFlipped) {
+                    t = CATransform3DConcat(t, CATransform3DMakeScale(1.0, -1.0, 1.0));
+                }
+                gDoc.rootLayer.position = CGPointMake(wp.bounds.size.width  / 2.0,
+                                                      wp.bounds.size.height / 2.0);
+                gDoc.rootLayer.transform = t;
+            }
+        }
     }
 
     // Cover sheet center in window coords. While unlocking, one of its
@@ -372,10 +404,13 @@ static void PPStartDisplayLink(void) {
 // Hooks
 // =====================================================================
 
-// (1) Wallpaper view — STATIC host. Hook the generic _UIWallpaperView so we
-//     catch whatever subclass (SBFWallpaperView, etc.) the running iOS build
-//     actually instantiates. We then filter to LOCK-SCREEN context only,
-//     so the home-screen wallpaper stays untouched.
+// (1) Lockscreen wallpaper host — discovered via runtime walk from the cover
+//     sheet's window, NOT by hooking a guessed class name. This is robust
+//     across iOS 15.x point releases where the wallpaper view's class might
+//     be _UIWallpaperView, SBFWallpaperView, MWFWallpaperView, ...
+//
+//     We DON'T %hook a wallpaper class anymore. Discovery is driven from
+//     CSCoverSheetView didMoveToWindow / layoutSubviews and the displaylink.
 
 // Build a "Class<-Class<-...<-Window" diagnostic string for the view chain.
 static NSString *PPViewChain(UIView *v) {
@@ -390,23 +425,52 @@ static NSString *PPViewChain(UIView *v) {
     return [parts componentsJoinedByString:@"<-"];
 }
 
-static void PPMaybeInstallIntoWallpaper(UIView *v) {
-    if (!v.window) return;
+// =====================================================================
+// Wallpaper-view discovery — runtime, not by hooking a guessed class name.
+//
+// On iOS 15.x the lock-screen wallpaper view's class can be named anything:
+// _UIWallpaperView, SBFWallpaperView, MWFWallpaperView, etc. Hooking by name
+// is brittle. Instead we walk the live view hierarchy from the cover-sheet
+// view UPWARD to its window, then DOWNWARD looking for the largest descendant
+// whose class name contains "Wallpaper" (case-insensitive). That's our host.
 
-    // Always log the chain so we can see exactly where each _UIWallpaperView
-    // lives. After the first lock cycle we'll know which class names to
-    // accept/reject.
-    NSString *chain = PPViewChain(v);
-    BOOL isLock = PPViewIsInLockScreen(v);
-    PPSetDebug(@"wp%@ %@", isLock ? @"!" : @"?", chain);
+static UIView *PPFindWallpaperViewIn(UIView *root) {
+    if (!root) return nil;
+    NSString *name = NSStringFromClass([root class]);
+    if (([name rangeOfString:@"Wallpaper" options:NSCaseInsensitiveSearch].location != NSNotFound) &&
+        ([name rangeOfString:@"Effect" options:NSCaseInsensitiveSearch].location == NSNotFound) &&
+        root.bounds.size.width  > 100 &&
+        root.bounds.size.height > 100) {
+        return root;
+    }
+    for (UIView *sub in root.subviews) {
+        UIView *r = PPFindWallpaperViewIn(sub);
+        if (r) return r;
+    }
+    return nil;
+}
 
-    if (!isLock) return;
+static UIView *PPLocateLockWallpaperView(UIView *coverSheetView) {
+    UIWindow *win = coverSheetView.window;
+    if (!win) return nil;
+    return PPFindWallpaperViewIn(win);
+}
 
-    // Skip if we already installed into THIS view.
-    for (CALayer *l in v.layer.sublayers) {
+// Try installing into the wallpaper view found in the cover-sheet's window.
+// Idempotent: bails out if our layer is already in place.
+static void PPTryInstallFromCoverSheet(UIView *coverSheet) {
+    UIView *wp = PPLocateLockWallpaperView(coverSheet);
+    if (!wp) {
+        PPSetDebug(@"no wallpaper view found in window");
+        return;
+    }
+    // Skip if already hosted on this exact view.
+    for (CALayer *l in wp.layer.sublayers) {
         if ([l.name isEqualToString:@"PocketPlayerLayer"]) return;
     }
-    PPInstallPosterIntoWallpaperView(v);
+    PPSetDebug(@"host=%@", NSStringFromClass([wp class]));
+    PPInstallPosterIntoWallpaperView(wp);
+    PPCleanupStaleLayers(wp);
 }
 
 // Recursively walk a CALayer tree and remove every layer named
@@ -433,48 +497,12 @@ static void PPCleanupStaleLayers(UIView *keepHost) {
     PPReapPocketLayersIn(w.layer, gPosterLayer);
 }
 
-%hook _UIWallpaperView
+// (Wallpaper-view discovery is purely runtime — no %hook on a guessed class.)
 
-- (void)didMoveToWindow {
-    %orig;
-    PPMaybeInstallIntoWallpaper(self);
-    PPCleanupStaleLayers(self);
-}
-
-- (void)layoutSubviews {
-    %orig;
-    if (gPosterLayer && gPosterLayer.superlayer == self.layer) {
-        // Resize the container WITHOUT clobbering its transform (we use it
-        // for counter-translate). Setting `frame` would clear the transform
-        // implicitly; setting bounds+position keeps the transform alive.
-        gPosterLayer.bounds = self.bounds;
-        gPosterLayer.position = CGPointMake(self.bounds.size.width / 2.0,
-                                             self.bounds.size.height / 2.0);
-        if (gDoc.rootLayer) {
-            CGRect rb = gDoc.rootLayer.bounds;
-            if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
-            CGFloat sx = self.bounds.size.width  / rb.size.width;
-            CGFloat sy = self.bounds.size.height / rb.size.height;
-            CGFloat s  = MAX(sx, sy);
-            // If the host view has geometryFlipped (some wallpaper views do),
-            // we counter it by flipping our root layer's Y axis. This keeps
-            // the chest right-side up regardless of host orientation.
-            CATransform3D t = CATransform3DMakeScale(s, s, 1.0);
-            if (self.layer.geometryFlipped) {
-                t = CATransform3DConcat(t, CATransform3DMakeScale(1.0, -1.0, 1.0));
-            }
-            gDoc.rootLayer.position = CGPointMake(self.bounds.size.width  / 2.0,
-                                                  self.bounds.size.height / 2.0);
-            gDoc.rootLayer.transform = t;
-        }
-    }
-}
-
-%end
-
-// (2) Cover sheet view — used ONLY to:
+// (2) Cover sheet view — primary entry point now:
 //       - capture the view ref so the CADisplayLink can read its position
 //       - host the debug label
+//       - kick off wallpaper-view discovery and poster install
 
 %hook CSCoverSheetView
 
@@ -494,12 +522,22 @@ static void PPCleanupStaleLayers(UIView *keepHost) {
 
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
+
+    // Try to find and host into the wallpaper view right now. If the
+    // wallpaper isn't ready yet, the displaylink will retry every frame
+    // until it appears.
+    PPTryInstallFromCoverSheet(self);
 }
 
 - (void)layoutSubviews {
     %orig;
     if (gDebugLabel.superview == self) {
         gDebugLabel.frame = CGRectMake(8, 60, self.bounds.size.width - 16, 22);
+    }
+    // Re-discover on relayout (e.g. orientation change) only if we don't
+    // already have a host.
+    if (!gPosterLayer || !gPosterLayer.superlayer) {
+        PPTryInstallFromCoverSheet(self);
     }
 }
 
