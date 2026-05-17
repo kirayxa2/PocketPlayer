@@ -357,7 +357,17 @@ static CALayer *PPBuildScaledLayerFromCAML(NSString *caPath,
     // Prefer the inner Floating sub-tree if present (iPad-canvas-with-
     // iPhone-Floating layout), else use the doc's root.
     CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
-    if (visibleRoot != doc.rootLayer) [visibleRoot removeFromSuperlayer];
+    if (visibleRoot != doc.rootLayer) {
+        // We're promoting an inner sub-tree to the role of root.
+        // Whatever geometryFlipped the OUTER root had defined the
+        // coordinate convention the author drew their children in,
+        // so we inherit that. Without this, MarioGalaxy-style CAMLs
+        // (outer geometryFlipped="1", inner Floating geometryFlipped="0")
+        // would render Y-inverted: planet ends up at the top instead
+        // of the bottom, Mario above center instead of below, etc.
+        visibleRoot.geometryFlipped = doc.rootLayer.geometryFlipped;
+        [visibleRoot removeFromSuperlayer];
+    }
 
     CGRect rb = visibleRoot.bounds;
     if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
