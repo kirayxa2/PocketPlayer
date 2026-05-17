@@ -409,24 +409,28 @@ static void PPMaybeInstallIntoWallpaper(UIView *v) {
     PPInstallPosterIntoWallpaperView(v);
 }
 
-// Walk up from a view to its window and remove ANY PocketPlayerLayer found
-// in the subtree of that window other than the one on `keepHost`. This kills
-// stale layers left behind by previous tweak versions (e.g. the one that
-// hosted into CSCoverSheetView).
+// Recursively walk a CALayer tree and remove every layer named
+// "PocketPlayerLayer" except `keep`. Plain C recursion to avoid the
+// retain-cycle warning ARC emits for self-referencing blocks.
+static void PPReapPocketLayersIn(CALayer *root, CALayer *keep) {
+    if (!root) return;
+    for (CALayer *child in [root.sublayers copy]) {
+        if ([child.name isEqualToString:@"PocketPlayerLayer"] && child != keep) {
+            [child removeFromSuperlayer];
+        } else {
+            PPReapPocketLayersIn(child, keep);
+        }
+    }
+}
+
+// Sweep the whole window subtree and remove stray PocketPlayerLayer
+// instances left behind by older tweak versions (e.g. ones attached to
+// CSCoverSheetView). The currently-installed layer (gPosterLayer) is
+// preserved.
 static void PPCleanupStaleLayers(UIView *keepHost) {
     UIWindow *w = keepHost.window;
     if (!w) return;
-    void (^__block walk)(CALayer *) = nil;
-    walk = ^(CALayer *l) {
-        for (CALayer *child in [l.sublayers copy]) {
-            if ([child.name isEqualToString:@"PocketPlayerLayer"] && child != gPosterLayer) {
-                [child removeFromSuperlayer];
-            } else {
-                walk(child);
-            }
-        }
-    };
-    walk(w.layer);
+    PPReapPocketLayersIn(w.layer, gPosterLayer);
 }
 
 %hook _UIWallpaperView
