@@ -1008,9 +1008,10 @@ didStartElement:(NSString *)elementName
             NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
             NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
             UIImage *img = PPLoadImageAtPath(imgPath);
+            BOOL toCell = (self.cellStack.count > 0);
             if (img) {
                 gPPImagesLoaded++;
-                if (self.cellStack.count) {
+                if (toCell) {
                     CAEmitterCell *cell = self.cellStack.lastObject;
                     cell.contents = (__bridge id)img.CGImage;
                     cell.contentsScale = img.scale;
@@ -1024,6 +1025,14 @@ didStartElement:(NSString *)elementName
             } else {
                 gPPImagesMissing++;
                 NSLog(@"[PocketPlayer] missing image: %@", imgPath);
+            }
+            if (gPPEmitterDumpBudget > 0) {
+                PPDumpEmitter([NSString stringWithFormat:
+                    @"  contents short form: src=%@ -> %@ owner=%@ size=%@",
+                    decoded,
+                    img ? @"OK" : @"FAILED",
+                    toCell ? @"CELL" : @"LAYER",
+                    img ? NSStringFromCGSize(img.size) : @"-"]);
             }
         }
         return;
@@ -1078,15 +1087,9 @@ didStartElement:(NSString *)elementName
         for (NSString *k in attrs) {
             PPApplyEmitterCellAttribute(cell, k, attrs[k]);
         }
-        if (gPPEmitterDumpBudget-- > 0) {
-            PPDumpEmitter([NSString stringWithFormat:
-                @"cell name=%@ birthRate=%.2f lifetime=%.2f velocity=%.2f scale=%.2f scaleRange=%.2f contentsScale=%.2f contents=%@",
-                cell.name ?: @"-",
-                cell.birthRate, cell.lifetime, cell.velocity,
-                cell.scale, cell.scaleRange,
-                cell.contentsScale,
-                cell.contents ? @"YES" : @"NO"]);
-        }
+        // NOTE: don't dump here — <contents> hasn't been parsed yet,
+        // so cell.contents is still nil. We dump on the closing tag,
+        // which fires after all children have been processed.
         // Attach to parent cell (nested case) or to the owning emitter
         // layer. We can't actually mutate `emitterCells` until we
         // close the parent's tag because some authoring tools list a
@@ -1240,7 +1243,28 @@ didStartElement:(NSString *)elementName
         return;
     }
     if ([elementName isEqualToString:@"CAEmitterCell"]) {
-        if (self.cellStack.count) [self.cellStack removeLastObject];
+        if (self.cellStack.count) {
+            CAEmitterCell *cell = self.cellStack.lastObject;
+            // Dump now: contents has been set (or not) by the
+            // <contents>/<CGImage> child handlers above.
+            if (gPPEmitterDumpBudget-- > 0) {
+                CGImageRef cg = (__bridge CGImageRef)cell.contents;
+                size_t cw = cg ? CGImageGetWidth(cg) : 0;
+                size_t ch = cg ? CGImageGetHeight(cg) : 0;
+                PPDumpEmitter([NSString stringWithFormat:
+                    @"cell-CLOSE name=%@ birthRate=%.2f lifetime=%.2f velocity=%.2f "
+                    @"scale=%.2f scaleRange=%.2f contentsScale=%.2f "
+                    @"contents=%@ cgSize=%zux%zu particleType=%@",
+                    cell.name ?: @"-",
+                    cell.birthRate, cell.lifetime, cell.velocity,
+                    cell.scale, cell.scaleRange,
+                    cell.contentsScale,
+                    cell.contents ? @"YES" : @"NO",
+                    cw, ch,
+                    [cell valueForKey:@"particleType"] ?: @"-"]);
+            }
+            [self.cellStack removeLastObject];
+        }
         return;
     }
 
