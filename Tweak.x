@@ -199,6 +199,18 @@ static void PPApplyProgress(CGFloat progress) {
         }
     }
 
+    // Snap-hide the cover-sheet poster the moment we've fully unlocked.
+    // The cover-sheet WINDOW lives ~2s past the actual unlock (system
+    // dismiss animation), and since it's stacked above the home-screen
+    // window, our poster on it would otherwise occlude the icons during
+    // that window. The home poster has identical pose at this point, so
+    // toggling .hidden is invisible to the user — they perceive the same
+    // chest staying put while icons spawn on top via the standard iOS
+    // home-screen reveal animation.
+    if (gPosterLayer) {
+        gPosterLayer.hidden = (progress >= 0.99);
+    }
+
     [CATransaction commit];
 }
 
@@ -631,6 +643,12 @@ static void PPStartDisplayLink(void) {
         // a sibling window is removed even if it tried to reattach.
         PPNukeAllStaleLayersEverywhere(gPosterLayer);
     }
+
+    // Cover sheet just (re-)appeared - whether from lock or from
+    // re-lock-after-unlock, the user is now looking at the lock screen
+    // and our poster must be visible. The snap-hide in PPApplyProgress
+    // only fires at progress >= 0.99.
+    if (gPosterLayer) gPosterLayer.hidden = NO;
 }
 
 - (void)layoutSubviews {
