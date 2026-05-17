@@ -39,10 +39,13 @@ static BOOL const kPPDebugLabel = YES;
 // =====================================================================
 
 static UILabel        *gDebugLabel;
-static PPCAMLDocument *gDoc;
+static PPCAMLDocument *gDoc;            // poster on cover-sheet window (animates with swipe)
 static CALayer        *gPosterLayer;     // our container CALayer (in window.layer)
 static __weak UIWindow *gHostWindow;     // SBCoverSheetWindow (host of poster layer)
 static __weak UIView  *gCoverSheetView;  // the sliding view (progress source only)
+static PPCAMLDocument *gHomeDoc;         // poster on home-screen window (frozen at Unlock)
+static CALayer        *gHomePosterLayer; // home-screen container CALayer
+static __weak UIWindow *gHomeHostWindow; // SBHomeScreenWindow / app's main window
 static CADisplayLink  *gDisplayLink;
 static CGFloat         gLastProgress = 0.0;
 static CGFloat         gFallbackBaselineY = -1.0;
@@ -69,6 +72,8 @@ static void PPNukeStaleLayersInTree(CALayer *root, CALayer *keep);
 static void PPNukeStaleViewsInTree(UIView *root);
 static void PPNukeAllStaleLayersEverywhere(CALayer *keep);
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep);
+static UIWindow *PPFindHomeScreenWindow(void);
+static void PPInstallPosterIntoHomeWindow(UIWindow *window);
 
 // =====================================================================
 // Filesystem helpers
@@ -175,6 +180,25 @@ static void PPApplyProgress(CGFloat progress) {
     } else {
         [gDoc applyState:gToState progress:progress];
     }
+
+    // Fade out the cover-sheet poster during the last ~30% of the swipe so
+    // it doesn't linger on top of the home screen after the unlock completes.
+    // Home-screen poster (gHomePosterLayer) stays fully opaque underneath, so
+    // the user sees a clean handoff: animated chest opening on lock screen,
+    // then dock/icons spawning over the already-open chest on home screen.
+    if (gPosterLayer) {
+        CGFloat fadeStart = 0.7;
+        CGFloat alpha = 1.0;
+        if (progress > fadeStart) {
+            alpha = 1.0 - (progress - fadeStart) / (1.0 - fadeStart);
+            if (alpha < 0.0) alpha = 0.0;
+        }
+        // Disable implicit animation so we follow the gesture in real time.
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        gPosterLayer.opacity = (float)alpha;
+        [CATransaction commit];
+    }
 }
 
 // =====================================================================
@@ -261,9 +285,107 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {
     if (!window) return;
     for (CALayer *l in [window.layer.sublayers copy]) {
-        if (l != keep && PPIsOurLayerName(l.name)) {
+        if (l != keep && l != gHomePosterLayer && PPIsOurLayerName(l.name)) {
             [l removeFromSuperlayer];
         }
+    }
+}
+
+// =====================================================================
+// Poster install — into the HOME-SCREEN WINDOW's layer (frozen at Unlock)
+// =====================================================================
+
+// On iOS 15 the home screen lives in its own UIWindow (commonly named
+// SBHomeScreenWindow / SBHomeScreenRootViewController's view's window).
+// We pick the lowest-windowLevel window whose class name contains
+// "HomeScreen", or fall back to the application's first window that
+// isn't the cover-sheet window we already use.
+static UIWindow *PPFindHomeScreenWindow(void) {
+    NSArray<UIWindow *> *windows = nil;
+    if (@available(iOS 15.0, *)) {
+        NSMutableArray *all = [NSMutableArray array];
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                [all addObjectsFromArray:((UIWindowScene *)s).windows];
+            }
+        }
+        windows = all;
+    }
+    if (windows.count == 0) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        windows = [UIApplication sharedApplication].windows;
+        #pragma clang diagnostic pop
+    }
+    for (UIWindow *w in windows) {
+        NSString *cls = NSStringFromClass([w class]);
+        if (cls && [cls containsString:@"HomeScreen"]) return w;
+    }
+    return nil;
+}
+
+// Installs a SECOND chest poster on the home-screen window, frozen at
+// the Unlock state (chest fully open). This is what the user sees AFTER
+// the cover sheet finishes sliding away — the icons/dock get composed
+// on top of an already-open chest.
+//
+// We don't drive this one with progress; it just applies state=Unlock
+// once at install time.
+static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
+    if (!window) return;
+    gHomeHostWindow = window;
+
+    // Wipe any prior home-poster from this window.
+    for (CALayer *l in [window.layer.sublayers copy]) {
+        if (l != gHomePosterLayer && PPIsOurLayerName(l.name)) {
+            [l removeFromSuperlayer];
+        }
+    }
+
+    NSString *bundle  = PPFindFirstWallpaperBundle();
+    NSString *caPath  = bundle ? PPFindFloatingCA(bundle) : nil;
+    NSString *camlPath  = caPath ? [caPath stringByAppendingPathComponent:@"main.caml"] : nil;
+    NSString *assetsPath = caPath ? [caPath stringByAppendingPathComponent:@"assets"] : nil;
+    if (!camlPath || ![[NSFileManager defaultManager] fileExistsAtPath:camlPath]) return;
+
+    PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
+    if (!doc || !doc.rootLayer) return;
+    gHomeDoc = doc;
+
+    CALayer *container = [CALayer layer];
+    container.name = @"PocketPlayerHomeLayer";
+    container.bounds = window.bounds;
+    container.position = CGPointMake(window.bounds.size.width / 2.0,
+                                     window.bounds.size.height / 2.0);
+    // zPosition = -1000 puts us at the very back of the home window so
+    // dock + icons + folders + spotlight all render on top of us.
+    container.zPosition = -1000;
+    container.masksToBounds = NO;
+    container.geometryFlipped = YES;
+
+    CGRect rb = doc.rootLayer.bounds;
+    if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+    CGFloat sx = window.bounds.size.width  / rb.size.width;
+    CGFloat sy = window.bounds.size.height / rb.size.height;
+    CGFloat s  = MAX(sx, sy);
+
+    doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
+    doc.rootLayer.position    = CGPointMake(window.bounds.size.width  / 2.0,
+                                            window.bounds.size.height / 2.0);
+    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+
+    [container addSublayer:doc.rootLayer];
+    [window.layer addSublayer:container];
+    gHomePosterLayer = container;
+
+    // Apply the Unlock state once. We use the same gFromState/gToState
+    // already resolved by PPResolveStates in the cover-sheet install path;
+    // we just push to progress=1.0 (fully unlocked).
+    [doc captureBaseValues];
+    if (gFromState && gToState) {
+        [doc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+    } else if (gToState) {
+        [doc applyState:gToState progress:1.0];
     }
 }
 
@@ -280,12 +402,12 @@ static BOOL PPIsOurLayerName(NSString *n) {
 }
 
 // Recursively walks a CALayer tree and removes any sublayer that looks
-// like one of ours, except the one we want to keep. Plain C, no blocks,
+// like one of ours, except the two we want to keep. Plain C, no blocks,
 // to avoid -Warc-retain-cycles on self-referential captures.
 static void PPNukeStaleLayersInTree(CALayer *root, CALayer *keep) {
     if (!root) return;
     for (CALayer *l in [root.sublayers copy]) {
-        if (l != keep && PPIsOurLayerName(l.name)) {
+        if (l != keep && l != gHomePosterLayer && PPIsOurLayerName(l.name)) {
             [l removeFromSuperlayer];
             continue;
         }
@@ -402,6 +524,13 @@ static void PPHideAllSystemWallpapers(void) {
     // user's background bleed through over our poster.
     PPHideAllSystemWallpapers();
 
+    // Install / re-install the home-screen poster lazily, since the
+    // home window may not exist when the cover-sheet first comes up.
+    if (!gHomePosterLayer || gHomePosterLayer.superlayer == nil) {
+        UIWindow *hw = PPFindHomeScreenWindow();
+        if (hw) PPInstallPosterIntoHomeWindow(hw);
+    }
+
     // Keep poster sized to the window on rotation.
     UIWindow *win = gHostWindow;
     if (gPosterLayer && win && gPosterLayer.superlayer == win.layer) {
@@ -418,6 +547,26 @@ static void PPHideAllSystemWallpapers(void) {
                 gDoc.rootLayer.position = CGPointMake(win.bounds.size.width  / 2.0,
                                                       win.bounds.size.height / 2.0);
                 gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+            }
+        }
+    }
+
+    // Same for the home-screen poster.
+    UIWindow *hwin = gHomeHostWindow;
+    if (gHomePosterLayer && hwin && gHomePosterLayer.superlayer == hwin.layer) {
+        if (!CGSizeEqualToSize(gHomePosterLayer.bounds.size, hwin.bounds.size)) {
+            gHomePosterLayer.bounds = hwin.bounds;
+            gHomePosterLayer.position = CGPointMake(hwin.bounds.size.width / 2.0,
+                                                    hwin.bounds.size.height / 2.0);
+            if (gHomeDoc.rootLayer) {
+                CGRect rb = gHomeDoc.rootLayer.bounds;
+                if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
+                CGFloat sx = hwin.bounds.size.width  / rb.size.width;
+                CGFloat sy = hwin.bounds.size.height / rb.size.height;
+                CGFloat s  = MAX(sx, sy);
+                gHomeDoc.rootLayer.position = CGPointMake(hwin.bounds.size.width  / 2.0,
+                                                          hwin.bounds.size.height / 2.0);
+                gHomeDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
             }
         }
     }
