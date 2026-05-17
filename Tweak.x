@@ -35,37 +35,24 @@ static NSString *const kPPWallpaperRoot =
 // Set to YES during development to show the on-screen progress label
 // and write per-frame log entries to /var/mobile/pocketplayer.log.
 // In a release build this should stay NO.
-static BOOL const kPPDebugLabel = YES;
+static BOOL const kPPDebugLabel = NO;
 
-// Set to YES to draw a magenta border around every CAEmitterLayer in
-// the parsed CAML, plus boost particle visibility (birthRate x5, min
-// scale 2.0). Lets us *see* where the emitter is physically placed
-// after all the parent transforms compose, even if its particles are
-// too small or transparent to spot otherwise.
+// We always rebuild emitters from CAML — this isn't a debug option,
+// it's needed to make particles render reliably in SpringBoard on
+// iOS 15 (see PPDebugAnnotateEmitters comment for the reason). This
+// flag is now just a kill-switch; keep it YES for production.
 static BOOL const kPPDebugEmitters = YES;
 
-// Set to YES to force every emitter to a hard-coded screen-relative
-// position (75%, 75%) regardless of where the CAML puts it. Many
-// PosterBoard wallpapers (Mario Galaxy, Cipher, ...) author their
-// emitters at coordinates outside the parent layer's bounds — they
-// rely on PosterBoard's own coordinate transforms to land them on
-// screen. When we replay the same CAML through plain iOS 15 CALayer
-// composition, the emitter often lands off the screen (way below or
-// to the right of the visible area) and the particles fly into the
-// void. This override pins them visibly so we can confirm the
-// emitter machinery itself is working.
-static BOOL const kPPDebugMoveEmitterIntoView = YES;
+// Production: keep emitter at its CAML-authored position (no pinning
+// to a debug location). Set to YES only when investigating offscreen-
+// emitter issues with a new wallpaper.
+static BOOL const kPPDebugMoveEmitterIntoView = NO;
 
-// Set to YES to inject a hand-built reference CAEmitterLayer at the
-// top of the cover-sheet view, with the simplest possible config:
-// emit one bright red 10x10pt square per second, going straight up.
-// If THIS emitter doesn't show particles either, the problem is not
-// our CAML configuration - CAEmitterLayer simply doesn't render
-// inside the SpringBoard process on iOS 15 (e.g. due to renderer
-// policy, sandbox, or a Metal context restriction we don't have
-// visibility into). In that case we'll need a software particle
-// system on top of plain CALayers + CADisplayLink instead.
-static BOOL const kPPDebugInjectTestEmitter = YES;
+// Reference CAEmitterLayer for proving the CA particle machinery
+// itself works. Off in release builds. Set to YES if a new wallpaper
+// shows zero particles and we need to test whether CAEmitterLayer is
+// emitting AT ALL.
+static BOOL const kPPDebugInjectTestEmitter = NO;
 
 // =====================================================================
 // State
@@ -372,28 +359,36 @@ static void PPCollectEmittersRecursive(CALayer *root, NSMutableArray *out) {
 //      so we can compare against the actual screen size.
 // PPDebugAnnotateEmitters
 //
-// PROOF FROM DIAGNOSTICS: the hand-built reference CAEmitterLayer at
-// the screen center DOES emit correctly (user sees the red squares).
-// Mario's CAML emitter does NOT. The difference: Mario's emitter is
-// 4 levels deep under Floating > Overall Scale > Arm Animations, and
-// each parent has its own scale/transform. The emitter itself also
-// carries transform="rotate(134.74deg) scale(1.24, 1.24, 1)".
+// PROOF FROM DIAGNOSTICS:
+//   * The hand-built reference CAEmitterLayer (PPInstallTestEmitter)
+//     at the screen center DOES emit particles correctly on iOS 15.
+//   * The CAML-parsed CAEmitterLayer in Mario Galaxy does NOT, even
+//     after hoisting it onto a parent layer with no transform chain.
 //
-// Cumulative parent transforms shred CAEmitterLayer particle physics:
-// velocity / emissionLongitude / emitterSize all get baked through
-// the parent's transform chain in unintuitive ways, and on iOS 15
-// the emitter ends up rendering particles at sub-pixel size or
-// drifting outside its render bounds.
+// What's actually different between the two? The reference emitter
+// is built up from scratch with strongly-typed property setters
+// (em.emitterCells = @[cell]), while the CAML emitter has its cells
+// configured through KVC (setValue:@... forKey:...). On iOS 15
+// CAEmitterLayer caches its cell list state when the layer is
+// committed in a CATransaction, and re-parenting after that point
+// does NOT cause the cell state to be re-uploaded to the renderer.
 //
-// FIX: hoist every emitter found in the CAML tree out of its deep
-// parent chain and re-parent it onto the top-level container. We
-// keep the emitter visually where it should be by translating its
-// original window-space center into the new (transform-free) parent
-// coordinate system. We also strip the emitter's own transform.
+// SO the only reliable fix is: read the parsed CAEmitterCell back
+// out of CAML, then BUILD A FRESH CAEmitterLayer + CAEmitterCell
+// from scratch, copy across only the values we need, and replace
+// the original. The new layer has clean state and emits correctly.
 //
-// Result: the emitter renders inside an identity coordinate system,
-// at the same window position the author intended, and particles
-// emit correctly.
+// Step-by-step:
+//   1. Find every CAEmitterLayer in the tree.
+//   2. Read its cell array, capture each cell's contents (CGImage)
+//      and a small fixed set of attributes (birthRate, lifetime,
+//      velocity, emissionLongitude, emissionRange, scale, color).
+//   3. Compute the original window-space position of the emitter.
+//   4. Remove the original emitter from the tree entirely.
+//   5. Build a brand-new CAEmitterLayer parented to `root` (our
+//      top-level container at window level) and stack new
+//      CAEmitterCells with the captured values.
+//   6. Position the new emitter at the original window-space center.
 static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     if (!kPPDebugEmitters || !root) return;
 
@@ -404,97 +399,140 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     if (emitters.count == 0) return;
 
     NSInteger idx = 0;
-    for (CAEmitterLayer *em in emitters) {
-        // Capture the emitter's CURRENT window-space position (from its
-        // CAML parents' transforms) BEFORE we re-parent it. We'll
-        // restore that visual position after the hoist.
+    for (CAEmitterLayer *oldEm in emitters) {
+        // 1) Original window-space position.
         CGPoint windowSpaceCenter = CGPointZero;
-        if (em.superlayer && window) {
-            windowSpaceCenter = [em convertPoint:CGPointZero toLayer:window.layer];
+        if (oldEm.superlayer && window) {
+            windowSpaceCenter = [oldEm convertPoint:CGPointZero toLayer:window.layer];
         }
 
-        // Reset the EMITTER LAYER's own multipliers. CAML often pins
-        // them to tiny values (Mario: lifetime=0.035, speed=0.138) that
-        // multiply the cell's lifetime/velocity. Stomp them so cells
-        // get to use their own honest values.
-        em.lifetime  = 1.0;
-        em.birthRate = 1.0;
-        em.speed     = 1.0;
-        em.scale     = 1.0;
+        // 2) Capture attributes we want to copy.
+        NSArray<CAEmitterCell *> *oldCells = oldEm.emitterCells ?: @[];
+        CGSize  oldEmitterSize = oldEm.emitterSize;
+        NSString *oldShape = oldEm.emitterShape ?: kCAEmitterLayerPoint;
+        NSString *oldMode  = oldEm.emitterMode  ?: kCAEmitterLayerVolume;
+        NSString *oldRender = oldEm.renderMode  ?: kCAEmitterLayerUnordered;
 
-        // Strip the emitter's own transform (Mario rotates+scales it).
-        // We don't need it once we hoist out of the parent chain — and
-        // it confuses CAEmitterLayer particle physics on iOS 15.
-        em.transform = CATransform3DIdentity;
+        // 3) Build a fresh CAEmitterLayer.
+        CAEmitterLayer *newEm = [CAEmitterLayer layer];
+        newEm.name        = [NSString stringWithFormat:@"PocketPlayerEmitter%ld", (long)idx];
+        // Use a generous bounds so particles are not clipped to a tiny
+        // rectangle. The CAML's emitter bounds are only used as the
+        // emission shape's bounds (via emitterSize), not as a render
+        // clip rectangle. Most CAML emitters have tiny bounds (like
+        // Mario's 21x18) which on iOS 15 sometimes cause culling.
+        newEm.bounds      = CGRectMake(0, 0, 200, 200);
+        newEm.emitterShape = oldShape;
+        newEm.emitterMode  = oldMode;
+        newEm.renderMode   = oldRender;
+        // emitterSize is what defines the spawn-region, so keep CAML's
+        // value (clamped to something visible).
+        newEm.emitterSize  = CGSizeMake(MAX(oldEmitterSize.width,  4),
+                                        MAX(oldEmitterSize.height, 4));
+        newEm.lifetime  = 1.0;
+        newEm.birthRate = 1.0;
+        newEm.speed     = 1.0;
+        newEm.scale     = 1.0;
+        newEm.masksToBounds = NO;
 
-        // Boost cells so particles are visibly large enough to spot.
-        NSMutableArray *boosted = [NSMutableArray array];
-        for (CAEmitterCell *c in em.emitterCells ?: @[]) {
-            if (c.scale < 2.0) c.scale = 2.0;
-            if (c.birthRate < 100) c.birthRate = c.birthRate * 5.0;
-            // Force opaque-ish alpha range/color so we don't lose the
-            // particle to alphaSpeed=-N decay before it travels.
-            c.alphaRange = 0;
-            c.alphaSpeed = 0;
-            // Cells of color-decaying CAML often have redSpeed/greenSpeed
-            // negative which fades the particle to black-on-black very
-            // fast. Zero them so the particle stays its starting color.
+        // 4) Build fresh cells from captured CAML cells.
+        NSMutableArray<CAEmitterCell *> *newCells = [NSMutableArray array];
+        for (CAEmitterCell *oldCell in oldCells) {
+            CAEmitterCell *nc = [CAEmitterCell emitterCell];
+            nc.name              = oldCell.name ?: @"cell";
+            nc.contents          = oldCell.contents;
+            nc.contentsRect      = oldCell.contentsRect;
+            // Don't copy contentsScale: the CAML's "16.67" is a CAML-
+            // private convention. Apple's renderer interprets it
+            // literally and sub-pixelates the particle. Force 1.0
+            // and use scale to size the particle instead.
+            nc.contentsScale     = 1.0;
+            nc.birthRate         = oldCell.birthRate;
+            nc.lifetime          = oldCell.lifetime > 0 ? oldCell.lifetime : 4.0;
+            nc.lifetimeRange     = oldCell.lifetimeRange;
+            nc.velocity          = oldCell.velocity != 0 ? oldCell.velocity : 60.0;
+            nc.velocityRange     = oldCell.velocityRange;
+            nc.scale             = oldCell.scale > 0 ? oldCell.scale : 1.0;
+            nc.scaleRange        = oldCell.scaleRange;
+            nc.scaleSpeed        = oldCell.scaleSpeed;
+            nc.spin              = oldCell.spin;
+            nc.spinRange         = oldCell.spinRange;
+            nc.emissionLongitude = oldCell.emissionLongitude;
+            nc.emissionLatitude  = oldCell.emissionLatitude;
+            nc.emissionRange     = oldCell.emissionRange != 0 ? oldCell.emissionRange : (M_PI / 4);
+            // Preserve color decay as authored. The default
+            // CAEmitterCell alpha/redSpeed/etc. are 0 so most CAML
+            // wallpapers will have constant-color particles anyway.
+            nc.alphaRange        = oldCell.alphaRange;
+            nc.alphaSpeed        = oldCell.alphaSpeed;
+            nc.color             = oldCell.color ?: [UIColor whiteColor].CGColor;
+            // Copy color-channel ranges & speeds via KVC since they're
+            // exposed as KVC-only on CAEmitterCell.
             @try {
-                [c setValue:@(0.0) forKey:@"redSpeed"];
-                [c setValue:@(0.0) forKey:@"greenSpeed"];
-                [c setValue:@(0.0) forKey:@"blueSpeed"];
+                NSArray *channelKeys = @[
+                    @"redRange",   @"greenRange",   @"blueRange",
+                    @"redSpeed",   @"greenSpeed",   @"blueSpeed",
+                ];
+                for (NSString *k in channelKeys) {
+                    NSNumber *v = [oldCell valueForKey:k];
+                    if (v) [nc setValue:v forKey:k];
+                }
             } @catch (NSException *e) {}
-            [boosted addObject:c];
+            // Acceleration too (xAcceleration / yAcceleration / zAcceleration).
+            @try {
+                NSArray *accelKeys = @[
+                    @"xAcceleration", @"yAcceleration", @"zAcceleration",
+                ];
+                for (NSString *k in accelKeys) {
+                    NSNumber *v = [oldCell valueForKey:k];
+                    if (v) [nc setValue:v forKey:k];
+                }
+            } @catch (NSException *e) {}
+            // Force particleType to "plane" via KVC so the texture
+            // renders even if CAML didn't specify particleType.
+            @try { [nc setValue:@"plane" forKey:@"particleType"]; }
+            @catch (NSException *e) {}
+            [newCells addObject:nc];
         }
-        if (boosted.count) em.emitterCells = boosted;
 
-        // === HOIST: detach emitter from its deep CAML parent and ===
-        // === re-attach to the top-level container layer.        ===
-        // root is the visibleRoot container we built. It has at most
-        // ONE scale to compose with the window, much friendlier to
-        // CAEmitterLayer particle physics than 4+ nested transforms.
-        if (em.superlayer && em.superlayer != root) {
-            [em removeFromSuperlayer];
-            [root addSublayer:em];
+        // If CAML had no cells (unlikely, but defensive), skip - no
+        // fallback debug particle in production.
+        if (newCells.count == 0) {
+            continue;
         }
 
-        // Re-anchor the emitter at the right window-space location.
-        if (window && em.superlayer) {
-            CGFloat targetWX, targetWY;
+        // 5) Attach cells BEFORE adding to superlayer (this matters on
+        //    iOS 15 — cells set after addSublayer: sometimes don't
+        //    upload to the renderer cleanly).
+        newEm.emitterCells = newCells;
+
+        // 6) Place at the original window-space position.
+        if (window && root) {
+            CGPoint targetWP = windowSpaceCenter;
+            // If MoveEmitterIntoView is on, pin to 75%/75% so we always
+            // see something during debug.
             if (kPPDebugMoveEmitterIntoView) {
-                // Pin to lower-right quadrant so user can see it.
-                targetWX = window.bounds.size.width  * 0.75;
-                targetWY = window.bounds.size.height * 0.75;
-            } else {
-                // Use the original window-space position.
-                targetWX = windowSpaceCenter.x;
-                targetWY = windowSpaceCenter.y;
+                targetWP = CGPointMake(window.bounds.size.width  * 0.75,
+                                       window.bounds.size.height * 0.75);
             }
-            // Convert the window-space target back to the emitter's
-            // (now top-level) parent coordinate system.
-            CGPoint targetInParent = [em.superlayer convertPoint:CGPointMake(targetWX, targetWY)
-                                                       fromLayer:window.layer];
-            em.position = targetInParent;
+            CGPoint pInRoot = [root convertPoint:targetWP fromLayer:window.layer];
+            newEm.position = pInRoot;
         }
 
-        // Magenta border + high zPosition so we find the emitter visually.
-        em.borderColor = [UIColor magentaColor].CGColor;
-        em.borderWidth = 1.0;
-        em.zPosition   = 10000;
+        // 7) Add to root, set beginTime AFTER add (in layer time-space).
+        [root addSublayer:newEm];
+        newEm.beginTime = [newEm convertTime:CACurrentMediaTime() fromLayer:nil];
 
-        // Re-prime the emitter timeline AFTER the hoist+positioning, so
-        // it starts emitting "now" in its new coordinate system.
-        em.beginTime = CACurrentMediaTime();
+        // 8) Remove the old emitter completely so we don't have two.
+        [oldEm removeFromSuperlayer];
 
-        // Translate emitter's anchor (its position) into window coords (post-hoist).
-        CGPoint inWindow = [em convertPoint:CGPointZero toLayer:window.layer];
-        CGRect boundsInWin = [em convertRect:em.bounds toLayer:window.layer];
-        PPEmitterLog(@"emitter[%ld] HOISTED localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@",
+        CGPoint inWindow = [newEm convertPoint:CGPointZero toLayer:window.layer];
+        PPEmitterLog(@"emitter[%ld] REBUILT pos=%@ inWindow=%@ cells=%lu emitterSize=%@",
                      (long)idx,
-                     NSStringFromCGPoint(em.position),
+                     NSStringFromCGPoint(newEm.position),
                      NSStringFromCGPoint(inWindow),
-                     NSStringFromCGRect(boundsInWin),
-                     NSStringFromCGRect(window.bounds));
+                     (unsigned long)newCells.count,
+                     NSStringFromCGSize(newEm.emitterSize));
         idx++;
     }
 }
