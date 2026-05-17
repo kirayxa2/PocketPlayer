@@ -109,8 +109,11 @@ static void PPResolveStates(PPCAMLDocument *doc) {
     gToState   = nil;
     if (!doc) return;
 
-    // Preferred canonical pairs in PosterBoard
+    // Preferred canonical pairs in PosterBoard.
+    // Names vary across communities — "Unlock" (no -ed) is common in Posterboard
+    // wallpapers, "Unlocked" is what Apple uses internally.
     NSArray *prefer = @[
+        @[@"Locked",   @"Unlock"],
         @[@"Locked",   @"Unlocked"],
         @[@"Sleep",    @"Wake"],
         @[@"Default",  @"Activated"],
@@ -270,7 +273,8 @@ static void PPInstallDebugLabel(UIView *host) {
 
     if (fabs(progress - gLastProgress) > 0.001) {
         PPApplyProgress(progress);
-        PPSetDebug(@"fallback progress: %.3f (y=%.1f base=%.1f)", progress, y, gFallbackBaselineY);
+        PPSetDebug(@"fb p=%.2f %@->%@ y=%.1f", progress,
+            gFromState ?: @"-", gToState ?: @"-", y);
     }
 }
 @end
