@@ -48,6 +48,10 @@ static CGFloat         gLastProgress = 0.0;
 static CGFloat         gFallbackBaselineY = -1.0;
 static NSString       *gFromState;
 static NSString       *gToState;
+// Window-space mirror copies of every CAML emitter, parented onto the cover
+// sheet VIEW (whose layer-tree time is not frozen). The pointers are weak --
+// the layers are owned by their superlayer.
+static NSMutableArray *gMirrorEmitters; // NSMutableArray<CAEmitterLayer *>
 
 // =====================================================================
 // Private class forward decls
@@ -249,6 +253,157 @@ static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {
     }
 }
 
+// =====================================================================
+// Emitter mirroring
+// =====================================================================
+//
+// The cover-sheet WINDOW's layer is held at speed=0 by SpringBoard while the
+// device is locked, so any CAEmitterLayer we put inside it stops emitting
+// (its internal clock is multiplied by 0). The cover-sheet VIEW that lives
+// inside that window does NOT have its layer time frozen -- you can verify
+// this by adding any CAEmitterLayer to gCoverSheetView.layer and watching
+// it emit normally.
+//
+// So for every CAEmitterLayer the CAML parser created we build a window-
+// space MIRROR on gCoverSheetView.layer, copy the cells across, and silence
+// the original. The mirror lives only as long as gCoverSheetView is in the
+// window; PPRebuildMirrorEmitters() is idempotent and re-runs whenever the
+// view re-mounts.
+
+static CAEmitterCell *PPCloneCell(CAEmitterCell *src) {
+    CAEmitterCell *c = [CAEmitterCell emitterCell];
+    c.name              = src.name;
+    c.contents          = src.contents;
+    c.contentsScale     = src.contentsScale > 0 ? src.contentsScale : 1.0;
+    c.birthRate         = src.birthRate;
+    c.lifetime          = src.lifetime;
+    c.lifetimeRange     = src.lifetimeRange;
+    c.velocity          = src.velocity;
+    c.velocityRange     = src.velocityRange;
+    c.xAcceleration     = src.xAcceleration;
+    c.yAcceleration     = src.yAcceleration;
+    c.zAcceleration     = src.zAcceleration;
+    c.scale             = src.scale;
+    c.scaleRange        = src.scaleRange;
+    c.scaleSpeed        = src.scaleSpeed;
+    c.spin              = src.spin;
+    c.spinRange         = src.spinRange;
+    c.emissionLatitude  = src.emissionLatitude;
+    c.emissionLongitude = src.emissionLongitude;
+    c.emissionRange     = src.emissionRange;
+    c.color             = src.color;
+    c.redRange          = src.redRange;
+    c.greenRange        = src.greenRange;
+    c.blueRange         = src.blueRange;
+    c.alphaRange        = src.alphaRange;
+    c.redSpeed          = src.redSpeed;
+    c.greenSpeed        = src.greenSpeed;
+    c.blueSpeed         = src.blueSpeed;
+    c.alphaSpeed        = src.alphaSpeed;
+    if (src.emitterCells.count) {
+        NSMutableArray *kids = [NSMutableArray array];
+        for (CAEmitterCell *k in src.emitterCells) [kids addObject:PPCloneCell(k)];
+        c.emitterCells = [kids copy];
+    }
+    return c;
+}
+
+static void PPRemoveExistingMirrors(void) {
+    for (CAEmitterLayer *m in [gMirrorEmitters copy]) {
+        [m removeFromSuperlayer];
+    }
+    [gMirrorEmitters removeAllObjects];
+}
+
+static void PPRebuildMirrorEmitters(void) {
+    UIView *cs = gCoverSheetView;
+    if (!cs || !cs.window) return;
+    if (!gDoc) return;
+    if (!gMirrorEmitters) gMirrorEmitters = [NSMutableArray array];
+
+    PPRemoveExistingMirrors();
+
+    NSArray<CAEmitterLayer *> *sources = gDoc.emitters;
+    if (sources.count == 0) {
+        PPSetDebug(@"no emitters in CAML");
+        return;
+    }
+
+    CALayer *host = cs.layer;
+    int idx = 0;
+    for (CAEmitterLayer *src in sources) {
+        // Where is the original emitter in window coordinates? Walk through
+        // its accumulated parent transforms via CALayer's own conversion.
+        if (!src.superlayer) continue;
+        CGPoint srcCenter = CGPointMake(CGRectGetMidX(src.bounds),
+                                        CGRectGetMidY(src.bounds));
+        CGPoint inHost = [host convertPoint:srcCenter fromLayer:src];
+
+        // Build a fresh emitter from scratch -- this is critical, because
+        // CAEmitterLayer caches its render state on first commit and
+        // removeFromSuperlayer/addSublayer: doesn't reset it.
+        CAEmitterLayer *m = [CAEmitterLayer layer];
+        m.name = @"PocketPlayerEmitterMirror";
+
+        // Geometry: keep the same emitter shape/size/mode the wallpaper
+        // author chose, but anchor it at the converted window-space point.
+        m.bounds          = CGRectMake(0, 0, 1, 1);
+        m.position        = inHost;
+        m.emitterPosition = CGPointMake(0, 0);
+        m.emitterSize     = src.emitterSize;
+        m.emitterShape    = src.emitterShape ?: kCAEmitterLayerPoint;
+        m.emitterMode     = src.emitterMode  ?: kCAEmitterLayerVolume;
+        m.renderMode      = src.renderMode   ?: kCAEmitterLayerUnordered;
+        m.birthRate       = src.birthRate > 0 ? src.birthRate : 1.0;
+        m.lifetime        = src.lifetime  > 0 ? src.lifetime  : 1.0;
+        m.scale           = src.scale     > 0 ? src.scale     : 1.0;
+        m.speed           = 1.0;
+        m.zPosition       = 9000; // above CAML decor layers, below debug label
+        m.masksToBounds   = NO;
+
+        // Clone every cell with a typed setter (KVC into CAEmitterCell is
+        // unreliable on iOS 15 for some keys -- typed setters always work).
+        NSMutableArray<CAEmitterCell *> *cells = [NSMutableArray array];
+        for (CAEmitterCell *cell in src.emitterCells) {
+            [cells addObject:PPCloneCell(cell)];
+        }
+        // emitterCells must be set BEFORE addSublayer: on iOS 15 or the
+        // emitter caches a "no cells" state and silently never emits.
+        m.emitterCells = [cells copy];
+
+        [host addSublayer:m];
+        m.beginTime = [m convertTime:CACurrentMediaTime() fromLayer:nil];
+
+        [gMirrorEmitters addObject:m];
+
+        // We deliberately do NOT silence the original emitter. While the
+        // device is locked the cover-sheet WINDOW's layer time is frozen,
+        // so the original emits nothing on screen and only the mirror is
+        // visible. Once the user unlocks, the cover-sheet VIEW slides
+        // off-screen (taking the mirror with it, harmlessly invisible)
+        // and the window thaws, letting the ORIGINAL emit on the home
+        // screen exactly as before. Net result: both screens get the
+        // intended particles, and we never have to track which mode we
+        // are in.
+
+        idx++;
+    }
+    PPSetDebug(@"emitters mirrored=%d host=%@", idx,
+        NSStringFromClass([host class]));
+}
+
+// Reset beginTime on every mirror so emission keeps flowing across hide/show
+// cycles (e.g. after the cover sheet snaps closed and reopens).
+static void PPRePrimeMirrorEmitters(void) {
+    if (gMirrorEmitters.count == 0) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    for (CAEmitterLayer *m in gMirrorEmitters) {
+        m.speed     = 1.0;
+        m.hidden    = NO;
+        m.beginTime = [m convertTime:now fromLayer:nil];
+    }
+}
+
 // Recursively walks a CALayer tree and removes any sublayer named
 // "PocketPlayerLayer" that isn't the one we want to keep. Plain C, no
 // blocks, to avoid -Warc-retain-cycles on self-referential captures.
@@ -394,6 +549,12 @@ static void PPStartDisplayLink(void) {
         // a sibling window is removed even if it tried to reattach.
         PPNukeAllStaleLayersEverywhere(gPosterLayer);
     }
+
+    // Mirror every CAML emitter onto THIS view's layer. The cover sheet
+    // window's layer time is frozen by SpringBoard while locked, so an
+    // emitter parented there silently stops emitting -- but a sibling
+    // emitter on the cover sheet view ticks normally.
+    PPRebuildMirrorEmitters();
 }
 
 - (void)layoutSubviews {
@@ -405,6 +566,13 @@ static void PPStartDisplayLink(void) {
     if (win && (!gPosterLayer || gPosterLayer.superlayer != win.layer)) {
         PPInstallPosterIntoWindow(win);
         PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        PPRebuildMirrorEmitters();
+    } else if (gMirrorEmitters.count == 0 && gDoc.emitters.count > 0) {
+        // Poster is already installed but mirrors got reaped during a
+        // hide/show cycle -- restore them.
+        PPRebuildMirrorEmitters();
+    } else {
+        PPRePrimeMirrorEmitters();
     }
 }
 

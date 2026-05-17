@@ -41,6 +41,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) NSDictionary<NSString *, PPCAMLState *> *states;
 // Names of states in the order they were declared in the .caml file.
 @property (nonatomic, strong, readonly) NSArray<NSString *> *stateOrder;
+// Every CAEmitterLayer the parser created, in document order. Populated even
+// when emitters are nested deep in the layer tree.
+@property (nonatomic, strong, readonly) NSArray<CAEmitterLayer *> *emitters;
 
 // Snapshot the "base" values (initial) so we can interpolate from them.
 - (void)captureBaseValues;
