@@ -284,6 +284,22 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
         em.borderColor = [UIColor magentaColor].CGColor;
         em.borderWidth = 1.0;
 
+        // Reset the EMITTER LAYER's own multipliers. CAML often pins
+        // them to tiny values (Mario: lifetime=0.035, speed=0.138) that
+        // multiply the cell's lifetime/velocity. Stomp them so cells
+        // get to use their own honest values.
+        em.lifetime  = 1.0;
+        em.birthRate = 1.0;
+        em.speed     = 1.0;
+        em.scale     = 1.0;
+        // Re-prime the emitter timeline. addSublayer: may have shifted
+        // beginTime relative to the layer's superlayer time-space; if
+        // beginTime stays at the original CACurrentMediaTime() captured
+        // at parse time, the emitter is "in the past" and may have
+        // already burnt through its lifetime budget by the time we
+        // see it. Resetting to the layer-local now-time fixes this.
+        em.beginTime = [em convertTime:CACurrentMediaTime() fromLayer:nil];
+
         // Boost cells so particles are visibly large enough to spot.
         NSMutableArray *boosted = [NSMutableArray array];
         for (CAEmitterCell *c in em.emitterCells ?: @[]) {
@@ -293,6 +309,14 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
             // particle to alphaSpeed=-N decay before it travels.
             c.alphaRange = 0;
             c.alphaSpeed = 0;
+            // Cells of color-decaying CAML often have redSpeed/greenSpeed
+            // negative which fades the particle to black-on-black very
+            // fast. Zero them so the particle stays its starting color.
+            @try {
+                [c setValue:@(0.0) forKey:@"redSpeed"];
+                [c setValue:@(0.0) forKey:@"greenSpeed"];
+                [c setValue:@(0.0) forKey:@"blueSpeed"];
+            } @catch (NSException *e) {}
             [boosted addObject:c];
         }
         if (boosted.count) em.emitterCells = boosted;
