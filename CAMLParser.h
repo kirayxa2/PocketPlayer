@@ -8,9 +8,14 @@
 //   - <CGImage src="assets/foo.png"/> contents
 //   - <states> with <LKState name="..."> containing <LKStateSetValue targetId keyPath><value/>
 //   - <stateTransitions> with per-(from,to) durations (basic)
+//   - <animations> blocks with <animation type="CAKeyframeAnimation"/CABasicAnimation"/...>
+//     attached natively via CALayer.addAnimation:forKey: so Apple's own animator
+//     handles repeat/autoreverse/timing without per-frame work from us.
 //
 // Not supported (gracefully ignored):
-//   - <modules>, animations, filters, text layers, gradient layers
+//   - <modules>, text layers, gradient layers
+//   - CAEmitterLayer (parsed as plain CALayer; particles don't spawn)
+//   - <filters> / CAFilter (private API; ignored)
 //
 // Usage:
 //   PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
