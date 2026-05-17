@@ -77,12 +77,45 @@ static NSString       *gToState;
 
 // _UIWallpaperView lives in UIKit. SBFWallpaperView is its SpringBoard-private
 // subclass on iOS 15 and is the one actually placed on the lock screen.
+// SBHomeScreenWallpaperView is the home-screen sibling — we MUST NOT host
+// our poster in that one (we'd see it on the home screen).
 @interface _UIWallpaperView : UIView @end
 @interface SBFWallpaperView : _UIWallpaperView @end
+@interface SBWallpaperEffectView : UIView @end
+@interface SBHomeScreenWallpaperView : UIView @end
+
+// SpringBoard window classes used to tell the lock-screen wallpaper apart from
+// the home-screen wallpaper. On iOS 15 the lock-screen wallpaper sits inside
+// SBCoverSheetWindow (or one of its descendants), while the home-screen
+// wallpaper lives in a normal SBHomeScreenWindow.
+@interface SBCoverSheetWindow            : UIWindow @end
+@interface SBHomeScreenWindow            : UIWindow @end
+@interface SBHomeScreenWallpaperWindow   : UIWindow @end
 
 // =====================================================================
 // Helpers: filesystem
 // =====================================================================
+
+// Walk up the view hierarchy. Return YES iff one of the ancestors is the
+// SBCoverSheetWindow (i.e. we are in lock-screen context, NOT home-screen).
+static BOOL PPViewIsInLockScreen(UIView *v) {
+    if (!v) return NO;
+    UIView *cur = v;
+    while (cur) {
+        Class c = [cur class];
+        NSString *name = NSStringFromClass(c);
+        if ([name isEqualToString:@"SBCoverSheetWindow"]) return YES;
+        // Some 15.x builds wrap wallpaper in SBCoverSheetExternalViewController
+        if ([name containsString:@"CoverSheet"]) return YES;
+        // Hard-no list: home-screen wallpaper containers
+        if ([name isEqualToString:@"SBHomeScreenWindow"] ||
+            [name isEqualToString:@"SBHomeScreenWallpaperWindow"]) return NO;
+        cur = cur.superview;
+    }
+    // No window attached yet — treat as "not lock" so we don't host into a
+    // floating preview/snapshot view.
+    return NO;
+}
 
 static NSString *PPFindFirstWallpaperBundle(void) {
     NSError *err = nil;
@@ -236,7 +269,13 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
     doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
     doc.rootLayer.position    = CGPointMake(wallpaper.bounds.size.width  / 2.0,
                                             wallpaper.bounds.size.height / 2.0);
-    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+    // Counter geometryFlipped on the host (some wallpaper views use it for
+    // perspective zoom), so the CAML stays right-side up.
+    CATransform3D t = CATransform3DMakeScale(s, s, 1.0);
+    if (wallpaper.layer.geometryFlipped) {
+        t = CATransform3DConcat(t, CATransform3DMakeScale(1.0, -1.0, 1.0));
+    }
+    doc.rootLayer.transform   = t;
 
     [container addSublayer:doc.rootLayer];
     [wallpaper.layer addSublayer:container];
@@ -305,18 +344,27 @@ static void PPStartDisplayLink(void) {
 // Hooks
 // =====================================================================
 
-// (1) Wallpaper view — STATIC host. Hook the SpringBoard-private subclass
-//     SBFWallpaperView and the generic _UIWallpaperView, so we work on every
-//     iOS 15.x build regardless of which one shows up first.
+// (1) Wallpaper view — STATIC host. Hook the generic _UIWallpaperView so we
+//     catch whatever subclass (SBFWallpaperView, etc.) the running iOS build
+//     actually instantiates. We then filter to LOCK-SCREEN context only,
+//     so the home-screen wallpaper stays untouched.
 
-%hook SBFWallpaperView
+static void PPMaybeInstallIntoWallpaper(UIView *v) {
+    if (!v.window) return;
+    if (!PPViewIsInLockScreen(v)) return;
+
+    // Skip if we already installed into THIS view.
+    for (CALayer *l in v.layer.sublayers) {
+        if ([l.name isEqualToString:@"PocketPlayerLayer"]) return;
+    }
+    PPInstallPosterIntoWallpaperView(v);
+}
+
+%hook _UIWallpaperView
 
 - (void)didMoveToWindow {
     %orig;
-    if (self.window == nil) return;
-    // Only the lockscreen wallpaper view is what we want; on iOS 15 it is
-    // typically inside the SBHomeScreenWindow stack and visible while locked.
-    PPInstallPosterIntoWallpaperView(self);
+    PPMaybeInstallIntoWallpaper(self);
 }
 
 - (void)layoutSubviews {
@@ -329,9 +377,16 @@ static void PPStartDisplayLink(void) {
             CGFloat sx = self.bounds.size.width  / rb.size.width;
             CGFloat sy = self.bounds.size.height / rb.size.height;
             CGFloat s  = MAX(sx, sy);
-            gDoc.rootLayer.position = CGPointMake(self.bounds.size.width / 2.0,
+            // If the host view has geometryFlipped (some wallpaper views do),
+            // we counter it by flipping our root layer's Y axis. This keeps
+            // the chest right-side up regardless of host orientation.
+            CATransform3D t = CATransform3DMakeScale(s, s, 1.0);
+            if (self.layer.geometryFlipped) {
+                t = CATransform3DConcat(t, CATransform3DMakeScale(1.0, -1.0, 1.0));
+            }
+            gDoc.rootLayer.position = CGPointMake(self.bounds.size.width  / 2.0,
                                                   self.bounds.size.height / 2.0);
-            gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+            gDoc.rootLayer.transform = t;
         }
     }
 }
