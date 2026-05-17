@@ -563,17 +563,30 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     }
 }
 
-// Re-prime every CAEmitterLayer's beginTime in `root`'s subtree.
-// Must be called after any hide/show cycle of the parent layer,
-// because on iOS 15 a hidden CAEmitterLayer pauses its timeline
-// at the moment of the hide and does not restart cleanly when
-// .hidden goes back to NO. Without this, after the first
-// unlock-then-relock the lockscreen poster shows zero particles.
+// Re-prime every CAEmitterLayer's beginTime in `root`'s subtree
+// AND restore its time / visibility state. On iOS 15 inside the
+// cover-sheet window, the layer-time chain that the emitter
+// inherits gets stuck (cover-sheet view's parent runs `speed=0`
+// during the unlock-presented state, freezing every CAEmitterLayer
+// underneath it). Each frame we forcibly:
+//
+//   * .speed = 1.0   (ignore inherited time-pause from parent)
+//   * .hidden = NO   (ignore any spurious hide done by SpringBoard)
+//   * .lifetime = 1  (don't let CAML's global multiplier on the
+//                     emitter layer kill particles instantly)
+//   * .beginTime advanced to layer-local now
+//
+// This is called per-frame from the CADisplayLink tick when the
+// cover-sheet poster is visible. It's cheap (just iterates layers).
 static void PPRePrimeEmittersIn(CALayer *root) {
     if (!root) return;
     NSMutableArray *emitters = [NSMutableArray array];
     PPCollectEmittersRecursive(root, emitters);
     for (CAEmitterLayer *em in emitters) {
+        em.speed     = 1.0;
+        em.hidden    = NO;
+        em.lifetime  = 1.0;
+        em.birthRate = 1.0;
         em.beginTime = [em convertTime:CACurrentMediaTime() fromLayer:nil];
     }
 }
@@ -835,6 +848,10 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
 
     [window.layer addSublayer:container];
     gPosterLayer = container;
+    // Force speed=1 so the cover-sheet window's frozen-time state
+    // (which SpringBoard sets to speed=0 during locked presentation)
+    // doesn't cascade into our subtree and freeze the emitters.
+    gPosterLayer.speed = 1.0;
 
     PPResolveStatesFromDocs(docs);
 
@@ -1116,6 +1133,17 @@ static void PPHideAllSystemWallpapers(void) {
     if (now - sLastWPHide > 0.3) {
         PPHideAllSystemWallpapers();
         sLastWPHide = now;
+    }
+
+    // Per-frame: keep cover-sheet emitters alive. The cover-sheet
+    // window inherits a frozen layer-time chain from SpringBoard's
+    // unlock-presented state, which on iOS 15 freezes every
+    // CAEmitterLayer underneath it. Forcing speed=1, hidden=NO and
+    // a fresh beginTime each tick overrides that. Only when the
+    // poster is actually visible (not in the post-unlock snap-hide
+    // window) — otherwise we'd waste CPU emitting offscreen.
+    if (gPosterLayer && !gPosterLayer.hidden) {
+        PPRePrimeEmittersIn(gPosterLayer);
     }
 
     // Install / re-install the home-screen poster lazily, since the
