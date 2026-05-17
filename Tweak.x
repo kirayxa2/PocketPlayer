@@ -77,6 +77,7 @@ static void PPNukeAllStaleLayersEverywhere(CALayer *keep);
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep);
 static UIWindow *PPFindHomeScreenWindow(void);
 static void PPInstallPosterIntoHomeWindow(UIWindow *window);
+static CALayer *PPFindFloatingLayer(CALayer *root);
 
 // =====================================================================
 // Filesystem helpers
@@ -246,6 +247,28 @@ static void PPApplyProgress(CGFloat progress) {
 // Poster install — into the COVER SHEET WINDOW's layer
 // =====================================================================
 
+// Recursively walk the CALayer tree of the parsed CAML doc and find a
+// sublayer whose name == "Floating". PosterBoard authors very commonly
+// wrap their iPhone-sized scene (e.g. 414x736) inside an iPad canvas
+// (3176x3176) and put position offsets like "967 216" to place it.
+// Rendering the iPad canvas fitted to a 6s screen ends up shrinking
+// our chest/Mario/etc. to invisible pixels - so we prefer the inner
+// "Floating" layer as the effective root when present.
+//
+// Returns nil if no such layer exists; caller falls back to doc.rootLayer.
+static CALayer *PPFindFloatingLayer(CALayer *root) {
+    if (!root) return nil;
+    if ([root.name isEqualToString:@"Floating"] && root.bounds.size.width > 0
+        && root.bounds.size.height > 0) {
+        return root;
+    }
+    for (CALayer *l in root.sublayers) {
+        CALayer *hit = PPFindFloatingLayer(l);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
 static void PPInstallPosterIntoWindow(UIWindow *window) {
     if (!window) return;
     gHostWindow = window;
@@ -291,18 +314,30 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     container.masksToBounds = NO;
     container.geometryFlipped = YES;
 
-    CGRect rb = doc.rootLayer.bounds;
+    // If the CAML wraps an iPhone-sized "Floating" sub-tree inside a
+    // larger (often iPad) canvas, prefer the inner Floating layer as
+    // our visible root. Authors put it at offset positions (e.g. 967,216
+    // inside a 3176x3176 canvas) which would render off-screen on a 6s
+    // if we used the outer root layer.
+    CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
+    if (visibleRoot != doc.rootLayer) {
+        // Detach from its iPad-canvas parent so our scaling math sees
+        // the inner bounds (e.g. 414x736) as the full sheet.
+        [visibleRoot removeFromSuperlayer];
+    }
+
+    CGRect rb = visibleRoot.bounds;
     if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
     CGFloat sx = window.bounds.size.width  / rb.size.width;
     CGFloat sy = window.bounds.size.height / rb.size.height;
     CGFloat s  = MAX(sx, sy);
 
-    doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
-    doc.rootLayer.position    = CGPointMake(window.bounds.size.width  / 2.0,
-                                            window.bounds.size.height / 2.0);
-    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+    visibleRoot.anchorPoint = CGPointMake(0.5, 0.5);
+    visibleRoot.position    = CGPointMake(window.bounds.size.width  / 2.0,
+                                          window.bounds.size.height / 2.0);
+    visibleRoot.transform   = CATransform3DMakeScale(s, s, 1.0);
 
-    [container addSublayer:doc.rootLayer];
+    [container addSublayer:visibleRoot];
     [window.layer addSublayer:container];
     gPosterLayer = container;
 
@@ -404,18 +439,23 @@ static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
     container.masksToBounds = NO;
     container.geometryFlipped = YES;
 
-    CGRect rb = doc.rootLayer.bounds;
+    CALayer *visibleRoot = PPFindFloatingLayer(doc.rootLayer) ?: doc.rootLayer;
+    if (visibleRoot != doc.rootLayer) {
+        [visibleRoot removeFromSuperlayer];
+    }
+
+    CGRect rb = visibleRoot.bounds;
     if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
     CGFloat sx = window.bounds.size.width  / rb.size.width;
     CGFloat sy = window.bounds.size.height / rb.size.height;
     CGFloat s  = MAX(sx, sy);
 
-    doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
-    doc.rootLayer.position    = CGPointMake(window.bounds.size.width  / 2.0,
-                                            window.bounds.size.height / 2.0);
-    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+    visibleRoot.anchorPoint = CGPointMake(0.5, 0.5);
+    visibleRoot.position    = CGPointMake(window.bounds.size.width  / 2.0,
+                                          window.bounds.size.height / 2.0);
+    visibleRoot.transform   = CATransform3DMakeScale(s, s, 1.0);
 
-    [container addSublayer:doc.rootLayer];
+    [container addSublayer:visibleRoot];
     [window.layer addSublayer:container];
     gHomePosterLayer = container;
 
