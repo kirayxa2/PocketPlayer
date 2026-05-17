@@ -26,6 +26,8 @@
 #import <notify.h>
 #import <fcntl.h>
 #import <sys/time.h>
+#import <signal.h>
+#import <unistd.h>
 #import "CAMLParser.h"
 
 // =====================================================================
@@ -380,47 +382,25 @@ static NSString *const kPPApplyManifestPath =
 static const char *const kPPApplyDarwinName =
     "com.vortex.pocketplayer.apply";
 
-// Tell PosterKit / SpringBoard's wallpaper renderer that the active
-// bundle on disk just changed. Without this, the system keeps a cached
-// copy of the previous bundle and ignores our swap entirely -- which
-// is exactly why "Apply" only updated our overlay, not the real
-// wallpaper visible on the home screen and behind the lock UI.
+// Restart SpringBoard. Same thing as ./scripts/deploy.sh's respring at
+// the end, just done from inside the process: kill -9 self. launchd
+// brings SpringBoard back up in ~3 seconds and on the next launch our
+// %ctor reads the (already-updated) PosterPlayer slot and shows the
+// new wallpaper EVERYWHERE -- lockscreen + homescreen + cover-sheet
+// background -- because the entire CA tree is rebuilt from disk.
 //
-// We try several signals because PosterKit's listener set varies
-// between iOS 15 point releases:
-//   - notify_post on every PosterKit change-of-state name we've seen
-//   - utimes() on the active-slot directory and its config plists, so
-//     any kqueue-based watcher inside the daemon fires
-static void PPNudgePosterKit(void) {
-    static const char *const kPosterNotifyNames[] = {
-        "com.apple.PosterKit.PRPosterRoleDidChange",
-        "com.apple.PosterKit.PRPosterDidChange",
-        "com.apple.posterservice.activePosterDidChange",
-        "com.apple.PRWallpaper.activeRoleDidChange",
-        NULL,
-    };
-    for (int i = 0; kPosterNotifyNames[i]; i++) {
-        notify_post(kPosterNotifyNames[i]);
-    }
-
-    // Touch the active-slot dir + its sibling plists. Any PosterKit
-    // process watching for filesystem mtime changes on those paths
-    // will reload the bundle on next event-loop tick. Best-effort,
-    // we don't care about errors.
-    NSString *contents = kPPWallpaperRoot;
-    NSArray<NSString *> *touchTargets = @[
-        contents,
-        [contents stringByAppendingPathComponent:@"Wallpaper.plist"],
-        [contents stringByAppendingPathComponent:
-         @"com.apple.posterkit.provider.contents.otherMetadata.plist"],
-        [contents stringByAppendingPathComponent:
-         @".com.apple.posterkit.provider.contents.configurableOptions.plist"],
-    ];
-    for (NSString *p in touchTargets) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
-            utimes([p fileSystemRepresentation], NULL);
-        }
-    }
+// Yes this is heavy-handed. But every "no respring" path I've tried
+// (PosterKit darwin notifications, mtime touches, manual layer reloads)
+// either misses some piece of Apple's caching or gets a different
+// wallpaper visible in different places. Until the user explicitly
+// asks for soft-reload again, just do the obvious thing.
+static void PPRespringSpringBoard(void) {
+    PPSetDebug(@"applying respring in 200ms...");
+    // 200ms grace so the manifest delete + log flush hits disk first.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        kill(getpid(), SIGKILL);
+    });
 }
 
 // Atomically replace the .wallpaper bundle inside
@@ -480,32 +460,20 @@ static void PPHandleApplyNotification(void) {
             return;
         }
 
-        // Re-install OUR overlay from disk. Existing PocketPlayerLayer is
-        // removed by PPInstallPosterIntoWindow itself; this gives us a
-        // brand-new PPCAMLDocument bound to the new bundle. No respring.
-        UIWindow *win = gHostWindow;
-        if (win) {
-            PPInstallPosterIntoWindow(win);
-            PPNukeAllStaleLayersEverywhere(gPosterLayer);
-        }
+        PPSetDebug(@"apply OK: %@ -> respring",
+            manifest[@"displayName"] ?: [src lastPathComponent]);
 
-        // Tell the SYSTEM wallpaper renderer that the active bundle
-        // changed too -- otherwise the home screen and the layer
-        // behind the lock UI keep showing the old wallpaper while
-        // only our overlay updates.
-        PPNudgePosterKit();
-
-        if (win) {
-            PPSetDebug(@"apply OK: %@",
-                manifest[@"displayName"] ?: [src lastPathComponent]);
-        } else {
-            PPSetDebug(@"apply: no host window yet, manifest staged");
-        }
-
-        // Manifest is one-shot -- delete so a stale one doesn't trigger
-        // re-applies on the next boot.
+        // Manifest is one-shot -- delete so the listener doesn't loop
+        // through it again after respring.
         [[NSFileManager defaultManager] removeItemAtPath:kPPApplyManifestPath
                                                    error:NULL];
+
+        // Hard respring. Same end state as `./scripts/deploy.sh` -- the
+        // wallpaper applies on every screen because SpringBoard rebuilds
+        // its whole layer tree from the new disk contents. Trying to do
+        // this without a respring miscaches in PosterKit; the user has
+        // explicitly asked for the simple/correct behaviour.
+        PPRespringSpringBoard();
     }
 }
 
