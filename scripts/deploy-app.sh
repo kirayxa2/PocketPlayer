@@ -19,17 +19,39 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 say()  { echo -e "${GREEN}==>${NC} $*"; }
 warn() { echo -e "${YELLOW}!! ${NC} $*"; }
 
-cd "$(dirname "$0")/.."
+# Repo root (one above scripts/).
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 
 : "${THEOS:=$HOME/theos}"
 export THEOS
 
 say "Building PocketPoster.app (theos at $THEOS)"
-make -C app clean >/dev/null 2>&1 || true
-make -C app package FINALPACKAGE=0 2>&1 | tail -8
+
+# Wipe stale build state from BOTH possible roots. The first failed
+# build can leave a half-staged tree at PocketPlayer/.theos/obj/debug/
+# because Theos was confused about which directory was the project
+# root; clear that out too so the next build is deterministic.
+rm -rf "$ROOT/app/.theos" "$ROOT/app/packages" \
+       "$ROOT/.theos/obj/debug/PocketPoster.app" \
+       "$ROOT/.theos/_/_/_root/_var/jb/Applications/PocketPoster.app" 2>/dev/null || true
+
+# Run the app build in a CLEAN environment. The parent shell may have
+# Theos variables left over from any 'make' run in the tweak directory
+# (THEOS_PROJECT_DIR in particular, which pins build paths to the wrong
+# directory). 'env -u' wipes only the dangerous ones so PATH/HOME/SSH
+# config stays intact.
+(
+  cd "$ROOT/app"
+  env -u THEOS_PROJECT_DIR -u THEOS_BUILD_DIR -u THEOS_OBJ_DIR \
+      -u THEOS_OBJ_DIR_NAME -u THEOS_PACKAGE_DIR -u THEOS_STAGING_DIR \
+      -u _THEOS_CURRENT_PACKAGE -u _THEOS_CURRENT_TYPE \
+      -u _THEOS_RULES_LOADED -u _THEOS_COMMON_LOADED \
+      make package FINALPACKAGE=0
+) 2>&1 | tail -30
 
 # Theos default packages dir is alongside its Makefile, so app/packages/.
-DEB="$(ls -t app/packages/com.vortex.pocketposter_*.deb 2>/dev/null | head -1)"
+DEB="$(ls -t "$ROOT"/app/packages/com.vortex.pocketposter_*.deb 2>/dev/null | head -1)"
 [ -n "$DEB" ] || { warn "no PocketPoster .deb produced (looked in app/packages/)"; exit 1; }
 say "Built $DEB"
 
