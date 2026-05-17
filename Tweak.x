@@ -44,6 +44,18 @@ static BOOL const kPPDebugLabel = YES;
 // too small or transparent to spot otherwise.
 static BOOL const kPPDebugEmitters = YES;
 
+// Set to YES to force every emitter to a hard-coded screen-relative
+// position (75%, 75%) regardless of where the CAML puts it. Many
+// PosterBoard wallpapers (Mario Galaxy, Cipher, ...) author their
+// emitters at coordinates outside the parent layer's bounds — they
+// rely on PosterBoard's own coordinate transforms to land them on
+// screen. When we replay the same CAML through plain iOS 15 CALayer
+// composition, the emitter often lands off the screen (way below or
+// to the right of the visible area) and the particles fly into the
+// void. This override pins them visibly so we can confirm the
+// emitter machinery itself is working.
+static BOOL const kPPDebugMoveEmitterIntoView = YES;
+
 // =====================================================================
 // State
 // =====================================================================
@@ -284,6 +296,34 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
             [boosted addObject:c];
         }
         if (boosted.count) em.emitterCells = boosted;
+
+        // OPTIONAL: forcibly move the emitter into the visible part of
+        // the window. After all parent CAML transforms compose, many
+        // PosterBoard wallpapers (Mario Galaxy in particular) place
+        // their emitter at a position that maps to coordinates well
+        // outside the screen — the original starbit emitter ends up
+        // around (494, 946) on a 375x667 screen, ~119pt past the
+        // right edge and 278pt below the bottom. PosterBoard on
+        // iOS 17 has its own coordinate transforms that reel it
+        // back; we don't, so the particles fly off into the void
+        // forever.
+        //
+        // To prove the emitter machinery itself is working, snap the
+        // emitter's window-space center to ~75% of the window. The
+        // user originally described this exact starbit stream as
+        // 'flying out of the lower-right corner', so 75%/75% is the
+        // canonical place for it.
+        if (kPPDebugMoveEmitterIntoView && em.superlayer && window) {
+            CGFloat targetWX = window.bounds.size.width  * 0.75;
+            CGFloat targetWY = window.bounds.size.height * 0.75;
+            // Convert the desired window-space target back into the
+            // emitter's parent-layer coordinate space, then assign
+            // that as the emitter's new position. This works no
+            // matter how complex the parent chain is.
+            CGPoint targetInParent = [em.superlayer convertPoint:CGPointMake(targetWX, targetWY)
+                                                       fromLayer:window.layer];
+            em.position = targetInParent;
+        }
 
         // Translate emitter's anchor (its position) into window coords.
         CGPoint inWindow = [em convertPoint:CGPointZero toLayer:window.layer];
