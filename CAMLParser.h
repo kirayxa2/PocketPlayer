@@ -47,6 +47,13 @@ NS_ASSUME_NONNULL_BEGIN
 // Names of states in the order they were declared in the .caml file.
 @property (nonatomic, strong, readonly) NSArray<NSString *> *stateOrder;
 
+// Diagnostics — parser fills these in so callers can show
+// "imgs=N missing=N emitters=N cells=N" in a debug label.
+@property (nonatomic, assign) NSInteger imagesLoaded;
+@property (nonatomic, assign) NSInteger imagesMissing;
+@property (nonatomic, assign) NSInteger emittersBuilt;
+@property (nonatomic, assign) NSInteger cellsBuilt;
+
 // Snapshot the "base" values (initial) so we can interpolate from them.
 - (void)captureBaseValues;
 
