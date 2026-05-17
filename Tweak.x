@@ -174,31 +174,32 @@ static void PPResolveStates(PPCAMLDocument *doc) {
 static void PPApplyProgress(CGFloat progress) {
     progress = MAX(0.0, MIN(1.0, progress));
     gLastProgress = progress;
-    if (!gDoc || !gToState) return;
-    if (gFromState) {
-        [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
-    } else {
-        [gDoc applyState:gToState progress:progress];
+
+    // Drive the SAME animation on both the cover-sheet poster (so the
+    // user sees the chest opening as they swipe) AND the home-screen
+    // poster (so the moment the cover-sheet finishes sliding away there
+    // is no visible jump - the chest under the dock is already in the
+    // exact same opened pose). Disable implicit CA animations so both
+    // posters follow the gesture frame-perfect.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+
+    if (gDoc && gToState) {
+        if (gFromState) {
+            [gDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
+        } else {
+            [gDoc applyState:gToState progress:progress];
+        }
+    }
+    if (gHomeDoc && gToState) {
+        if (gFromState) {
+            [gHomeDoc applyTransitionFromState:gFromState toState:gToState progress:progress];
+        } else {
+            [gHomeDoc applyState:gToState progress:progress];
+        }
     }
 
-    // Fade out the cover-sheet poster during the last ~30% of the swipe so
-    // it doesn't linger on top of the home screen after the unlock completes.
-    // Home-screen poster (gHomePosterLayer) stays fully opaque underneath, so
-    // the user sees a clean handoff: animated chest opening on lock screen,
-    // then dock/icons spawning over the already-open chest on home screen.
-    if (gPosterLayer) {
-        CGFloat fadeStart = 0.7;
-        CGFloat alpha = 1.0;
-        if (progress > fadeStart) {
-            alpha = 1.0 - (progress - fadeStart) / (1.0 - fadeStart);
-            if (alpha < 0.0) alpha = 0.0;
-        }
-        // Disable implicit animation so we follow the gesture in real time.
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        gPosterLayer.opacity = (float)alpha;
-        [CATransaction commit];
-    }
+    [CATransaction commit];
 }
 
 // =====================================================================
@@ -378,14 +379,13 @@ static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
     [window.layer addSublayer:container];
     gHomePosterLayer = container;
 
-    // Apply the Unlock state once. We use the same gFromState/gToState
-    // already resolved by PPResolveStates in the cover-sheet install path;
-    // we just push to progress=1.0 (fully unlocked).
+    // Capture base values so state interpolation has anchor points.
+    // Start at Locked (progress=0); the gesture will drive it open.
     [doc captureBaseValues];
     if (gFromState && gToState) {
-        [doc applyTransitionFromState:gFromState toState:gToState progress:1.0];
+        [doc applyTransitionFromState:gFromState toState:gToState progress:gLastProgress];
     } else if (gToState) {
-        [doc applyState:gToState progress:1.0];
+        [doc applyState:gToState progress:gLastProgress];
     }
 }
 
