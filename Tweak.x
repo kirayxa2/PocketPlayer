@@ -210,6 +210,13 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     // Container fills the WINDOW. zPosition = -1 puts it behind cover-sheet
     // sibling views (which sit at default zPosition 0) but in front of any
     // background the window may have.
+    //
+    // geometryFlipped = YES compensates for UIWindow.layer's own
+    // geometryFlipped (which is YES under UIKit). Setting it here gives
+    // our subtree normal UIKit coordinates (origin top-left), without
+    // resorting to a Y scale-flip on the root layer. A Y scale-flip
+    // visually inverts but causes (a) the top edge to be clipped by
+    // its parent and (b) child rotations/anchors to read mirrored.
     CALayer *container = [CALayer layer];
     container.name = @"PocketPlayerLayer";
     container.bounds = window.bounds;
@@ -217,6 +224,7 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
                                      window.bounds.size.height / 2.0);
     container.zPosition = -1;
     container.masksToBounds = NO;
+    container.geometryFlipped = YES;
 
     CGRect rb = doc.rootLayer.bounds;
     if (rb.size.width <= 0 || rb.size.height <= 0) rb = CGRectMake(0, 0, 390, 844);
@@ -224,12 +232,10 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     CGFloat sy = window.bounds.size.height / rb.size.height;
     CGFloat s  = MAX(sx, sy);
 
-    // Flip Y because UIWindow.layer has geometryFlipped=YES on iOS:
-    // without -s on Y, content renders upside down.
     doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
     doc.rootLayer.position    = CGPointMake(window.bounds.size.width  / 2.0,
                                             window.bounds.size.height / 2.0);
-    doc.rootLayer.transform   = CATransform3DMakeScale(s, -s, 1.0);
+    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
 
     [container addSublayer:doc.rootLayer];
     [window.layer addSublayer:container];
@@ -411,7 +417,7 @@ static void PPHideAllSystemWallpapers(void) {
                 CGFloat s  = MAX(sx, sy);
                 gDoc.rootLayer.position = CGPointMake(win.bounds.size.width  / 2.0,
                                                       win.bounds.size.height / 2.0);
-                gDoc.rootLayer.transform = CATransform3DMakeScale(s, -s, 1.0);
+                gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
             }
         }
     }
