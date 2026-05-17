@@ -24,9 +24,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 : "${THEOS:=$HOME/theos}"
-export THEOS
-
-say "Building PocketPoster.app (theos at $THEOS)"
+[ -d "$THEOS" ] || { warn "THEOS not found at $THEOS"; exit 1; }
 
 # Wipe stale build state from BOTH possible roots. The first failed
 # build can leave a half-staged tree at PocketPlayer/.theos/obj/debug/
@@ -34,25 +32,51 @@ say "Building PocketPoster.app (theos at $THEOS)"
 # root; clear that out too so the next build is deterministic.
 rm -rf "$ROOT/app/.theos" "$ROOT/app/packages" \
        "$ROOT/.theos/obj/debug/PocketPoster.app" \
-       "$ROOT/.theos/_/_/_root/_var/jb/Applications/PocketPoster.app" 2>/dev/null || true
+       "$ROOT/.theos/_/var/jb/Applications/PocketPoster.app" 2>/dev/null || true
 
-# Run the app build in a CLEAN environment. The parent shell may have
-# Theos variables left over from any 'make' run in the tweak directory
-# (THEOS_PROJECT_DIR in particular, which pins build paths to the wrong
-# directory). 'env -u' wipes only the dangerous ones so PATH/HOME/SSH
-# config stays intact.
+LOG="/tmp/pocketposter-build.log"
+say "Building PocketPoster.app (theos at $THEOS) -- full log: $LOG"
+
+# Run the build with `env -i` -- a TOTALLY clean environment. The parent
+# 'make app-deploy' invocation pollutes the env with both THEOS_*
+# variables (from the tweak's common.mk include) and MAKEFLAGS that
+# carry a now-broken jobserver fd. Either of those can make Theos
+# either build into the wrong directory or skip the compile rules
+# entirely (we saw 'Making stage' fire with no preceding 'Compiling'
+# lines, then rsync ENOENT). Wiping the env and re-injecting only
+# HOME / PATH / SHELL / THEOS is the only deterministic fix.
+set +e
 (
   cd "$ROOT/app"
-  env -u THEOS_PROJECT_DIR -u THEOS_BUILD_DIR -u THEOS_OBJ_DIR \
-      -u THEOS_OBJ_DIR_NAME -u THEOS_PACKAGE_DIR -u THEOS_STAGING_DIR \
-      -u _THEOS_CURRENT_PACKAGE -u _THEOS_CURRENT_TYPE \
-      -u _THEOS_RULES_LOADED -u _THEOS_COMMON_LOADED \
+  env -i \
+      HOME="$HOME" \
+      PATH="$PATH" \
+      SHELL="${SHELL:-/bin/bash}" \
+      LANG="${LANG:-C.UTF-8}" \
+      THEOS="$THEOS" \
       make package FINALPACKAGE=0
-) 2>&1 | tail -30
+) >"$LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 0 ]; then
+  warn "build failed (exit $RC). Last 60 lines of $LOG:"
+  echo "----------------------------------------"
+  tail -60 "$LOG"
+  echo "----------------------------------------"
+  exit "$RC"
+fi
 
 # Theos default packages dir is alongside its Makefile, so app/packages/.
 DEB="$(ls -t "$ROOT"/app/packages/com.vortex.pocketposter_*.deb 2>/dev/null | head -1)"
-[ -n "$DEB" ] || { warn "no PocketPoster .deb produced (looked in app/packages/)"; exit 1; }
+if [ -z "$DEB" ]; then
+  warn "no PocketPoster .deb produced (looked in app/packages/)."
+  warn "Last 40 lines of $LOG:"
+  echo "----------------------------------------"
+  tail -40 "$LOG"
+  echo "----------------------------------------"
+  exit 1
+fi
 say "Built $DEB"
 
 say "scp -> $PP_HOST"

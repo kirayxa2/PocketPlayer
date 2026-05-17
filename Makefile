@@ -40,10 +40,12 @@ rebuild:
 # script uses; mirroring it here so 'make app' works without the
 # wrapper script.
 app:
-	env -u THEOS_PROJECT_DIR -u THEOS_BUILD_DIR -u THEOS_OBJ_DIR \
-	    -u THEOS_OBJ_DIR_NAME -u THEOS_PACKAGE_DIR -u THEOS_STAGING_DIR \
-	    -u _THEOS_CURRENT_PACKAGE -u _THEOS_CURRENT_TYPE \
-	    -u _THEOS_RULES_LOADED -u _THEOS_COMMON_LOADED \
+	env -i \
+	    HOME="$$HOME" \
+	    PATH="$$PATH" \
+	    SHELL="$${SHELL:-/bin/bash}" \
+	    LANG="$${LANG:-C.UTF-8}" \
+	    THEOS="$(THEOS)" \
 	    $(MAKE) -C app package
 
 app-clean:
