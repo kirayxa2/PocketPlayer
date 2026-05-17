@@ -37,6 +37,13 @@ static NSString *const kPPWallpaperRoot =
 // In a release build this should stay NO.
 static BOOL const kPPDebugLabel = YES;
 
+// Set to YES to draw a magenta border around every CAEmitterLayer in
+// the parsed CAML, plus boost particle visibility (birthRate x5, min
+// scale 2.0). Lets us *see* where the emitter is physically placed
+// after all the parent transforms compose, even if its particles are
+// too small or transparent to spot otherwise.
+static BOOL const kPPDebugEmitters = YES;
+
 // =====================================================================
 // State
 // =====================================================================
@@ -78,6 +85,7 @@ static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep);
 static UIWindow *PPFindHomeScreenWindow(void);
 static void PPInstallPosterIntoHomeWindow(UIWindow *window);
 static CALayer *PPFindFloatingLayer(CALayer *root);
+static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window);
 
 // =====================================================================
 // Filesystem helpers
@@ -191,6 +199,75 @@ static void PPInstallDebugLabel(UIView *host) {
     l.layer.zPosition = 9999;
     [host addSubview:l];
     gDebugLabel = l;
+}
+
+// =====================================================================
+// Emitter debug
+// =====================================================================
+
+// For each CAEmitterLayer found in `root`'s subtree:
+//
+//   1. Add a thin magenta border so we can SEE the bounds rectangle
+//      after all parent transforms have composed. If a wallpaper claims
+//      "particles aren't appearing" but the magenta box is offscreen,
+//      we know it's a coordinate issue, not a particle issue.
+//   2. Boost visibility of its cells (birthRate x5, minimum particle
+//      scale 2.0pt, opaque alpha) so even configurations that emit
+//      mostly-transparent or sub-pixel particles still produce visible
+//      output during debugging.
+//   3. Append one line per emitter to /var/mobile/pocketplayer-emitters.log
+//      with a translation of its position into WINDOW coordinates,
+//      so we can compare against the actual screen size.
+static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
+    if (!kPPDebugEmitters || !root) return;
+
+    NSArray<CAEmitterLayer *> *emitters = [root pp_collectEmitters];
+    if (emitters.count == 0) return;
+
+    NSString *logPath = @"/var/mobile/pocketplayer-emitters.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!fh) {
+        [@"" writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    }
+    if (fh) { @try { [fh seekToEndOfFile]; } @catch (NSException *e) {} }
+
+    NSInteger idx = 0;
+    for (CAEmitterLayer *em in emitters) {
+        // Magenta border around the emitter's local bounds.
+        em.borderColor = [UIColor magentaColor].CGColor;
+        em.borderWidth = 1.0;
+
+        // Boost cells so particles are visibly large enough to spot.
+        NSMutableArray *boosted = [NSMutableArray array];
+        for (CAEmitterCell *c in em.emitterCells ?: @[]) {
+            if (c.scale < 2.0) c.scale = 2.0;
+            if (c.birthRate < 100) c.birthRate = c.birthRate * 5.0;
+            // Force opaque-ish alpha range/color so we don't lose the
+            // particle to alphaSpeed=-N decay before it travels.
+            c.alphaRange = 0;
+            c.alphaSpeed = 0;
+            [boosted addObject:c];
+        }
+        if (boosted.count) em.emitterCells = boosted;
+
+        // Translate emitter's anchor (its position) into window coords.
+        CGPoint inWindow = [em convertPoint:CGPointZero toLayer:window.layer];
+        CGRect boundsInWin = [em convertRect:em.bounds toLayer:window.layer];
+        NSString *line = [NSString stringWithFormat:
+            @"emitter[%ld] localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@\n",
+            (long)idx,
+            NSStringFromCGPoint(em.position),
+            NSStringFromCGPoint(inWindow),
+            NSStringFromCGRect(boundsInWin),
+            NSStringFromCGRect(window.bounds)];
+        if (fh) {
+            @try { [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
+            @catch (NSException *e) {}
+        }
+        idx++;
+    }
+    if (fh) { @try { [fh closeFile]; } @catch (NSException *e) {} }
 }
 
 // =====================================================================
@@ -444,6 +521,11 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
 
     PPResolveStatesFromDocs(docs);
 
+    // Annotate every emitter with a magenta border (and boost particle
+    // visibility) so we can SEE physically where emitters end up after
+    // all the parent transforms compose. Disabled in release builds.
+    PPDebugAnnotateEmitters(container, window);
+
     NSMutableString *summary = [NSMutableString string];
     for (NSUInteger i = 0; i < docs.count; i++) {
         if (i) [summary appendString:@" | "];
@@ -555,6 +637,9 @@ static void PPInstallPosterIntoHomeWindow(UIWindow *window) {
 
     [window.layer addSublayer:container];
     gHomePosterLayer = container;
+
+    // Same emitter debug annotation on the home-window poster.
+    PPDebugAnnotateEmitters(container, window);
 
     // Make sure state names are resolved using whichever stack first
     // declares them (cover-sheet stack wins, but if it's empty the home

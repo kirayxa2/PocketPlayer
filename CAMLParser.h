@@ -75,4 +75,12 @@ NS_ASSUME_NONNULL_BEGIN
                                   assetsPath:(NSString *)assetsPath;
 @end
 
+// Debug helpers, used by Tweak.x to visualise where emitters
+// physically end up on screen.
+@interface CALayer (PPDebug)
+// Recursively walk the layer tree starting at `self` and return all
+// CAEmitterLayers found under it (including self).
+- (NSArray<CAEmitterLayer *> *)pp_collectEmitters;
+@end
+
 NS_ASSUME_NONNULL_END
