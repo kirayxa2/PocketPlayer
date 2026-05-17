@@ -24,6 +24,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
+#import <fcntl.h>
 #import "CAMLParser.h"
 
 // =====================================================================
@@ -442,7 +443,6 @@ static void PPHandleApplyNotification(void) {
         if (win) {
             PPInstallPosterIntoWindow(win);
             PPNukeAllStaleLayersEverywhere(gPosterLayer);
-            PPRebuildMirrorEmitters();
             PPSetDebug(@"apply OK: %@",
                 manifest[@"displayName"] ?: [src lastPathComponent]);
         } else {
@@ -456,23 +456,78 @@ static void PPHandleApplyNotification(void) {
     }
 }
 
+// Three independent triggers, any one of them is enough:
+//   1. Darwin notification "com.vortex.pocketplayer.apply" -- instant if
+//      it gets through. On rootless iOS 15 the app's notify_post() is
+//      sometimes filtered before reaching SpringBoard depending on which
+//      entitlement bundle the jailbreak's signing pipeline preserves.
+//      We register but DON'T rely on it.
+//   2. dispatch_source(VNODE) on the parent directory: fires whenever
+//      the manifest plist is created / replaced. Filesystem-level event,
+//      no entitlements involved, works on every jailbreak we tested.
+//   3. NSTimer poll every 2s as a paranoid backstop.
+//
+// Whichever fires first wins; PPHandleApplyNotification() is idempotent
+// (deletes the manifest after handling) so duplicate triggers no-op.
+
 static void PPRegisterApplyListener(void) {
     static dispatch_once_t once;
-    static int token;
+    static int notifyToken;
+    static dispatch_source_t dirSource;
+    static NSTimer *pollTimer;
+
     dispatch_once(&once, ^{
+        // --- 1. Darwin notification (best case) ---
         notify_register_dispatch(kPPApplyDarwinName,
-                                 &token,
+                                 &notifyToken,
                                  dispatch_get_main_queue(),
                                  ^(int t) { PPHandleApplyNotification(); });
-        // If the app fired its notification before we could subscribe
-        // (e.g. user tapped Apply seconds before SpringBoard finished
-        // booting), the manifest will still be sitting on disk. Pick
-        // it up on first install.
+
+        // --- 2. kqueue on the manifest's parent directory ---
+        // The dir always exists once the app has tapped Apply once;
+        // create it ourselves so the watcher can attach even on a
+        // freshly-installed device.
+        NSString *dir = [kPPApplyManifestPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:NULL];
+        int fd = open([dir fileSystemRepresentation], O_EVTONLY);
+        if (fd >= 0) {
+            dirSource = dispatch_source_create(
+                DISPATCH_SOURCE_TYPE_VNODE,
+                fd,
+                DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND |
+                DISPATCH_VNODE_RENAME | DISPATCH_VNODE_LINK,
+                dispatch_get_main_queue());
+            dispatch_source_set_event_handler(dirSource, ^{
+                if ([[NSFileManager defaultManager]
+                        fileExistsAtPath:kPPApplyManifestPath]) {
+                    PPHandleApplyNotification();
+                }
+            });
+            dispatch_source_set_cancel_handler(dirSource, ^{ close(fd); });
+            dispatch_resume(dirSource);
+        }
+
+        // --- 3. Paranoid polling backstop ---
+        pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                    repeats:YES
+                                                      block:^(NSTimer *t) {
+            if ([[NSFileManager defaultManager]
+                    fileExistsAtPath:kPPApplyManifestPath]) {
+                PPHandleApplyNotification();
+            }
+        }];
+
+        // --- One-shot kick: anything left over from before we attached. ---
         if ([[NSFileManager defaultManager] fileExistsAtPath:kPPApplyManifestPath]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 PPHandleApplyNotification();
             });
         }
+
+        PPSetDebug(@"apply listener: notify+vnode+poll armed at %@", dir);
     });
 }
 
