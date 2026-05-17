@@ -739,6 +739,32 @@ didStartElement:(NSString *)elementName
     }
     if ([elementName isEqualToString:@"contents"]) {
         self.inContents = YES;
+        // Two CAML conventions in the wild:
+        //
+        //   (a) Long form with a child <CGImage>:
+        //         <contents>
+        //           <CGImage src="assets/foo.png"/>
+        //         </contents>
+        //       This is what CAPlayground emits. (Dark, etc.)
+        //
+        //   (b) Short form with the src on <contents> itself:
+        //         <contents type="CGImage" src="assets/foo.png"/>
+        //       This is what Apple's authoring tools and many community
+        //       posts emit. (Waves Bundle, MarioGalaxy, ...)
+        //
+        // We need to support BOTH or wallpapers from one camp render
+        // as a colored background with no objects.
+        NSString *src = attrs[@"src"];
+        if (src.length) {
+            CALayer *cur = self.layerStack.lastObject;
+            NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
+            NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
+            UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
+            if (cur && img) {
+                cur.contents = (__bridge id)img.CGImage;
+                cur.contentsScale = img.scale;
+            }
+        }
         return;
     }
     if ([elementName isEqualToString:@"CGImage"] && self.inContents) {
