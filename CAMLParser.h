@@ -39,6 +39,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) CALayer *rootLayer;
 @property (nonatomic, strong, readonly) NSDictionary<NSString *, CALayer *> *layersById;
 @property (nonatomic, strong, readonly) NSDictionary<NSString *, PPCAMLState *> *states;
+// Names of states in the order they were declared in the .caml file.
+@property (nonatomic, strong, readonly) NSArray<NSString *> *stateOrder;
 
 // Snapshot the "base" values (initial) so we can interpolate from them.
 - (void)captureBaseValues;
