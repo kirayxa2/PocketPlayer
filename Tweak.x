@@ -61,6 +61,16 @@ static NSString       *gToState;
 @interface SBDashBoardViewController         : UIViewController @end
 
 // =====================================================================
+// Forward declarations for helpers used out of definition order
+// =====================================================================
+
+static BOOL PPIsOurLayerName(NSString *n);
+static void PPNukeStaleLayersInTree(CALayer *root, CALayer *keep);
+static void PPNukeStaleViewsInTree(UIView *root);
+static void PPNukeAllStaleLayersEverywhere(CALayer *keep);
+static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep);
+
+// =====================================================================
 // Filesystem helpers
 // =====================================================================
 
@@ -214,10 +224,12 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
     CGFloat sy = window.bounds.size.height / rb.size.height;
     CGFloat s  = MAX(sx, sy);
 
+    // Flip Y because UIWindow.layer has geometryFlipped=YES on iOS:
+    // without -s on Y, content renders upside down.
     doc.rootLayer.anchorPoint = CGPointMake(0.5, 0.5);
     doc.rootLayer.position    = CGPointMake(window.bounds.size.width  / 2.0,
                                             window.bounds.size.height / 2.0);
-    doc.rootLayer.transform   = CATransform3DMakeScale(s, s, 1.0);
+    doc.rootLayer.transform   = CATransform3DMakeScale(s, -s, 1.0);
 
     [container addSublayer:doc.rootLayer];
     [window.layer addSublayer:container];
@@ -243,19 +255,31 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {
     if (!window) return;
     for (CALayer *l in [window.layer.sublayers copy]) {
-        if ([l.name isEqualToString:@"PocketPlayerLayer"] && l != keep) {
+        if (l != keep && PPIsOurLayerName(l.name)) {
             [l removeFromSuperlayer];
         }
     }
 }
 
-// Recursively walks a CALayer tree and removes any sublayer named
-// "PocketPlayerLayer" that isn't the one we want to keep. Plain C, no
-// blocks, to avoid -Warc-retain-cycles on self-referential captures.
+// True if a layer was created by us OR by any prior incarnation of this
+// tweak (the previous one was called PosterPlayer with an 's'). Older
+// builds also occasionally used unprefixed names; match anything that
+// looks like one of ours.
+static BOOL PPIsOurLayerName(NSString *n) {
+    if (!n) return NO;
+    return [n isEqualToString:@"PocketPlayerLayer"]
+        || [n isEqualToString:@"PosterPlayerLayer"]
+        || [n hasPrefix:@"PocketPlayer"]
+        || [n hasPrefix:@"PosterPlayer"];
+}
+
+// Recursively walks a CALayer tree and removes any sublayer that looks
+// like one of ours, except the one we want to keep. Plain C, no blocks,
+// to avoid -Warc-retain-cycles on self-referential captures.
 static void PPNukeStaleLayersInTree(CALayer *root, CALayer *keep) {
     if (!root) return;
     for (CALayer *l in [root.sublayers copy]) {
-        if ([l.name isEqualToString:@"PocketPlayerLayer"] && l != keep) {
+        if (l != keep && PPIsOurLayerName(l.name)) {
             [l removeFromSuperlayer];
             continue;
         }
@@ -304,6 +328,56 @@ static void PPNukeAllStaleLayersEverywhere(CALayer *keep) {
     }
 }
 
+// Hides system wallpaper views (the user's own background image) so
+// our poster shines through. Walks the cover-sheet view's subview tree
+// and hides anything whose class name contains "Wallpaper". Reversible:
+// if you uninstall the tweak, the views just get hidden=NO again at next
+// respring.
+static void PPHideSystemWallpapersIn(UIView *root) {
+    if (!root) return;
+    NSString *cls = NSStringFromClass([root class]);
+    if (cls && [cls containsString:@"Wallpaper"]) {
+        // Don't hide our own debug label or container.
+        if (root.tag != 0xCAFE) {
+            root.hidden = YES;
+        }
+    }
+    for (UIView *v in root.subviews) {
+        PPHideSystemWallpapersIn(v);
+    }
+}
+
+// Same but at window level — walks every window in every scene.
+static void PPHideAllSystemWallpapers(void) {
+    NSArray<UIWindow *> *windows = nil;
+    if (@available(iOS 15.0, *)) {
+        NSMutableArray *all = [NSMutableArray array];
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                [all addObjectsFromArray:((UIWindowScene *)s).windows];
+            }
+        }
+        windows = all;
+    }
+    if (windows.count == 0) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        windows = [UIApplication sharedApplication].windows;
+        #pragma clang diagnostic pop
+    }
+    for (UIWindow *w in windows) {
+        // Only hide wallpapers in the lock-screen / cover-sheet windows,
+        // not on the home screen — otherwise the home wallpaper goes too.
+        NSString *wcls = NSStringFromClass([w class]);
+        if (!wcls) continue;
+        if ([wcls containsString:@"CoverSheet"]
+            || [wcls containsString:@"Lock"]
+            || [wcls containsString:@"DashBoard"]) {
+            PPHideSystemWallpapersIn(w);
+        }
+    }
+}
+
 // =====================================================================
 // CADisplayLink — drives state interpolation only
 // =====================================================================
@@ -316,6 +390,11 @@ static void PPNukeAllStaleLayersEverywhere(CALayer *keep) {
 - (void)tick:(CADisplayLink *)link {
     UIView *cs = gCoverSheetView;
     if (!cs.window) return;
+
+    // Re-hide system wallpaper views every frame — iOS occasionally
+    // un-hides them during the unlock transition, which would let the
+    // user's background bleed through over our poster.
+    PPHideAllSystemWallpapers();
 
     // Keep poster sized to the window on rotation.
     UIWindow *win = gHostWindow;
@@ -332,7 +411,7 @@ static void PPNukeAllStaleLayersEverywhere(CALayer *keep) {
                 CGFloat s  = MAX(sx, sy);
                 gDoc.rootLayer.position = CGPointMake(win.bounds.size.width  / 2.0,
                                                       win.bounds.size.height / 2.0);
-                gDoc.rootLayer.transform = CATransform3DMakeScale(s, s, 1.0);
+                gDoc.rootLayer.transform = CATransform3DMakeScale(s, -s, 1.0);
             }
         }
     }
@@ -380,6 +459,9 @@ static void PPStartDisplayLink(void) {
     // Kill any zombies left by older builds anywhere in the SpringBoard
     // process — wallpaper views, other windows, our own cover sheet view.
     PPNukeAllStaleLayersEverywhere(gPosterLayer);
+
+    // Hide the user's stock wallpaper so our poster is the lockscreen.
+    PPHideAllSystemWallpapers();
 
     PPInstallDebugLabel(self);
     PPStartDisplayLink();
