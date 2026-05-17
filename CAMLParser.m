@@ -645,12 +645,13 @@ static void PPApplyEmitterLayerAttribute(CAEmitterLayer *em, NSString *key, NSSt
 //     need parsing into NSValue.
 //   - "name" we set directly so authoring tools that target child
 //     cells by name still work.
-//   - contentsScale: PosterBoard authoring tools sometimes emit
-//     absurd values like "16.67" (probably an internal HiDPI factor
-//     for a >3x asset). Apple's public CAEmitterCell interprets that
-//     literally, dividing the texture down to ~1pt and rendering
-//     invisibly. We clamp to a sane range; values outside [0.1, 4.0]
-//     are dropped (KVC keeps the default of 1.0).
+//   - contentsScale: in PosterBoard CAML files this is the texture
+//     pixel/point ratio. Authoring tools sometimes emit large values
+//     like 16.67 because the asset was exported at 16x its on-screen
+//     size. Apple's CAEmitterCell honours it correctly (texture is
+//     divided by contentsScale before rasterisation), so we pass it
+//     through unchanged. Earlier we clamped to [0.1, 4.0] which broke
+//     exactly the case where it was needed.
 static void PPApplyEmitterCellAttribute(CAEmitterCell *cell, NSString *key, NSString *val) {
     if (!cell || !val.length) return;
 
@@ -679,18 +680,6 @@ static void PPApplyEmitterCellAttribute(CAEmitterCell *cell, NSString *key, NSSt
         [key isEqualToString:@"enabled"] ||
         [key isEqualToString:@"hidden"]) {
         @try { [cell setValue:@(val.boolValue) forKey:key]; } @catch (NSException *e) {}
-        return;
-    }
-
-    // contentsScale guard. See header comment.
-    if ([key isEqualToString:@"contentsScale"]) {
-        double v = val.doubleValue;
-        if (v < 0.1 || v > 4.0) {
-            // Skip — defaults to 1.0 which renders the texture at its
-            // natural pixel size.
-            return;
-        }
-        @try { [cell setValue:@(v) forKey:key]; } @catch (NSException *e) {}
         return;
     }
 
@@ -1014,12 +1003,21 @@ didStartElement:(NSString *)elementName
                 if (toCell) {
                     CAEmitterCell *cell = self.cellStack.lastObject;
                     cell.contents = (__bridge id)img.CGImage;
-                    cell.contentsScale = img.scale;
+                    // Only set contentsScale from the image if the cell
+                    // attribute didn't already pin one — otherwise we'd
+                    // overwrite e.g. contentsScale="16.67" from the
+                    // CAML with the image's natural scale (usually 1.0)
+                    // and the particle would render giant.
+                    if (cell.contentsScale == 1.0) {
+                        cell.contentsScale = img.scale;
+                    }
                 } else {
                     CALayer *cur = self.layerStack.lastObject;
                     if (cur) {
                         cur.contents = (__bridge id)img.CGImage;
-                        cur.contentsScale = img.scale;
+                        if (cur.contentsScale == 1.0) {
+                            cur.contentsScale = img.scale;
+                        }
                     }
                 }
             } else {
@@ -1051,12 +1049,16 @@ didStartElement:(NSString *)elementName
                 if (self.cellStack.count) {
                     CAEmitterCell *cell = self.cellStack.lastObject;
                     cell.contents = (__bridge id)img.CGImage;
-                    cell.contentsScale = img.scale;
+                    if (cell.contentsScale == 1.0) {
+                        cell.contentsScale = img.scale;
+                    }
                 } else {
                     CALayer *cur = self.layerStack.lastObject;
                     if (cur) {
                         cur.contents = (__bridge id)img.CGImage;
-                        cur.contentsScale = img.scale;
+                        if (cur.contentsScale == 1.0) {
+                            cur.contentsScale = img.scale;
+                        }
                     }
                 }
             } else {
