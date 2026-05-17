@@ -370,6 +370,30 @@ static void PPCollectEmittersRecursive(CALayer *root, NSMutableArray *out) {
 //   3. Append one line per emitter to /var/mobile/pocketplayer-emitters.log
 //      with a translation of its position into WINDOW coordinates,
 //      so we can compare against the actual screen size.
+// PPDebugAnnotateEmitters
+//
+// PROOF FROM DIAGNOSTICS: the hand-built reference CAEmitterLayer at
+// the screen center DOES emit correctly (user sees the red squares).
+// Mario's CAML emitter does NOT. The difference: Mario's emitter is
+// 4 levels deep under Floating > Overall Scale > Arm Animations, and
+// each parent has its own scale/transform. The emitter itself also
+// carries transform="rotate(134.74deg) scale(1.24, 1.24, 1)".
+//
+// Cumulative parent transforms shred CAEmitterLayer particle physics:
+// velocity / emissionLongitude / emitterSize all get baked through
+// the parent's transform chain in unintuitive ways, and on iOS 15
+// the emitter ends up rendering particles at sub-pixel size or
+// drifting outside its render bounds.
+//
+// FIX: hoist every emitter found in the CAML tree out of its deep
+// parent chain and re-parent it onto the top-level container. We
+// keep the emitter visually where it should be by translating its
+// original window-space center into the new (transform-free) parent
+// coordinate system. We also strip the emitter's own transform.
+//
+// Result: the emitter renders inside an identity coordinate system,
+// at the same window position the author intended, and particles
+// emit correctly.
 static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     if (!kPPDebugEmitters || !root) return;
 
@@ -381,9 +405,13 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
 
     NSInteger idx = 0;
     for (CAEmitterLayer *em in emitters) {
-        // Magenta border around the emitter's local bounds.
-        em.borderColor = [UIColor magentaColor].CGColor;
-        em.borderWidth = 1.0;
+        // Capture the emitter's CURRENT window-space position (from its
+        // CAML parents' transforms) BEFORE we re-parent it. We'll
+        // restore that visual position after the hoist.
+        CGPoint windowSpaceCenter = CGPointZero;
+        if (em.superlayer && window) {
+            windowSpaceCenter = [em convertPoint:CGPointZero toLayer:window.layer];
+        }
 
         // Reset the EMITTER LAYER's own multipliers. CAML often pins
         // them to tiny values (Mario: lifetime=0.035, speed=0.138) that
@@ -393,13 +421,11 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
         em.birthRate = 1.0;
         em.speed     = 1.0;
         em.scale     = 1.0;
-        // Re-prime the emitter timeline. addSublayer: may have shifted
-        // beginTime relative to the layer's superlayer time-space; if
-        // beginTime stays at the original CACurrentMediaTime() captured
-        // at parse time, the emitter is "in the past" and may have
-        // already burnt through its lifetime budget by the time we
-        // see it. Resetting to the layer-local now-time fixes this.
-        em.beginTime = [em convertTime:CACurrentMediaTime() fromLayer:nil];
+
+        // Strip the emitter's own transform (Mario rotates+scales it).
+        // We don't need it once we hoist out of the parent chain — and
+        // it confuses CAEmitterLayer particle physics on iOS 15.
+        em.transform = CATransform3DIdentity;
 
         // Boost cells so particles are visibly large enough to spot.
         NSMutableArray *boosted = [NSMutableArray array];
@@ -422,38 +448,48 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
         }
         if (boosted.count) em.emitterCells = boosted;
 
-        // OPTIONAL: forcibly move the emitter into the visible part of
-        // the window. After all parent CAML transforms compose, many
-        // PosterBoard wallpapers (Mario Galaxy in particular) place
-        // their emitter at a position that maps to coordinates well
-        // outside the screen — the original starbit emitter ends up
-        // around (494, 946) on a 375x667 screen, ~119pt past the
-        // right edge and 278pt below the bottom. PosterBoard on
-        // iOS 17 has its own coordinate transforms that reel it
-        // back; we don't, so the particles fly off into the void
-        // forever.
-        //
-        // To prove the emitter machinery itself is working, snap the
-        // emitter's window-space center to ~75% of the window. The
-        // user originally described this exact starbit stream as
-        // 'flying out of the lower-right corner', so 75%/75% is the
-        // canonical place for it.
-        if (kPPDebugMoveEmitterIntoView && em.superlayer && window) {
-            CGFloat targetWX = window.bounds.size.width  * 0.75;
-            CGFloat targetWY = window.bounds.size.height * 0.75;
-            // Convert the desired window-space target back into the
-            // emitter's parent-layer coordinate space, then assign
-            // that as the emitter's new position. This works no
-            // matter how complex the parent chain is.
+        // === HOIST: detach emitter from its deep CAML parent and ===
+        // === re-attach to the top-level container layer.        ===
+        // root is the visibleRoot container we built. It has at most
+        // ONE scale to compose with the window, much friendlier to
+        // CAEmitterLayer particle physics than 4+ nested transforms.
+        if (em.superlayer && em.superlayer != root) {
+            [em removeFromSuperlayer];
+            [root addSublayer:em];
+        }
+
+        // Re-anchor the emitter at the right window-space location.
+        if (window && em.superlayer) {
+            CGFloat targetWX, targetWY;
+            if (kPPDebugMoveEmitterIntoView) {
+                // Pin to lower-right quadrant so user can see it.
+                targetWX = window.bounds.size.width  * 0.75;
+                targetWY = window.bounds.size.height * 0.75;
+            } else {
+                // Use the original window-space position.
+                targetWX = windowSpaceCenter.x;
+                targetWY = windowSpaceCenter.y;
+            }
+            // Convert the window-space target back to the emitter's
+            // (now top-level) parent coordinate system.
             CGPoint targetInParent = [em.superlayer convertPoint:CGPointMake(targetWX, targetWY)
                                                        fromLayer:window.layer];
             em.position = targetInParent;
         }
 
-        // Translate emitter's anchor (its position) into window coords.
+        // Magenta border + high zPosition so we find the emitter visually.
+        em.borderColor = [UIColor magentaColor].CGColor;
+        em.borderWidth = 1.0;
+        em.zPosition   = 10000;
+
+        // Re-prime the emitter timeline AFTER the hoist+positioning, so
+        // it starts emitting "now" in its new coordinate system.
+        em.beginTime = CACurrentMediaTime();
+
+        // Translate emitter's anchor (its position) into window coords (post-hoist).
         CGPoint inWindow = [em convertPoint:CGPointZero toLayer:window.layer];
         CGRect boundsInWin = [em convertRect:em.bounds toLayer:window.layer];
-        PPEmitterLog(@"emitter[%ld] localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@",
+        PPEmitterLog(@"emitter[%ld] HOISTED localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@",
                      (long)idx,
                      NSStringFromCGPoint(em.position),
                      NSStringFromCGPoint(inWindow),
