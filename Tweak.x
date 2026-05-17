@@ -322,8 +322,10 @@ static void PPInstallPosterIntoWallpaperView(UIView *wallpaper) {
 - (void)tick:(CADisplayLink *)link;
 @end
 
-// Forward declaration: implementation lives below in the Hooks section.
+// Forward declarations: implementations live below in the Hooks section.
 static void PPTryInstallFromCoverSheet(UIView *coverSheet);
+static void PPCleanupStaleLayers(UIView *keepHost);
+static void PPReapPocketLayersIn(CALayer *root, CALayer *keep);
 
 @implementation PPDisplayLinkTarget
 - (void)tick:(CADisplayLink *)link {
