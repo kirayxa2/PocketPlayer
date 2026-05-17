@@ -1,0 +1,9 @@
+Package: com.vortex.pocketplayer
+Name: PocketPlayer
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: PosterBoard-style animated lockscreen wallpapers (.ca bundles) for iOS 15.
+Maintainer: vortex
+Author: vortex
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
