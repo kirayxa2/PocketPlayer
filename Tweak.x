@@ -224,6 +224,32 @@ static void PPInstallDebugLabel(UIView *host) {
     gDebugLabel = l;
 }
 
+// Append one diagnostic line to /var/mobile/pocketplayer-emitters.log.
+// Different from PPSetDebug() because that overwrites; this appends.
+//
+// Defined here (above PPInstallTestEmitter) so all subsequent emitter
+// helpers can call it without needing forward declarations.
+static void PPEmitterLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *withNL = [s stringByAppendingString:@"\n"];
+    NSString *path = @"/var/mobile/pocketplayer-emitters.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[withNL dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
+
 // Build a tiny CGImage of the given size and uniform color. Used so
 // the reference test emitter has a guaranteed-visible particle texture
 // that doesn't depend on any asset on disk.
@@ -312,28 +338,8 @@ static void PPInstallTestEmitter(UIView *host) {
 // Emitter debug
 // =====================================================================
 
-// Append one diagnostic line to /var/mobile/pocketplayer-emitters.log.
-// Different from PPSetDebug() because that overwrites; this appends.
-static void PPEmitterLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSString *withNL = [s stringByAppendingString:@"\n"];
-    NSString *path = @"/var/mobile/pocketplayer-emitters.log";
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    }
-    if (fh) {
-        @try {
-            [fh seekToEndOfFile];
-            [fh writeData:[withNL dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        } @catch (NSException *e) {}
-    }
-}
+// PPEmitterLog defined above (before PPInstallTestEmitter so it can
+// call it without a forward declaration).
 
 // Recursive walk that collects every CAEmitterLayer under `root`.
 // Implemented here as a plain C-style helper instead of as an ObjC
