@@ -25,6 +25,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
 #import <fcntl.h>
+#import <sys/time.h>
 #import "CAMLParser.h"
 
 // =====================================================================
@@ -379,6 +380,49 @@ static NSString *const kPPApplyManifestPath =
 static const char *const kPPApplyDarwinName =
     "com.vortex.pocketplayer.apply";
 
+// Tell PosterKit / SpringBoard's wallpaper renderer that the active
+// bundle on disk just changed. Without this, the system keeps a cached
+// copy of the previous bundle and ignores our swap entirely -- which
+// is exactly why "Apply" only updated our overlay, not the real
+// wallpaper visible on the home screen and behind the lock UI.
+//
+// We try several signals because PosterKit's listener set varies
+// between iOS 15 point releases:
+//   - notify_post on every PosterKit change-of-state name we've seen
+//   - utimes() on the active-slot directory and its config plists, so
+//     any kqueue-based watcher inside the daemon fires
+static void PPNudgePosterKit(void) {
+    static const char *const kPosterNotifyNames[] = {
+        "com.apple.PosterKit.PRPosterRoleDidChange",
+        "com.apple.PosterKit.PRPosterDidChange",
+        "com.apple.posterservice.activePosterDidChange",
+        "com.apple.PRWallpaper.activeRoleDidChange",
+        NULL,
+    };
+    for (int i = 0; kPosterNotifyNames[i]; i++) {
+        notify_post(kPosterNotifyNames[i]);
+    }
+
+    // Touch the active-slot dir + its sibling plists. Any PosterKit
+    // process watching for filesystem mtime changes on those paths
+    // will reload the bundle on next event-loop tick. Best-effort,
+    // we don't care about errors.
+    NSString *contents = kPPWallpaperRoot;
+    NSArray<NSString *> *touchTargets = @[
+        contents,
+        [contents stringByAppendingPathComponent:@"Wallpaper.plist"],
+        [contents stringByAppendingPathComponent:
+         @"com.apple.posterkit.provider.contents.otherMetadata.plist"],
+        [contents stringByAppendingPathComponent:
+         @".com.apple.posterkit.provider.contents.configurableOptions.plist"],
+    ];
+    for (NSString *p in touchTargets) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            utimes([p fileSystemRepresentation], NULL);
+        }
+    }
+}
+
 // Atomically replace the .wallpaper bundle inside
 //     /var/mobile/Library/PosterPlayer/active/versions/1/contents/
 // with the one at `srcBundle`. Returns YES on success.
@@ -436,13 +480,22 @@ static void PPHandleApplyNotification(void) {
             return;
         }
 
-        // Re-install the poster from disk. Existing PocketPlayerLayer is
+        // Re-install OUR overlay from disk. Existing PocketPlayerLayer is
         // removed by PPInstallPosterIntoWindow itself; this gives us a
         // brand-new PPCAMLDocument bound to the new bundle. No respring.
         UIWindow *win = gHostWindow;
         if (win) {
             PPInstallPosterIntoWindow(win);
             PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        }
+
+        // Tell the SYSTEM wallpaper renderer that the active bundle
+        // changed too -- otherwise the home screen and the layer
+        // behind the lock UI keep showing the old wallpaper while
+        // only our overlay updates.
+        PPNudgePosterKit();
+
+        if (win) {
             PPSetDebug(@"apply OK: %@",
                 manifest[@"displayName"] ?: [src lastPathComponent]);
         } else {
