@@ -97,6 +97,9 @@ static NSString       *gToState;
 
 // Walk up the view hierarchy. Return YES iff one of the ancestors is the
 // SBCoverSheetWindow (i.e. we are in lock-screen context, NOT home-screen).
+// (Kept around even though discovery currently happens via PPFindWallpaperViewIn;
+//  we may want it again to filter false positives.)
+__attribute__((unused))
 static BOOL PPViewIsInLockScreen(UIView *v) {
     if (!v) return NO;
     UIView *cur = v;
@@ -415,6 +418,8 @@ static void PPStartDisplayLink(void) {
 //     CSCoverSheetView didMoveToWindow / layoutSubviews and the displaylink.
 
 // Build a "Class<-Class<-...<-Window" diagnostic string for the view chain.
+// (Useful for printing host hierarchies during bring-up; kept for re-use.)
+__attribute__((unused))
 static NSString *PPViewChain(UIView *v) {
     NSMutableArray *parts = [NSMutableArray array];
     UIView *cur = v;
