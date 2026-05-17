@@ -1270,19 +1270,24 @@ didStartElement:(NSString *)elementName
         return;
     }
 
-@end
-
-#pragma mark - Debug: emitter collection
-
-@implementation CALayer (PPDebug)
-- (NSArray<CAEmitterLayer *> *)pp_collectEmitters {
-    NSMutableArray *out = [NSMutableArray array];
-    if ([self isKindOfClass:[CAEmitterLayer class]]) {
-        [out addObject:(CAEmitterLayer *)self];
+    // Any layer-kind closing tag pops the parser's layer stack so the
+    // next opening element attaches to the correct parent.
+    //
+    // Critically important: a previous refactor accidentally removed
+    // this branch, leaving the layer stack growing without bound on
+    // every nested <CALayer>...</CALayer> close. That broke parent
+    // resolution for both child layers AND emitter cells (since cells
+    // attach to the topmost CAEmitterLayer on layerStack), and is the
+    // most likely reason MarioGalaxy emitters appeared to be silently
+    // misconfigured.
+    if ([elementName isEqualToString:@"CALayer"] ||
+        [elementName isEqualToString:@"CATransformLayer"] ||
+        [elementName isEqualToString:@"CAShapeLayer"] ||
+        [elementName isEqualToString:@"CAEmitterLayer"]) {
+        if (self.layerStack.count) [self.layerStack removeLastObject];
+        return;
     }
-    for (CALayer *l in self.sublayers) {
-        [out addObjectsFromArray:[l pp_collectEmitters]];
-    }
-    return out;
 }
+
 @end
+
