@@ -205,6 +205,45 @@ static void PPInstallDebugLabel(UIView *host) {
 // Emitter debug
 // =====================================================================
 
+// Append one diagnostic line to /var/mobile/pocketplayer-emitters.log.
+// Different from PPSetDebug() because that overwrites; this appends.
+static void PPEmitterLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *withNL = [s stringByAppendingString:@"\n"];
+    NSString *path = @"/var/mobile/pocketplayer-emitters.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[withNL dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
+
+// Recursive walk that collects every CAEmitterLayer under `root`.
+// Implemented here as a plain C-style helper instead of as an ObjC
+// category on CALayer because Theos linker behaviour around categories
+// declared in a separate .m file is unreliable - a category can be
+// stripped by dead-code-elimination if no code in the same translation
+// unit references it.
+static void PPCollectEmittersRecursive(CALayer *root, NSMutableArray *out) {
+    if (!root) return;
+    if ([root isKindOfClass:[CAEmitterLayer class]]) {
+        [out addObject:root];
+    }
+    for (CALayer *l in root.sublayers) {
+        PPCollectEmittersRecursive(l, out);
+    }
+}
+
 // For each CAEmitterLayer found in `root`'s subtree:
 //
 //   1. Add a thin magenta border so we can SEE the bounds rectangle
@@ -221,16 +260,11 @@ static void PPInstallDebugLabel(UIView *host) {
 static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
     if (!kPPDebugEmitters || !root) return;
 
-    NSArray<CAEmitterLayer *> *emitters = [root pp_collectEmitters];
+    NSMutableArray *emitters = [NSMutableArray array];
+    PPCollectEmittersRecursive(root, emitters);
+    PPEmitterLog(@"=== annotate: found %lu emitter(s) under %@ ===",
+                 (unsigned long)emitters.count, root.name ?: @"(unnamed)");
     if (emitters.count == 0) return;
-
-    NSString *logPath = @"/var/mobile/pocketplayer-emitters.log";
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
-    if (!fh) {
-        [@"" writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
-    }
-    if (fh) { @try { [fh seekToEndOfFile]; } @catch (NSException *e) {} }
 
     NSInteger idx = 0;
     for (CAEmitterLayer *em in emitters) {
@@ -254,20 +288,14 @@ static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window) {
         // Translate emitter's anchor (its position) into window coords.
         CGPoint inWindow = [em convertPoint:CGPointZero toLayer:window.layer];
         CGRect boundsInWin = [em convertRect:em.bounds toLayer:window.layer];
-        NSString *line = [NSString stringWithFormat:
-            @"emitter[%ld] localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@\n",
-            (long)idx,
-            NSStringFromCGPoint(em.position),
-            NSStringFromCGPoint(inWindow),
-            NSStringFromCGRect(boundsInWin),
-            NSStringFromCGRect(window.bounds)];
-        if (fh) {
-            @try { [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
-            @catch (NSException *e) {}
-        }
+        PPEmitterLog(@"emitter[%ld] localPos=%@ inWindow=%@ boundsInWin=%@ winBounds=%@",
+                     (long)idx,
+                     NSStringFromCGPoint(em.position),
+                     NSStringFromCGPoint(inWindow),
+                     NSStringFromCGRect(boundsInWin),
+                     NSStringFromCGRect(window.bounds));
         idx++;
     }
-    if (fh) { @try { [fh closeFile]; } @catch (NSException *e) {} }
 }
 
 // =====================================================================
