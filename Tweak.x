@@ -35,7 +35,7 @@ static NSString *const kPPWallpaperRoot =
 // Set to YES during development to show the on-screen progress label
 // and write per-frame log entries to /var/mobile/pocketplayer.log.
 // In a release build this should stay NO.
-static BOOL const kPPDebugLabel = NO;
+static BOOL const kPPDebugLabel = YES;
 
 // =====================================================================
 // State
@@ -445,9 +445,7 @@ static void PPInstallPosterIntoWindow(UIWindow *window) {
               atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     PPApplyProgress(0.0);
-    PPSetDebug(@"ready %lu .ca hostWin=%@",
-        (unsigned long)docs.count,
-        NSStringFromClass([window class]));
+    PPSetDebug(@"%lu .ca: %@", (unsigned long)docs.count, kindList);
 }
 
 static void PPCleanupStaleLayersInWindow(UIWindow *window, CALayer *keep) {
