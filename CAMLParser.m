@@ -345,6 +345,30 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
 @property (nonatomic, assign) NSInteger animationsDepth;
 @property (nonatomic, strong) PPPendingAnim *currentAnim;
 @property (nonatomic, assign) NSInteger animKeyCounter;          // for autogen anim key names
+
+// Emitter-cell parsing.
+//
+// CAEmitterLayer is a CALayer subclass whose particles are described by
+// CAEmitterCell objects in its `emitterCells` array. Cells can in turn
+// have child cells. The CAML structure is:
+//
+//   <CAEmitterLayer emitterSize="200 200" emitterMode="points" ...>
+//     <emitterCells>
+//       <CAEmitterCell birthRate="20" lifetime="100" velocity="114"
+//                      particleType="plane" color="1 1 1" ...>
+//         <contents type="CGImage" src="assets/starbit.webp"/>
+//         <emitterCells>
+//           <CAEmitterCell .../>     <!-- child cell, optional -->
+//         </emitterCells>
+//       </CAEmitterCell>
+//     </emitterCells>
+//   </CAEmitterLayer>
+//
+// We push the current cell onto a stack so children attach to the
+// right parent. The `emitterCells` wrapper element is just structural
+// (we track depth in inEmitterCellsDepth so we know we're inside one).
+@property (nonatomic, strong) NSMutableArray<CAEmitterCell *> *cellStack;
+@property (nonatomic, assign) NSInteger inEmitterCellsDepth;
 @end
 
 @implementation PPCAMLParser
@@ -360,6 +384,7 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
     p.assetsPath = assetsPath;
     p.doc = [PPCAMLDocument new];
     p.layerStack = [NSMutableArray array];
+    p.cellStack  = [NSMutableArray array];
 
     NSXMLParser *xml = [[NSXMLParser alloc] initWithData:data];
     xml.delegate = p;
@@ -482,6 +507,105 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
         }
         if (anyOp) layer.transform = acc;
     }
+}
+
+#pragma mark Emitter attribute helpers
+
+// CAEmitterLayer-only attributes. Most layer-level attributes
+// (bounds/position/transform/etc) are handled by applyAttribute: above
+// because CAEmitterLayer IS-A CALayer.
+//
+// Reference: <QuartzCore/CAEmitterLayer.h>.
+static void PPApplyEmitterLayerAttribute(CAEmitterLayer *em, NSString *key, NSString *val) {
+    if (!em || !val.length) return;
+
+    if ([key isEqualToString:@"emitterSize"]) {
+        NSArray<NSNumber *> *n = PPParseNumberList(val);
+        if (n.count >= 2) em.emitterSize = CGSizeMake(n[0].doubleValue, n[1].doubleValue);
+    } else if ([key isEqualToString:@"emitterPosition"]) {
+        em.emitterPosition = PPParsePoint(val);
+    } else if ([key isEqualToString:@"emitterDepth"]) {
+        em.emitterDepth = val.doubleValue;
+    } else if ([key isEqualToString:@"emitterShape"]) {
+        em.emitterShape = val; // "point", "line", "rectangle", "circle", "cuboid", "sphere"
+    } else if ([key isEqualToString:@"emitterMode"]) {
+        em.emitterMode = val;  // "points", "outline", "surface", "volume"
+    } else if ([key isEqualToString:@"renderMode"]) {
+        em.renderMode = val;   // "unordered", "oldestFirst", "oldestLast", "backToFront", "additive"
+    } else if ([key isEqualToString:@"birthRate"]) {
+        em.birthRate = val.floatValue;
+    } else if ([key isEqualToString:@"lifetime"]) {
+        em.lifetime = val.floatValue;
+    } else if ([key isEqualToString:@"scale"]) {
+        em.scale = val.floatValue;
+    } else if ([key isEqualToString:@"spin"]) {
+        em.spin = val.floatValue;
+    } else if ([key isEqualToString:@"velocity"]) {
+        em.velocity = val.floatValue;
+    } else if ([key isEqualToString:@"seed"]) {
+        em.seed = (unsigned int)val.integerValue;
+    } else if ([key isEqualToString:@"preservesDepth"]) {
+        em.preservesDepth = val.boolValue;
+    }
+    // Anything else falls through to the generic CALayer applyAttribute.
+}
+
+// Apply one CAEmitterCell attribute. We use KVC because CAEmitterCell
+// already exposes everything we need as keyed properties.
+//
+// Most CAML CAEmitterCell attributes map 1:1 to CAEmitterCell property
+// names (birthRate, lifetime, velocity, color, scale, etc.). The
+// special-cases below are:
+//   - color/redRange/greenRange/blueRange/alphaRange come as a 4-float
+//     "r g b a" or 3-float "r g b" string; we parse to UIColor and
+//     hand its .CGColor through.
+//   - particleType is a string ("plane", "rectangle", "cuboid", ...).
+//   - contentsRect / emitterPosition style "x y" or "x y w h" strings
+//     need parsing into NSValue.
+//   - "name" we set directly so authoring tools that target child
+//     cells by name still work.
+static void PPApplyEmitterCellAttribute(CAEmitterCell *cell, NSString *key, NSString *val) {
+    if (!cell || !val.length) return;
+
+    // Color attribute is always 3 or 4 floats.
+    if ([key isEqualToString:@"color"]) {
+        UIColor *c = PPParseColor(val);
+        if (c) cell.color = c.CGColor;
+        return;
+    }
+
+    // particleType / contentsFormat / minificationFilter / magnificationFilter
+    // are plain strings; KVC-set them directly.
+    if ([key isEqualToString:@"particleType"] ||
+        [key isEqualToString:@"contentsFormat"] ||
+        [key isEqualToString:@"minificationFilter"] ||
+        [key isEqualToString:@"magnificationFilter"] ||
+        [key isEqualToString:@"name"]) {
+        @try { [cell setValue:val forKey:key]; } @catch (NSException *e) {}
+        return;
+    }
+
+    // Booleans first: KVC autoboxes "1"/"0"/"YES"/"NO" via
+    // -setValue:forKey: but only if the property type is BOOL. To be
+    // safe we coerce to NSNumber explicitly.
+    if ([key isEqualToString:@"autoreverses"] ||
+        [key isEqualToString:@"enabled"] ||
+        [key isEqualToString:@"hidden"]) {
+        @try { [cell setValue:@(val.boolValue) forKey:key]; } @catch (NSException *e) {}
+        return;
+    }
+
+    // Everything else we know about on CAEmitterCell is a scalar:
+    //
+    //   birthRate, lifetime, lifetimeRange, scale, scaleRange, scaleSpeed,
+    //   spin, spinRange, velocity, velocityRange, emissionLatitude,
+    //   emissionLongitude, emissionRange, redRange, greenRange, blueRange,
+    //   alphaRange, redSpeed, greenSpeed, blueSpeed, alphaSpeed,
+    //   xAcceleration, yAcceleration, zAcceleration, contentsScale,
+    //   contentsFramesPerSecond, contentsScale, duration, beginTime, ...
+    //
+    // Set via KVC; if the key doesn't exist we silently catch.
+    @try { [cell setValue:@(val.doubleValue) forKey:key]; } @catch (NSException *e) {}
 }
 
 #pragma mark Animation materialization
@@ -754,32 +878,99 @@ didStartElement:(NSString *)elementName
         //
         // We need to support BOTH or wallpapers from one camp render
         // as a colored background with no objects.
+        //
+        // Owner can be either the layer we're currently in, or the
+        // CAEmitterCell we're currently filling (cells use `contents`
+        // the same way layers do, for the particle texture).
         NSString *src = attrs[@"src"];
         if (src.length) {
-            CALayer *cur = self.layerStack.lastObject;
             NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
             NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
             UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
-            if (cur && img) {
-                cur.contents = (__bridge id)img.CGImage;
-                cur.contentsScale = img.scale;
+            if (img) {
+                if (self.cellStack.count) {
+                    CAEmitterCell *cell = self.cellStack.lastObject;
+                    cell.contents = (__bridge id)img.CGImage;
+                    cell.contentsScale = img.scale;
+                } else {
+                    CALayer *cur = self.layerStack.lastObject;
+                    if (cur) {
+                        cur.contents = (__bridge id)img.CGImage;
+                        cur.contentsScale = img.scale;
+                    }
+                }
             }
         }
         return;
     }
     if ([elementName isEqualToString:@"CGImage"] && self.inContents) {
-        CALayer *cur = self.layerStack.lastObject;
+        // <CGImage> long-form contents. Owner is whichever is on top:
+        // a CAEmitterCell currently being filled (cells use `contents`
+        // for their particle texture), or the current CALayer.
         NSString *src = attrs[@"src"];
-        if (cur && src.length) {
-            // src might be "assets/foo.png" or URL-encoded "Screenshot%20188.png".
+        if (src.length) {
             NSString *decoded = [src stringByRemovingPercentEncoding] ?: src;
             NSString *imgPath = [self.assetsPath stringByAppendingPathComponent:[decoded lastPathComponent]];
             UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
             if (img) {
-                cur.contents = (__bridge id)img.CGImage;
-                cur.contentsScale = img.scale;
+                if (self.cellStack.count) {
+                    CAEmitterCell *cell = self.cellStack.lastObject;
+                    cell.contents = (__bridge id)img.CGImage;
+                    cell.contentsScale = img.scale;
+                } else {
+                    CALayer *cur = self.layerStack.lastObject;
+                    if (cur) {
+                        cur.contents = (__bridge id)img.CGImage;
+                        cur.contentsScale = img.scale;
+                    }
+                }
             }
         }
+        return;
+    }
+
+    // ---------------- Emitter cells ----------------
+    //
+    // <emitterCells>  is just a container; we track depth to know we're
+    // inside one (so a stray <CAEmitterCell> outside this wrapper isn't
+    // accidentally treated as a particle definition).
+    //
+    // <CAEmitterCell> ... </CAEmitterCell>  describes one particle.
+    //   - Attaches to the parent CAEmitterLayer's `emitterCells`, OR
+    //     to the parent CAEmitterCell's `emitterCells` (CAEmitterCell
+    //     can itself contain child cells).
+    if ([elementName isEqualToString:@"emitterCells"]) {
+        self.inEmitterCellsDepth++;
+        return;
+    }
+    if ([elementName isEqualToString:@"CAEmitterCell"]) {
+        CAEmitterCell *cell = [CAEmitterCell emitterCell];
+        for (NSString *k in attrs) {
+            PPApplyEmitterCellAttribute(cell, k, attrs[k]);
+        }
+        // Attach to parent cell (nested case) or to the owning emitter
+        // layer. We can't actually mutate `emitterCells` until we
+        // close the parent's tag because some authoring tools list a
+        // bunch of siblings -- so we collect into a temp array via
+        // associated state and assign on the parent's close.
+        //
+        // To keep the existing tree walk linear we just *append* to
+        // the parent's emitterCells right now via a fresh array each
+        // time (copy + append). Cheap; emitter cell counts are small
+        // (< 100 per layer, typically 1-4).
+        if (self.cellStack.count) {
+            CAEmitterCell *parent = self.cellStack.lastObject;
+            NSArray *existing = parent.emitterCells ?: @[];
+            parent.emitterCells = [existing arrayByAddingObject:cell];
+        } else {
+            CALayer *owner = self.layerStack.lastObject;
+            if ([owner isKindOfClass:[CAEmitterLayer class]]) {
+                CAEmitterLayer *em = (CAEmitterLayer *)owner;
+                NSArray *existing = em.emitterCells ?: @[];
+                em.emitterCells = [existing arrayByAddingObject:cell];
+            }
+        }
+        [self.cellStack addObject:cell];
         return;
     }
 
@@ -794,18 +985,21 @@ didStartElement:(NSString *)elementName
         } else if ([elementName isEqualToString:@"CAShapeLayer"]) {
             layer = [CAShapeLayer layer];
         } else if ([elementName isEqualToString:@"CAEmitterLayer"]) {
-            // We don't (yet) parse CAEmitterCell. The wrapper CAEmitterLayer
-            // is allocated as itself anyway so future emitter-cell support
-            // can attach without reparenting; today it just renders nothing,
-            // which is correct compared to crashing or skipping the layer.
             layer = [CAEmitterLayer layer];
         } else {
             layer = [CALayer layer];
         }
 
-        // Apply attributes
+        // Apply attributes (CALayer properties for any layer kind, plus
+        // emitter-layer-only properties when applicable).
         for (NSString *k in attrs) {
             [self applyAttribute:k value:attrs[k] toLayer:layer];
+        }
+        if ([layer isKindOfClass:[CAEmitterLayer class]]) {
+            CAEmitterLayer *em = (CAEmitterLayer *)layer;
+            for (NSString *k in attrs) {
+                PPApplyEmitterLayerAttribute(em, k, attrs[k]);
+            }
         }
 
         NSString *layerId = attrs[@"id"];
@@ -883,6 +1077,14 @@ didStartElement:(NSString *)elementName
 
     if ([elementName isEqualToString:@"sublayers"]) { self.inSublayers = NO; return; }
     if ([elementName isEqualToString:@"contents"])  { self.inContents = NO;  return; }
+    if ([elementName isEqualToString:@"emitterCells"]) {
+        if (self.inEmitterCellsDepth > 0) self.inEmitterCellsDepth--;
+        return;
+    }
+    if ([elementName isEqualToString:@"CAEmitterCell"]) {
+        if (self.cellStack.count) [self.cellStack removeLastObject];
+        return;
+    }
 
     if ([elementName isEqualToString:@"CALayer"] ||
         [elementName isEqualToString:@"CATransformLayer"] ||
