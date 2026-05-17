@@ -452,6 +452,9 @@ static CAMediaTimingFunction *PPMakeTimingFunction(NSString *spec) {
     gPPImagesMissing = 0;
     gPPEmittersBuilt = 0;
     gPPCellsBuilt    = 0;
+    gPPEmitterDumpBudget = 8;
+    [@"" writeToFile:@"/var/mobile/pocketplayer-emitters.log"
+          atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
     PPCAMLParser *p = [PPCAMLParser new];
     p.assetsPath = assetsPath;
@@ -642,6 +645,12 @@ static void PPApplyEmitterLayerAttribute(CAEmitterLayer *em, NSString *key, NSSt
 //     need parsing into NSValue.
 //   - "name" we set directly so authoring tools that target child
 //     cells by name still work.
+//   - contentsScale: PosterBoard authoring tools sometimes emit
+//     absurd values like "16.67" (probably an internal HiDPI factor
+//     for a >3x asset). Apple's public CAEmitterCell interprets that
+//     literally, dividing the texture down to ~1pt and rendering
+//     invisibly. We clamp to a sane range; values outside [0.1, 4.0]
+//     are dropped (KVC keeps the default of 1.0).
 static void PPApplyEmitterCellAttribute(CAEmitterCell *cell, NSString *key, NSString *val) {
     if (!cell || !val.length) return;
 
@@ -673,20 +682,54 @@ static void PPApplyEmitterCellAttribute(CAEmitterCell *cell, NSString *key, NSSt
         return;
     }
 
+    // contentsScale guard. See header comment.
+    if ([key isEqualToString:@"contentsScale"]) {
+        double v = val.doubleValue;
+        if (v < 0.1 || v > 4.0) {
+            // Skip — defaults to 1.0 which renders the texture at its
+            // natural pixel size.
+            return;
+        }
+        @try { [cell setValue:@(v) forKey:key]; } @catch (NSException *e) {}
+        return;
+    }
+
     // Everything else we know about on CAEmitterCell is a scalar:
     //
     //   birthRate, lifetime, lifetimeRange, scale, scaleRange, scaleSpeed,
     //   spin, spinRange, velocity, velocityRange, emissionLatitude,
     //   emissionLongitude, emissionRange, redRange, greenRange, blueRange,
     //   alphaRange, redSpeed, greenSpeed, blueSpeed, alphaSpeed,
-    //   xAcceleration, yAcceleration, zAcceleration, contentsScale,
-    //   contentsFramesPerSecond, contentsScale, duration, beginTime, ...
+    //   xAcceleration, yAcceleration, zAcceleration,
+    //   contentsFramesPerSecond, duration, beginTime, ...
     //
     // Set via KVC; if the key doesn't exist we silently catch.
     @try { [cell setValue:@(val.doubleValue) forKey:key]; } @catch (NSException *e) {}
 }
 
-#pragma mark Animation materialization
+// Counter for emitter-debug dump throttling (we only dump the first
+// few cells/layers per parse, otherwise large CAMLs spam the log).
+static NSInteger gPPEmitterDumpBudget = 0;
+
+// Append one line to /var/mobile/pocketplayer-emitters.log so a debug
+// build can see what shape the freshly-parsed emitter / cell ended up
+// with. Bypasses the normal label log so screen UX stays clean.
+static void PPDumpEmitter(NSString *line) {
+    NSString *path = @"/var/mobile/pocketplayer-emitters.log";
+    NSString *withNL = [line stringByAppendingString:@"\n"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[withNL dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
 
 // Build a CAAnimation from a fully-parsed PPPendingAnim and attach it
 // to `layer`. Apple's animator handles repeat/autoreverse/timing for
@@ -1035,6 +1078,15 @@ didStartElement:(NSString *)elementName
         for (NSString *k in attrs) {
             PPApplyEmitterCellAttribute(cell, k, attrs[k]);
         }
+        if (gPPEmitterDumpBudget-- > 0) {
+            PPDumpEmitter([NSString stringWithFormat:
+                @"cell name=%@ birthRate=%.2f lifetime=%.2f velocity=%.2f scale=%.2f scaleRange=%.2f contentsScale=%.2f contents=%@",
+                cell.name ?: @"-",
+                cell.birthRate, cell.lifetime, cell.velocity,
+                cell.scale, cell.scaleRange,
+                cell.contentsScale,
+                cell.contents ? @"YES" : @"NO"]);
+        }
         // Attach to parent cell (nested case) or to the owning emitter
         // layer. We can't actually mutate `emitterCells` until we
         // close the parent's tag because some authoring tools list a
@@ -1084,7 +1136,6 @@ didStartElement:(NSString *)elementName
         } else {
             layer = [CALayer layer];
         }
-
         // Apply attributes (CALayer properties for any layer kind, plus
         // emitter-layer-only properties when applicable).
         for (NSString *k in attrs) {
@@ -1094,6 +1145,18 @@ didStartElement:(NSString *)elementName
             CAEmitterLayer *em = (CAEmitterLayer *)layer;
             for (NSString *k in attrs) {
                 PPApplyEmitterLayerAttribute(em, k, attrs[k]);
+            }
+            if (gPPEmitterDumpBudget > 0) {
+                // Don't decrement here — let cells share the budget.
+                PPDumpEmitter([NSString stringWithFormat:
+                    @"emitter bounds=%@ pos=%@ size=%@ shape=%@ mode=%@ render=%@ birthRate=%.2f lifetime=%.2f velocity=%.2f scale=%.2f speed=%.2f",
+                    NSStringFromCGRect(em.bounds),
+                    NSStringFromCGPoint(em.position),
+                    NSStringFromCGSize(em.emitterSize),
+                    em.emitterShape ?: @"-",
+                    em.emitterMode  ?: @"-",
+                    em.renderMode   ?: @"-",
+                    em.birthRate, em.lifetime, em.velocity, em.scale, em.speed]);
             }
         }
 
