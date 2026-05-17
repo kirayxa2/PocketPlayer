@@ -56,6 +56,17 @@ static BOOL const kPPDebugEmitters = YES;
 // emitter machinery itself is working.
 static BOOL const kPPDebugMoveEmitterIntoView = YES;
 
+// Set to YES to inject a hand-built reference CAEmitterLayer at the
+// top of the cover-sheet view, with the simplest possible config:
+// emit one bright red 10x10pt square per second, going straight up.
+// If THIS emitter doesn't show particles either, the problem is not
+// our CAML configuration - CAEmitterLayer simply doesn't render
+// inside the SpringBoard process on iOS 15 (e.g. due to renderer
+// policy, sandbox, or a Metal context restriction we don't have
+// visibility into). In that case we'll need a software particle
+// system on top of plain CALayers + CADisplayLink instead.
+static BOOL const kPPDebugInjectTestEmitter = YES;
+
 // =====================================================================
 // State
 // =====================================================================
@@ -211,6 +222,90 @@ static void PPInstallDebugLabel(UIView *host) {
     l.layer.zPosition = 9999;
     [host addSubview:l];
     gDebugLabel = l;
+}
+
+// Build a tiny CGImage of the given size and uniform color. Used so
+// the reference test emitter has a guaranteed-visible particle texture
+// that doesn't depend on any asset on disk.
+static CGImageRef PPMakeSolidColorCGImage(CGSize size, UIColor *color) {
+    UIGraphicsBeginImageContextWithOptions(size, NO, 0);
+    [color setFill];
+    UIRectFill(CGRectMake(0, 0, size.width, size.height));
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return CGImageRetain(img.CGImage);
+}
+
+// Inject a hand-built CAEmitterLayer into the host view's layer at
+// position (50%, 50%). It emits one solid-red 10pt square every 0.5s
+// going straight up at 60pt/s. This is the simplest possible test of
+// "do CAEmitterLayers render inside SpringBoard on iOS 15 at all".
+//
+// If you see red squares streaming up from the middle of the screen,
+// CA emitters work — and our CAML emitters fail because of how their
+// parameters get parsed/composed. If you don't see anything, CA
+// emitters are non-functional in this context and we need a software
+// particle system instead.
+static void PPInstallTestEmitter(UIView *host) {
+    if (!kPPDebugInjectTestEmitter) return;
+
+    // Avoid stacking duplicates if didMoveToWindow fires twice.
+    for (CALayer *l in [host.layer.sublayers copy]) {
+        if ([l.name isEqualToString:@"PPTestEmitter"]) {
+            [l removeFromSuperlayer];
+        }
+    }
+
+    CAEmitterLayer *em = [CAEmitterLayer layer];
+    em.name           = @"PPTestEmitter";
+    em.bounds         = CGRectMake(0, 0, 20, 20);
+    em.position       = CGPointMake(host.bounds.size.width / 2.0,
+                                    host.bounds.size.height / 2.0);
+    em.zPosition      = 99999;       // above everything (incl. our poster)
+    em.emitterShape   = kCAEmitterLayerPoint;
+    em.emitterMode    = kCAEmitterLayerOutline;
+    em.renderMode     = kCAEmitterLayerAdditive;
+    em.emitterSize    = CGSizeMake(2, 2);
+    em.lifetime       = 1.0;
+    em.birthRate      = 1.0;
+    em.speed          = 1.0;
+
+    CAEmitterCell *cell = [CAEmitterCell emitterCell];
+    cell.name           = @"PPTestCell";
+    cell.birthRate      = 4.0;             // 4 particles/sec
+    cell.lifetime       = 4.0;             // each lasts 4s -> visible trail
+    cell.lifetimeRange  = 0.0;
+    cell.velocity       = 60.0;
+    cell.velocityRange  = 0.0;
+    cell.scale          = 1.0;
+    cell.scaleRange     = 0.0;
+    cell.alphaRange     = 0.0;
+    cell.alphaSpeed     = 0.0;
+    // Straight up. CAEmitterCell uses radians and the convention is:
+    // emissionLongitude = 0 means +X, -pi/2 means up (-Y in screen space).
+    cell.emissionLongitude = -M_PI_2;
+    cell.emissionRange     = 0.0;          // perfectly straight
+    // Solid red CGImage, 10x10pt. Created here, retained by the cell.
+    CGImageRef cg = PPMakeSolidColorCGImage(CGSizeMake(10, 10), [UIColor redColor]);
+    cell.contents = (__bridge_transfer id)cg;
+    cell.contentsScale = 1.0;
+    [cell setValue:@"plane" forKey:@"particleType"];
+
+    em.emitterCells = @[cell];
+
+    // Crucial: anchor beginTime in the layer's own time-space, not
+    // the global media-time before the layer was attached.
+    em.beginTime = [em convertTime:CACurrentMediaTime() fromLayer:nil];
+
+    // Magenta border so we can see the layer rect even before any
+    // particles fire.
+    em.borderColor = [UIColor cyanColor].CGColor;
+    em.borderWidth = 1.0;
+
+    [host.layer addSublayer:em];
+
+    PPEmitterLog(@"=== test-emitter installed at center of %@ ===",
+                 NSStringFromClass([host class]));
 }
 
 // =====================================================================
@@ -990,6 +1085,7 @@ static void PPStartDisplayLink(void) {
     PPHideAllSystemWallpapers();
 
     PPInstallDebugLabel(self);
+    PPInstallTestEmitter(self);
     PPStartDisplayLink();
 
     // Install poster directly on the cover sheet WINDOW. The window does
