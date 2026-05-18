@@ -3,9 +3,6 @@
 PosterBoard-style **animated lockscreen wallpapers** for **iOS 15** (Dopamine /
 palera1n rootless jailbreaks).
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/d3405d66-dc54-445c-8a98-d9b808e03fd6" width="320" alt="PocketPlayer demo">
-</p>
 
 It loads `.ca` "tendies" bundles (the same format Apple uses for PosterBoard on
 iOS 17+) — `main.caml` describes a `CALayer` tree, `assets/` contains the PNGs,
