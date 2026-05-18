@@ -1,4 +1,4 @@
-# PocketPlayer - PosterBoard-style animated lockscreen for iOS 15 (Dopamine, rootless)
+# PocketPlayer - animated lockscreen wallpapers for iOS 15 (Dopamine, rootless)
 #
 # Build:   make package
 # Deploy:  make do        (requires THEOS_DEVICE_IP / THEOS_DEVICE_USER env vars)
