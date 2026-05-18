@@ -1,5 +1,7 @@
 #import "PPWallpaperLibrary.h"
 #import "PPPreviewRenderer.h"
+#import "PPWallpaperResizer.h"
+#import <UIKit/UIKit.h>
 
 @implementation PPWallpaperItem
 @end
@@ -174,6 +176,24 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
 
 - (PPWallpaperItem *)importTendiesAtURL:(NSURL *)url
                                   error:(NSError **)error {
+    // Backwards-compatible one-shot. Unpacks AND resizes to the main
+    // screen in a single call; returns the ready-to-display item.
+    PPWallpaperItem *it = [self beginImportTendiesAtURL:url error:error];
+    if (!it) return nil;
+    UIScreen *s = [UIScreen mainScreen];
+    NSError *re = nil;
+    if (![self resizeItem:it toSize:s.bounds.size error:&re]) {
+        // Resize failure isn't fatal -- the unscaled bundle still
+        // renders, just with the canvas-fit hack the runtime applies.
+        // Log it via the caller's error pointer if they passed one but
+        // the item is otherwise valid.
+        if (error && !*error) *error = re;
+    }
+    return it;
+}
+
+- (PPWallpaperItem *)beginImportTendiesAtURL:(NSURL *)url
+                                       error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *root = [self libraryRoot];
 
@@ -280,18 +300,42 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
     [meta writeToFile:[itemDir stringByAppendingPathComponent:@"meta.plist"]
             atomically:YES];
 
-    // Render a still preview off the main thread so the import call
-    // returns quickly. Failure here is non-fatal; the gallery will
-    // just show a placeholder until next attempt.
+    // Don't render preview here -- the caller will trigger that once
+    // the resize stage completes (otherwise we'd render a preview of
+    // the unscaled CAML, which then needs re-rendering).
+
+    [self reload];
+    for (PPWallpaperItem *it in self.cache) {
+        if ([it.itemID isEqualToString:uuid]) return it;
+    }
+    return nil;
+}
+
+- (BOOL)resizeItem:(PPWallpaperItem *)item
+            toSize:(CGSize)targetSize
+             error:(NSError **)error {
+    if (!item.bundlePath.length) {
+        if (error) *error = [NSError errorWithDomain:@"PocketPoster" code:40
+            userInfo:@{NSLocalizedDescriptionKey: @"Item has no bundle path"}];
+        return NO;
+    }
+
+    if (![PPWallpaperResizer resizeBundleAtPath:item.bundlePath
+                                         toSize:targetSize
+                                          error:error]) {
+        return NO;
+    }
+
+    // Preview is now safe to render: it'll reflect the rescaled CAML.
+    NSString *root = [self libraryRoot];
+    NSString *itemDir = [root stringByAppendingPathComponent:item.itemID];
     NSString *previewPath = [itemDir stringByAppendingPathComponent:@"preview.png"];
-    NSString *bundleForPreview = [bundlePath copy];
+    NSString *bundleForPreview = [item.bundlePath copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [PPPreviewRenderer renderPreviewForBundle:bundleForPreview
                                              size:CGSizeMake(360, 640)
                                           outPath:previewPath
                                             error:NULL];
-        // Notify the UI a preview just landed so any visible cells
-        // can refresh without the user having to scroll.
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter]
                 postNotificationName:@"PPWallpaperPreviewDidUpdate"
@@ -299,11 +343,7 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
         });
     });
 
-    [self reload];
-    for (PPWallpaperItem *it in self.cache) {
-        if ([it.itemID isEqualToString:uuid]) return it;
-    }
-    return nil;
+    return YES;
 }
 
 - (BOOL)deleteItem:(PPWallpaperItem *)item error:(NSError **)error {
