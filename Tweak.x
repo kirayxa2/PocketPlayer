@@ -1685,10 +1685,190 @@ static void PPRegisterApplyListener(void) {
     });
 }
 
+// =====================================================================
+// Panic recovery / kill-switch
+//
+// Story: PocketPlayer parses arbitrary CAML wallpaper bundles inside
+// SpringBoard's address space. Most failures throw NSException, which
+// we already catch around the apply / install paths. But a sufficiently
+// broken bundle can also cause:
+//   - EXC_BAD_ACCESS  (nil deref, dangling pointer in CG/CA internals)
+//   - SIGABRT from C++ destructors / assertions in QuartzCore
+//   - infinite loops -> watchdog kill at 120s
+// None of those are catchable in Objective-C. If SpringBoard repeatedly
+// crashes at boot trying to load the bundle, the user is stuck in safe
+// mode — they can't even open Settings to disable the tweak (the home
+// screen is unreachable while SB is crashing).
+//
+// Solution: heartbeat file + 30s boot-success watchdog.
+//   1. At %ctor entry we read heartbeat.plist.
+//   2. If the previous boot's record has succeeded=NO, the previous
+//      boot didn't survive 30s -> probably crashed. Increment badStreak.
+//   3. If badStreak hits 2, we conclude the active wallpaper is toxic.
+//      Move it to quarantine/ and remove from the active slot.
+//   4. Write a fresh "starting" record (succeeded=NO).
+//   5. After 30s of live operation, write succeeded=YES + reset streak.
+//
+// Net effect: one bad install costs the user 2-3 fast respring cycles
+// (~10-20 seconds total) and then they're back on the regular home
+// screen with no wallpaper. They can pick a different one from the
+// companion app. They never need SSH or DFU.
+// =====================================================================
+
+static NSString *const kPPHeartbeatPath =
+    @"/var/mobile/Library/PocketPlayer/heartbeat.plist";
+static NSString *const kPPQuarantineDir =
+    @"/var/mobile/Library/PocketPlayer/quarantine";
+static NSString *const kPPQuarantineLog =
+    @"/var/mobile/pocketplayer-quarantine.log";
+
+static const NSTimeInterval kPPBootSuccessGrace = 30.0; // seconds
+static const NSInteger kPPMaxConsecutiveBadBoots = 2;
+
+// Append one line to /var/mobile/pocketplayer-quarantine.log. Best-effort
+// — never throws.
+static void PPQuarantineLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"%@: %@\n", [NSDate date], s];
+    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kPPQuarantineLog];
+    if (!fh) {
+        [@"" writeToFile:kPPQuarantineLog atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:kPPQuarantineLog];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
+
+// Move every *.wallpaper out of the active PosterPlayer slot into the
+// quarantine directory, with a unix-time prefix so older quarantines
+// don't get clobbered. Active slot ends up empty -> next SpringBoard
+// boot reads no bundle -> %ctor's normal install path bails cleanly
+// in PPInstallPosterIntoWindow ("no caml at (null)") and the user
+// sees the stock iOS wallpaper instead of safe mode.
+static void PPQuarantineActiveWallpaper(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:kPPQuarantineDir
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    NSArray *contents = [fm contentsOfDirectoryAtPath:kPPWallpaperRoot
+                                                error:NULL];
+    for (NSString *kid in contents) {
+        if (![kid hasSuffix:@".wallpaper"]) continue;
+        NSString *src = [kPPWallpaperRoot stringByAppendingPathComponent:kid];
+        NSString *stamp = [NSString stringWithFormat:@"%.0f-%@",
+                           [NSDate date].timeIntervalSince1970, kid];
+        NSString *dst = [kPPQuarantineDir stringByAppendingPathComponent:stamp];
+        NSError *err = nil;
+        if ([fm moveItemAtPath:src toPath:dst error:&err]) {
+            PPQuarantineLog(@"quarantined %@ -> %@", kid, stamp);
+        } else {
+            // If move fails (rare; rootless permissions can rarely
+            // refuse), fall back to a destructive remove. Better to
+            // lose the bundle than to keep crashing.
+            [fm removeItemAtPath:src error:NULL];
+            PPQuarantineLog(@"removed %@ (move failed: %@)",
+                            kid, err.localizedDescription ?: @"?");
+        }
+    }
+}
+
+// Read previous heartbeat. If the last boot didn't record success
+// within 30s, treat it as a fast crash and increment the bad-streak
+// counter. If the counter hits the threshold, quarantine the active
+// wallpaper. Then write a fresh "starting" record and arm a 30-second
+// timer that will mark success.
+//
+// Wrapped in @try by its only caller (%ctor); even if NSDictionary
+// readers throw on a corrupt plist, the recovery path stays alive.
+static void PPPanicCheckAtBoot(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [kPPHeartbeatPath stringByDeletingLastPathComponent];
+    [fm createDirectoryAtPath:dir
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    NSDictionary *prev = [NSDictionary dictionaryWithContentsOfFile:kPPHeartbeatPath];
+    NSInteger badStreak = [prev[@"badStreak"] integerValue];
+    BOOL prevSucceeded  = [prev[@"succeeded"]  boolValue];
+    NSTimeInterval prevStart = [prev[@"startedAt"] doubleValue];
+
+    if (prev != nil && !prevSucceeded) {
+        // Previous boot ran our %ctor but never reached the 30s
+        // success mark. Almost always means a fast crash (or a
+        // watchdog kill within the first 30s of life). Count it.
+        badStreak += 1;
+        PPQuarantineLog(@"bad boot detected: prevStartedAt=%.0f badStreak=%ld",
+                        prevStart, (long)badStreak);
+        if (badStreak >= kPPMaxConsecutiveBadBoots) {
+            PPQuarantineLog(@"streak hit threshold (%ld) -- quarantining active slot",
+                            (long)kPPMaxConsecutiveBadBoots);
+            PPQuarantineActiveWallpaper();
+            badStreak = 0;
+        }
+    } else {
+        badStreak = 0;
+    }
+
+    NSDictionary *fresh = @{
+        @"startedAt": @([NSDate date].timeIntervalSince1970),
+        @"succeeded": @NO,
+        @"badStreak": @(badStreak),
+    };
+    [fresh writeToFile:kPPHeartbeatPath atomically:YES];
+
+    // Mark success after 30s on the main queue. If main thread is
+    // hung (worse than crashed), this block doesn't run, so the next
+    // boot still sees succeeded=NO and increments the streak.
+    // Captures the timestamp by value so we record when *this* boot
+    // actually started, not when the success block fired.
+    NSTimeInterval thisBootStart = [fresh[@"startedAt"] doubleValue];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kPPBootSuccessGrace * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            NSDictionary *ok = @{
+                @"startedAt": @(thisBootStart),
+                @"succeeded": @YES,
+                @"badStreak": @0,
+            };
+            [ok writeToFile:kPPHeartbeatPath atomically:YES];
+        } @catch (NSException *e) {
+            // Best-effort -- if we can't write the success mark, the
+            // worst that happens is we falsely "remember" this boot
+            // as bad next time, which is the safe failure mode.
+        }
+    });
+}
+
 %ctor {
     @autoreleasepool {
         NSString *exe = [[[NSBundle mainBundle] executablePath] lastPathComponent];
         if (![exe isEqualToString:@"SpringBoard"]) return;
+
+        // Run BEFORE %init so we count even a crash inside Logos
+        // initialization (e.g. a hooked class isn't found and Logos
+        // bails). PPPanicCheckAtBoot itself does no UIKit / QuartzCore
+        // work — it only touches the filesystem and dispatch_after,
+        // so it can't be the cause of a crash.
+        @try {
+            PPPanicCheckAtBoot();
+        } @catch (NSException *e) {
+            // Recovery should never itself break the boot.
+        }
+
         %init;
     }
 }
