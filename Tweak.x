@@ -25,7 +25,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
 #import <fcntl.h>
-#import <sys/time.h>
 #import <signal.h>
 #import <unistd.h>
 #import "CAMLParser.h"
@@ -371,32 +370,41 @@ static void PPStartDisplayLink(void) {
 }
 
 // =====================================================================
-// Apply bridge — listen for "com.vortex.pocketplayer.apply" Darwin
-// notifications from the PocketPoster app. When fired, copy the
-// manifest's source bundle into the active PosterPlayer slot and
-// reload the poster live (no respring).
+// Apply bridge — listen for two SEPARATE Darwin notifications from the
+// PocketPoster app:
+//
+//   "com.vortex.pocketplayer.apply"   -- copy the bundle to the active
+//                                         PosterPlayer slot. NO respring.
+//                                         Takes effect on the NEXT
+//                                         SpringBoard launch (manual
+//                                         respring or natural reboot).
+//
+//   "com.vortex.pocketplayer.respring" -- kill SpringBoard now. Same as
+//                                         what `./scripts/deploy.sh`
+//                                         does at the end. The user
+//                                         taps a separate button in the
+//                                         app for this so they're aware
+//                                         it'll close all foreground
+//                                         processes -- and so users
+//                                         whose jailbreak is fragile
+//                                         after respring can opt out.
 // =====================================================================
 
 static NSString *const kPPApplyManifestPath =
     @"/var/mobile/Library/PocketPlayer/apply.plist";
-static const char *const kPPApplyDarwinName =
-    "com.vortex.pocketplayer.apply";
+static const char *const kPPApplyDarwinName    = "com.vortex.pocketplayer.apply";
+static const char *const kPPRespringDarwinName = "com.vortex.pocketplayer.respring";
 
-// Restart SpringBoard. Same thing as ./scripts/deploy.sh's respring at
-// the end, just done from inside the process: kill -9 self. launchd
-// brings SpringBoard back up in ~3 seconds and on the next launch our
-// %ctor reads the (already-updated) PosterPlayer slot and shows the
-// new wallpaper EVERYWHERE -- lockscreen + homescreen + cover-sheet
-// background -- because the entire CA tree is rebuilt from disk.
+// kill -9 ourselves. launchd brings SpringBoard back in ~3s and on
+// the next launch our %ctor reads the (already-updated) PosterPlayer
+// slot, and PosterKit's own startup picks the new bundle up too --
+// so the wallpaper applies on lockscreen + homescreen + behind the
+// lock UI, including animated states and emitters.
 //
-// Yes this is heavy-handed. But every "no respring" path I've tried
-// (PosterKit darwin notifications, mtime touches, manual layer reloads)
-// either misses some piece of Apple's caching or gets a different
-// wallpaper visible in different places. Until the user explicitly
-// asks for soft-reload again, just do the obvious thing.
-static void PPRespringSpringBoard(void) {
-    PPSetDebug(@"applying respring in 200ms...");
-    // 200ms grace so the manifest delete + log flush hits disk first.
+// We only call this from the explicit "respring" notification path,
+// never automatically. The user has to tap the button.
+static void PPRespringNow(void) {
+    PPSetDebug(@"respring requested by app");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         kill(getpid(), SIGKILL);
@@ -460,54 +468,64 @@ static void PPHandleApplyNotification(void) {
             return;
         }
 
-        PPSetDebug(@"apply OK: %@ -> respring",
-            manifest[@"displayName"] ?: [src lastPathComponent]);
-
-        // Manifest is one-shot -- delete so the listener doesn't loop
-        // through it again after respring.
+        // Manifest is one-shot -- delete so the listener doesn't loop.
         [[NSFileManager defaultManager] removeItemAtPath:kPPApplyManifestPath
                                                    error:NULL];
 
-        // Hard respring. Same end state as `./scripts/deploy.sh` -- the
-        // wallpaper applies on every screen because SpringBoard rebuilds
-        // its whole layer tree from the new disk contents. Trying to do
-        // this without a respring miscaches in PosterKit; the user has
-        // explicitly asked for the simple/correct behaviour.
-        PPRespringSpringBoard();
+        // Refresh OUR overlay in-place so the user gets immediate visual
+        // feedback that the file landed -- even though full system-wide
+        // application requires a respring. PosterKit and the homescreen
+        // wallpaper view ignore this, but the lockscreen overlay
+        // updates instantly.
+        UIWindow *win = gHostWindow;
+        if (win) {
+            PPInstallPosterIntoWindow(win);
+            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        }
+
+        PPSetDebug(@"apply OK: %@ (respring needed for full effect)",
+            manifest[@"displayName"] ?: [src lastPathComponent]);
+
+        // Note: we do NOT respring automatically. The user gets to
+        // choose via the separate "Respring" button in the app.
     }
 }
 
-// Three independent triggers, any one of them is enough:
-//   1. Darwin notification "com.vortex.pocketplayer.apply" -- instant if
-//      it gets through. On rootless iOS 15 the app's notify_post() is
-//      sometimes filtered before reaching SpringBoard depending on which
-//      entitlement bundle the jailbreak's signing pipeline preserves.
-//      We register but DON'T rely on it.
-//   2. dispatch_source(VNODE) on the parent directory: fires whenever
-//      the manifest plist is created / replaced. Filesystem-level event,
-//      no entitlements involved, works on every jailbreak we tested.
-//   3. NSTimer poll every 2s as a paranoid backstop.
+// Three independent ways the apply listener can fire (any one is
+// enough):
+//   1. notify_register_dispatch on "com.vortex.pocketplayer.apply"
+//   2. dispatch_source(VNODE) on the manifest's parent directory
+//   3. NSTimer poll every 2s
 //
-// Whichever fires first wins; PPHandleApplyNotification() is idempotent
-// (deletes the manifest after handling) so duplicate triggers no-op.
+// All three converge on PPHandleApplyNotification(), which is
+// idempotent (it deletes the manifest) so duplicate triggers no-op.
 
 static void PPRegisterApplyListener(void) {
     static dispatch_once_t once;
     static int notifyToken;
+    static int respringToken;
     static dispatch_source_t dirSource;
     static NSTimer *pollTimer;
 
     dispatch_once(&once, ^{
-        // --- 1. Darwin notification (best case) ---
+        // --- apply ---
         notify_register_dispatch(kPPApplyDarwinName,
                                  &notifyToken,
                                  dispatch_get_main_queue(),
                                  ^(int t) { PPHandleApplyNotification(); });
 
-        // --- 2. kqueue on the manifest's parent directory ---
-        // The dir always exists once the app has tapped Apply once;
-        // create it ourselves so the watcher can attach even on a
-        // freshly-installed device.
+        // --- respring (separate, explicit) ---
+        notify_register_dispatch(kPPRespringDarwinName,
+                                 &respringToken,
+                                 dispatch_get_main_queue(),
+                                 ^(int t) { PPRespringNow(); });
+
+        // --- vnode watcher on the manifest directory ---
+        // Belt-and-suspenders for the apply path: notify_post() from a
+        // sandboxed app to SpringBoard sometimes gets filtered on
+        // rootless 15.x depending on which entitlements the signer
+        // preserves. The kqueue path is filesystem-level and entitlement
+        // -free, so it always fires.
         NSString *dir = [kPPApplyManifestPath stringByDeletingLastPathComponent];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES
@@ -531,7 +549,7 @@ static void PPRegisterApplyListener(void) {
             dispatch_resume(dirSource);
         }
 
-        // --- 3. Paranoid polling backstop ---
+        // --- 2s poll, paranoid backstop ---
         pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                     repeats:YES
                                                       block:^(NSTimer *t) {

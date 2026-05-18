@@ -9,8 +9,8 @@
 // keep their original location on rootless.
 static NSString *const kPPApplyManifestPath =
     @"/var/mobile/Library/PocketPlayer/apply.plist";
-static const char *const kPPApplyDarwinName =
-    "com.vortex.pocketplayer.apply";
+static const char *const kPPApplyDarwinName    = "com.vortex.pocketplayer.apply";
+static const char *const kPPRespringDarwinName = "com.vortex.pocketplayer.respring";
 
 @implementation PPApplyBridge
 
@@ -55,10 +55,14 @@ static const char *const kPPApplyDarwinName =
     }
 
     // Wake up the listener inside SpringBoard. If the tweak isn't
-    // installed (or is an older build that doesn't listen), this is
-    // a harmless no-op -- the manifest is still on disk waiting.
+    // installed (or notify_post is filtered), the kqueue watcher
+    // inside the tweak picks it up from the file system instead.
     notify_post(kPPApplyDarwinName);
     return YES;
+}
+
++ (void)respring {
+    notify_post(kPPRespringDarwinName);
 }
 
 @end

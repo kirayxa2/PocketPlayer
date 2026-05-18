@@ -69,6 +69,11 @@
     path.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [self.view addSubview:path];
 
+    // Two buttons stacked vertically: Apply (primary), Respring (secondary).
+    // Apply ONLY copies the bundle into PosterPlayer's active slot;
+    // Respring is a separate, explicit action so users on fragile
+    // jailbreaks (where respring sometimes drops the JB) can decide
+    // when SpringBoard restarts.
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
     apply.translatesAutoresizingMaskIntoConstraints = NO;
     [apply setTitle:@"Apply" forState:UIControlStateNormal];
@@ -78,6 +83,16 @@
     apply.layer.cornerRadius = 14;
     [apply addTarget:self action:@selector(tapApply:) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:apply];
+
+    UIButton *respring = [UIButton buttonWithType:UIButtonTypeSystem];
+    respring.translatesAutoresizingMaskIntoConstraints = NO;
+    [respring setTitle:@"Respring" forState:UIControlStateNormal];
+    respring.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    respring.tintColor = [UIColor labelColor];
+    respring.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    respring.layer.cornerRadius = 14;
+    [respring addTarget:self action:@selector(tapRespring:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:respring];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -90,9 +105,14 @@
         [path.leadingAnchor  constraintEqualToAnchor:safe.leadingAnchor constant:24],
         [path.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
 
+        [respring.leadingAnchor  constraintEqualToAnchor:safe.leadingAnchor constant:24],
+        [respring.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
+        [respring.bottomAnchor   constraintEqualToAnchor:safe.bottomAnchor constant:-24],
+        [respring.heightAnchor   constraintEqualToConstant:44],
+
         [apply.leadingAnchor  constraintEqualToAnchor:safe.leadingAnchor constant:24],
         [apply.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-24],
-        [apply.bottomAnchor   constraintEqualToAnchor:safe.bottomAnchor constant:-24],
+        [apply.bottomAnchor   constraintEqualToAnchor:respring.topAnchor constant:-12],
         [apply.heightAnchor   constraintEqualToConstant:50],
     ]];
 }
@@ -100,15 +120,54 @@
 - (void)tapApply:(id)sender {
     NSError *err = nil;
     BOOL ok = [PPApplyBridge applyItem:self.item error:&err];
-    NSString *title = ok ? @"Sent" : @"Apply failed";
-    NSString *msg   = ok
-        ? @"PocketPoster posted the apply request. The tweak side of the bridge "
-          @"will pick it up — once that lands a respring won't be needed."
-        : (err.localizedDescription ?: @"Unknown error");
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
-                                                               message:msg
-                                                        preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    if (!ok) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"Apply failed"
+                             message:err.localizedDescription ?: @"Unknown error"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    // Bundle is staged. Offer the user a respring (which actually
+    // applies the wallpaper system-wide) but never force one.
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Wallpaper staged"
+                         message:@"PocketPlayer copied the bundle into the active slot.\n\n"
+                                 @"Tap Respring to apply it on the lockscreen, behind the lock UI, "
+                                 @"and on the home screen. Or wait — it'll take effect on the next "
+                                 @"natural reboot too.\n\n"
+                                 @"If your jailbreak is fragile after respring, plug in your charger first."
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"Later"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"Respring now"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *_) {
+        [PPApplyBridge respring];
+    }]];
+
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)tapRespring:(id)sender {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Respring SpringBoard?"
+                         message:@"Closes all foreground apps for ~3 seconds while SpringBoard restarts. "
+                                 @"Required to fully apply a freshly staged wallpaper."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Respring"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *_) {
+        [PPApplyBridge respring];
+    }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
