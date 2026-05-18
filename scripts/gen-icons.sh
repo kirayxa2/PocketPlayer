@@ -2,21 +2,28 @@
 # scripts/gen-icons.sh
 #
 # Resizes the master icon (app/Resources/posterPlayer.png, 1024x1024)
-# into the iPhone home-screen icon variants iOS expects:
+# into every iPhone home-screen icon variant iOS / uicache might look
+# for. We're generous with filenames here because rootless iOS 15
+# uicache + SpringBoard have been observed to fall back through several
+# different naming conventions before giving up and showing the white
+# square.
 #
-#     AppIcon@2x.png       120x120   (iPhone 6s / 7 / 8 / SE)
-#     AppIcon@3x.png       180x180   (iPhone 6/7/8 Plus, X and later)
-#     AppIcon~ipad.png      76x76    (iPad)
-#     AppIcon@2x~ipad.png  152x152   (iPad @2x)
+# Filenames generated (all in app/Resources/):
 #
-# Output is written next to the master in app/Resources/, where Theos
-# picks them up at build time (the CFBundleIcons key in Info.plist
-# tells iOS to look for files named "AppIcon...").
+#     Icon.png             60x60    (legacy 1x)
+#     Icon@2x.png         120x120
+#     Icon@3x.png         180x180
+#     Icon-60.png          60x60    (modern, 1x)
+#     Icon-60@2x.png      120x120
+#     Icon-60@3x.png      180x180
+#     Icon-76.png          76x76    (iPad 1x)
+#     Icon-76@2x.png      152x152   (iPad @2x)
+#     AppIcon@2x.png      120x120   (kept for back-compat with old Info.plist)
+#     AppIcon@3x.png      180x180
+#     AppIcon~ipad.png     76x76
+#     AppIcon@2x~ipad.png 152x152
 #
 # Re-run after replacing posterPlayer.png with a new master.
-#
-# Resize tools tried in order: sips (preinstalled on macOS), magick /
-# convert (ImageMagick), and finally a tiny Python+Pillow fallback.
 
 set -e
 
@@ -56,9 +63,22 @@ EOF
 }
 
 say "Generating icon variants from $SRC"
+
+# "Icon" family (the names declared in our Info.plist's CFBundleIconFiles).
+resize  60 "$DST_DIR/Icon.png"
+resize 120 "$DST_DIR/Icon@2x.png"
+resize 180 "$DST_DIR/Icon@3x.png"
+resize  60 "$DST_DIR/Icon-60.png"
+resize 120 "$DST_DIR/Icon-60@2x.png"
+resize 180 "$DST_DIR/Icon-60@3x.png"
+resize  76 "$DST_DIR/Icon-76.png"
+resize 152 "$DST_DIR/Icon-76@2x.png"
+
+# "AppIcon" family (back-compat for any older Info.plist references).
 resize 120 "$DST_DIR/AppIcon@2x.png"
 resize 180 "$DST_DIR/AppIcon@3x.png"
 resize  76 "$DST_DIR/AppIcon~ipad.png"
 resize 152 "$DST_DIR/AppIcon@2x~ipad.png"
+
 say "Done. Generated:"
-ls -la "$DST_DIR"/AppIcon*.png
+ls -la "$DST_DIR"/Icon*.png "$DST_DIR"/AppIcon*.png 2>/dev/null
