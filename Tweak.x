@@ -54,6 +54,17 @@ static BOOL const kPPDebugMoveEmitterIntoView = NO;
 // emitting AT ALL.
 static BOOL const kPPDebugInjectTestEmitter = NO;
 
+// Remove the lockscreen blur (MTMaterialView) so our wallpaper renders
+// crisp instead of through Apple's frosted-glass cover. iOS 15 stacks
+// a fullscreen blur on top of the wallpaper as part of the cover-sheet
+// presentation; on iOS 17+ Apple started rendering the lockscreen
+// without it, which is the modern look.
+//
+// We only kill blur views that are roughly fullscreen — small material
+// views (notification card backgrounds, dock blur, status bar) stay
+// intact so the rest of SpringBoard still looks right.
+static BOOL const kPPRemoveCoverSheetBlur = YES;
+
 // =====================================================================
 // State
 // =====================================================================
@@ -1125,6 +1136,46 @@ static void PPHideSystemWallpapersIn(UIView *root) {
     }
 }
 
+// Hides Apple's fullscreen blur (MTMaterialView / UIVisualEffectView /
+// _UIBackdropView) so our wallpaper renders crisp instead of through a
+// frosted-glass overlay -- the iOS 17+ aesthetic.
+//
+// Critical filter: we only hide views that are essentially fullscreen
+// (>= 80% of screen area). Notification card backgrounds, dock blur,
+// status bar, control center widgets etc. all use the same classes
+// at small sizes, and hiding those breaks UI. The size check keeps
+// them visible.
+static void PPHideCoverSheetBlurIn(UIView *root, CGSize screen) {
+    if (!root) return;
+    NSString *cls = NSStringFromClass([root class]);
+    BOOL isBlur = NO;
+    if (cls) {
+        // The three classes that show up under cover sheet on 15.x.
+        // MTMaterialView is the modern (15.4+) one, _UIBackdropView
+        // is the older private one, UIVisualEffectView is rare here
+        // but we cover it for safety.
+        if ([cls containsString:@"MTMaterialView"]      ||
+            [cls containsString:@"_UIBackdropView"]      ||
+            [cls isEqualToString:@"UIVisualEffectView"]) {
+            isBlur = YES;
+        }
+    }
+    if (isBlur && root.tag != 0xCAFE) {
+        // Fullscreen check: width >= 80% screen AND height >= 80% screen.
+        // This catches the cover-sheet background blur but ignores
+        // notification cards (~85pt tall) and the dock (~95pt tall).
+        CGRect b = root.bounds;
+        CGFloat ws = screen.width  > 0 ? (b.size.width  / screen.width)  : 0;
+        CGFloat hs = screen.height > 0 ? (b.size.height / screen.height) : 0;
+        if (ws >= 0.8 && hs >= 0.8) {
+            root.hidden = YES;
+        }
+    }
+    for (UIView *v in root.subviews) {
+        PPHideCoverSheetBlurIn(v, screen);
+    }
+}
+
 // Same but at window level — walks every window in every scene.
 static void PPHideAllSystemWallpapers(void) {
     NSArray<UIWindow *> *windows = nil;
@@ -1152,6 +1203,9 @@ static void PPHideAllSystemWallpapers(void) {
             || [wcls containsString:@"Lock"]
             || [wcls containsString:@"DashBoard"]) {
             PPHideSystemWallpapersIn(w);
+            if (kPPRemoveCoverSheetBlur) {
+                PPHideCoverSheetBlurIn(w, w.bounds.size);
+            }
         }
     }
 }
