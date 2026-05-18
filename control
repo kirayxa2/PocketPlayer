@@ -1,7 +1,7 @@
 Package: com.vortex.pocketplayer
 Name: PocketPlayer
 Version: 0.1.0
-Architecture: iphoneos-arm
+Architecture: iphoneos-arm64
 Description: Animated lockscreen wallpapers (.ca bundles) for iOS 15.
 Maintainer: vortex
 Author: vortex
