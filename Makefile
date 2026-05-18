@@ -26,3 +26,19 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 rebuild:
 	$(MAKE) clean
 	$(MAKE) package
+
+# ----- Companion app (separate .deb, lives in app/) -----
+# These targets shell out into app/ via scripts/deploy-app.sh, which
+# builds Theos in a clean env (the parent make's THEOS_*/MAKEFLAGS
+# would otherwise leak in and confuse the app's APPLICATION_NAME
+# build). Use them instead of cd app && make package.
+
+.PHONY: app app-deploy app-clean
+app:
+	./scripts/deploy-app.sh build-only
+
+app-deploy:
+	./scripts/deploy-app.sh
+
+app-clean:
+	rm -rf app/.theos app/packages
