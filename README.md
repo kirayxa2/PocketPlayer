@@ -1,15 +1,14 @@
 # PocketPlayer
 
-PosterBoard-style **animated wallpapers** for **iOS 15** — the way Lemin's
-[Pocket Poster](https://github.com/leminlimez/Pocket-Poster) does it for iOS 17,
-but built from scratch so it runs on devices Apple stranded on iOS 15
-(iPhone 6s/7, plus anyone on Dopamine / palera1n rootless).
+**Animated lockscreen wallpapers for jailbroken iOS 15.**
 
-It loads `.tendies` wallpaper bundles (the same format the iOS 17 PosterBoard
-ecosystem uses), parses the `main.caml` scene and animates between the
-`Locked` / `Unlocked` states based on the swipe-to-unlock gesture. Particle
-emitters, multi-state transitions, multi-bundle (`Background.ca` + `Floating.ca`
-+ `Foreground.ca`) layouts and `<animations>` keyframes are all supported.
+A Substrate tweak + companion app that loads `.tendies` wallpaper bundles
+(animated CAML scenes), parses them, draws the result on the lockscreen
+and home screen, and animates between states based on the unlock gesture.
+
+It's an alternative for devices stuck on iOS 15 — iPhone 6s, 7, 8, X — that
+can run jailbreaks like Dopamine 2 / palera1n but can't be updated to
+newer iOS versions.
 
 ## What's in this repo
 
@@ -38,8 +37,8 @@ SBCoverSheetWindow                           SBHomeScreenWindow
   `<animations>` (CABasicAnimation / CAKeyframeAnimation), color decay,
   `transform="scale(...) rotate(...) translate(...)"` shorthand, WebP textures.
 - **Particle emitters that actually emit** — CAEmitterLayer rebuilt from scratch
-  on the cover-sheet *view* (not the frozen window) so iOS 15's `speed=0`
-  cascade doesn't kill them.
+  on the cover-sheet view so iOS 15's frozen layer-time on the cover-sheet
+  window doesn't kill them.
 - **Two posters in sync** — lockscreen poster animates with the gesture,
   home-screen poster sits frozen at the final pose so the chest under the
   dock matches the moment the cover sheet slides away.
@@ -49,8 +48,8 @@ SBCoverSheetWindow                           SBHomeScreenWindow
   active, the bundle is auto-quarantined and SB boots empty. Bad `.tendies`
   can never trap you in safe mode.
 - **Companion app** — UIDocumentPicker import, `.tendies` open-with handler,
-  per-import auto-resize to your screen, online catalog (SerStars/Nugget-Wallpapers),
-  optional GitHub token in Settings to lift the rate limit.
+  per-import auto-resize to your screen, online catalog, optional GitHub
+  token in Settings to lift the rate limit.
 
 ## Quick start
 
@@ -126,8 +125,8 @@ these private classes, and the choice differs across point releases:
 We hook all three. The hook that exists at runtime gets matched by Substrate;
 the others are silent no-ops. As a final fallback, a `CADisplayLink` reads the
 cover-sheet view's window-space `y` directly and derives progress geometrically,
-so the animation always has *some* signal even if Apple renames everything in
-a future patch.
+so the animation always has *some* signal even if a future patch renames
+everything.
 
 ## Wallpaper format
 
@@ -207,11 +206,12 @@ are caught so a single weird state value can't kill SpringBoard.
 
 PRs welcome.
 
-## Credits
+## License
 
-- Wallpaper format and CAML decoding is reverse-engineered from Apple's
-  PosterBoard / PosterKit on iOS 17.
-- The `.tendies` ecosystem is built around tools by
-  [@leminlimez](https://github.com/leminlimez) and friends — Pocket Poster,
-  Nugget. PocketPoster is a 15-compatible cousin, not a fork.
-- Online catalog source repo: [SerStars/Nugget-Wallpapers](https://github.com/SerStars/Nugget-Wallpapers).
+MIT — see `LICENSE`.
+
+## Disclaimer
+
+This is an unofficial, community-built tweak. It is not affiliated with,
+endorsed by, or sponsored by any first-party platform vendor. All product
+names, logos, and brands are property of their respective owners.
