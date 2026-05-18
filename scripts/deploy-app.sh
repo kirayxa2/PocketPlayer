@@ -35,7 +35,8 @@ cd "$ROOT"
 # to run -- the script itself short-circuits if the master is missing.
 if [ -f "$ROOT/app/Resources/posterPlayer.png" ] && [ -f "$ROOT/scripts/gen-icons.sh" ]; then
   needs_icons=0
-  for v in AppIcon@2x.png AppIcon@3x.png AppIcon~ipad.png AppIcon@2x~ipad.png; do
+  for v in Icon.png Icon@2x.png Icon@3x.png Icon-60@2x.png Icon-60@3x.png \
+           AppIcon@2x.png AppIcon@3x.png AppIcon~ipad.png AppIcon@2x~ipad.png; do
     if [ ! -f "$ROOT/app/Resources/$v" ] || \
        [ "$ROOT/app/Resources/$v" -ot "$ROOT/app/Resources/posterPlayer.png" ]; then
       needs_icons=1

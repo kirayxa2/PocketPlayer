@@ -1,6 +1,7 @@
 #import "PPAppDelegate.h"
 #import "PPRootViewController.h"
 #import "PPBrowseViewController.h"
+#import "PPSettingsViewController.h"
 
 @implementation PPAppDelegate
 
@@ -36,7 +37,21 @@
     }
 
     UITabBarController *tabs = [UITabBarController new];
-    tabs.viewControllers = @[ libraryNav, browseNav ];
+
+    // Tab 3 — Settings.
+    PPSettingsViewController *settings = [[PPSettingsViewController alloc] init];
+    UINavigationController *settingsNav = [[UINavigationController alloc]
+                                           initWithRootViewController:settings];
+    if (@available(iOS 13.0, *)) {
+        settingsNav.tabBarItem = [[UITabBarItem alloc]
+            initWithTitle:@"Settings"
+                    image:[UIImage systemImageNamed:@"gearshape"]
+                      tag:2];
+    } else {
+        settingsNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Settings" image:nil tag:2];
+    }
+
+    tabs.viewControllers = @[ libraryNav, browseNav, settingsNav ];
 
     // Subtle tint that matches Apple's stock apps.
     if (@available(iOS 13.0, *)) {

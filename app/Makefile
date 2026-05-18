@@ -38,6 +38,7 @@ PocketPoster_FILES = \
     PPPreviewRenderer.m \
     PPWallpaperResizer.m \
     PPImportProgressViewController.m \
+    PPSettingsViewController.m \
     ../CAMLParser.m
 
 PocketPoster_FRAMEWORKS    = UIKit Foundation CoreGraphics QuartzCore UniformTypeIdentifiers

@@ -22,19 +22,42 @@
     <string>1</string>
     <!--
         Home-screen icon. iOS doesn't pick up `posterPlayer.png` directly;
-        it expects sized variants under CFBundleIconFiles. scripts/gen-icons.sh
-        regenerates them from the 1024x1024 master in this same folder.
+        it expects sized variants. scripts/gen-icons.sh regenerates them
+        from the 1024x1024 master next to this file.
+        For maximum jailbreak/uicache compatibility we declare the icons
+        in THREE places:
+          1. Top-level CFBundleIconFiles array (legacy, but universally
+             honoured by uicache on rootless iOS 15).
+          2. CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconFiles (modern).
+          3. Plain Icon.png / Icon@2x.png / Icon@3x.png filenames so
+             uicache's filename heuristic also finds them.
+        We deliberately do NOT use CFBundleIconName -- that key only
+        works with an Asset Catalog (.car), which we don't ship.
     -->
+    <key>CFBundleIconFile</key>
+    <string>Icon</string>
+    <key>CFBundleIconFiles</key>
+    <array>
+        <string>Icon</string>
+        <string>Icon@2x</string>
+        <string>Icon@3x</string>
+        <string>Icon-60</string>
+        <string>Icon-60@2x</string>
+        <string>Icon-60@3x</string>
+    </array>
     <key>CFBundleIcons</key>
     <dict>
         <key>CFBundlePrimaryIcon</key>
         <dict>
             <key>CFBundleIconFiles</key>
             <array>
-                <string>AppIcon</string>
+                <string>Icon</string>
+                <string>Icon@2x</string>
+                <string>Icon@3x</string>
+                <string>Icon-60</string>
+                <string>Icon-60@2x</string>
+                <string>Icon-60@3x</string>
             </array>
-            <key>CFBundleIconName</key>
-            <string>AppIcon</string>
         </dict>
     </dict>
     <key>CFBundleIcons~ipad</key>
@@ -43,10 +66,15 @@
         <dict>
             <key>CFBundleIconFiles</key>
             <array>
-                <string>AppIcon</string>
+                <string>Icon</string>
+                <string>Icon@2x</string>
+                <string>Icon@3x</string>
+                <string>Icon-60</string>
+                <string>Icon-60@2x</string>
+                <string>Icon-60@3x</string>
+                <string>Icon-76</string>
+                <string>Icon-76@2x</string>
             </array>
-            <key>CFBundleIconName</key>
-            <string>AppIcon</string>
         </dict>
     </dict>
     <key>LSRequiresIPhoneOS</key>
