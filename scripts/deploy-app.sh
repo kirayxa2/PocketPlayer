@@ -30,6 +30,25 @@ cd "$ROOT"
 : "${THEOS:=$HOME/theos}"
 [ -d "$THEOS" ] || { warn "THEOS not found at $THEOS"; exit 1; }
 
+# (Re)generate icon variants from the 1024x1024 master, if it exists
+# AND any of the variants are missing or older than the master. Cheap
+# to run -- the script itself short-circuits if the master is missing.
+if [ -f "$ROOT/app/Resources/posterPlayer.png" ] && [ -f "$ROOT/scripts/gen-icons.sh" ]; then
+  needs_icons=0
+  for v in Icon.png Icon@2x.png Icon@3x.png Icon-60@2x.png Icon-60@3x.png \
+           AppIcon@2x.png AppIcon@3x.png AppIcon~ipad.png AppIcon@2x~ipad.png; do
+    if [ ! -f "$ROOT/app/Resources/$v" ] || \
+       [ "$ROOT/app/Resources/$v" -ot "$ROOT/app/Resources/posterPlayer.png" ]; then
+      needs_icons=1
+      break
+    fi
+  done
+  if [ "$needs_icons" = 1 ]; then
+    say "Regenerating icon variants from posterPlayer.png"
+    "$ROOT/scripts/gen-icons.sh" || warn "icon generation failed; continuing without"
+  fi
+fi
+
 # Wipe stale build state from BOTH possible roots. The first failed
 # build can leave a half-staged tree at PocketPlayer/.theos/obj/debug/
 # because Theos was confused about which directory was the project
@@ -92,14 +111,25 @@ say "scp -> $PP_HOST"
 scp -i "$PP_KEY" -o StrictHostKeyChecking=accept-new "$DEB" "$PP_HOST:/var/mobile/"
 
 DEB_BASE="$(basename "$DEB")"
-say "dpkg -i + uicache"
+say "dpkg -i + uicache + respring (so SpringBoard sees the new icons)"
+# Aggressive icon-cache reset: dpkg -> wipe SpringBoard's icon caches
+# -> uicache -a (full rebuild from disk) -> killall SpringBoard.
+# Plain `uicache -p` doesn't always evict the in-memory cache on
+# rootless iOS 15, leaving the white square; the wipe + respring
+# combo always works.
+REMOTE_CMD="dpkg -i /var/mobile/'$DEB_BASE' \
+  && rm -f /var/mobile/Library/Caches/com.apple.IconsCache.plist \
+           /var/mobile/Library/Caches/com.apple.springboard-imagecache* \
+           /var/mobile/Library/Caches/SpringBoard/Application*Cache* 2>/dev/null \
+  ; uicache -a \
+  ; killall SpringBoard"
+
 if [ -n "$PP_PASS" ]; then
   ssh -i "$PP_KEY" "$PP_HOST" \
-    "echo '$PP_PASS' | sudo -S dpkg -i /var/mobile/'$DEB_BASE' && echo '$PP_PASS' | sudo -S uicache -p /var/jb/Applications/PocketPoster.app" 2>&1 \
+    "echo '$PP_PASS' | sudo -S sh -c \"$REMOTE_CMD\"" 2>&1 \
     | grep -vE 'password for|пароль для|tcgetattr' || true
 else
-  ssh -i "$PP_KEY" "$PP_HOST" \
-    "sudo -S dpkg -i /var/mobile/'$DEB_BASE' && sudo -S uicache -p /var/jb/Applications/PocketPoster.app"
+  ssh -i "$PP_KEY" "$PP_HOST" "sudo -S sh -c \"$REMOTE_CMD\""
 fi
 
-say "Done. Look for the PocketPoster icon on the home screen."
+say "Done. SpringBoard should respawn in ~3s with the PocketPoster icon visible."

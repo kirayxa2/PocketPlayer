@@ -54,6 +54,17 @@ static BOOL const kPPDebugMoveEmitterIntoView = NO;
 // emitting AT ALL.
 static BOOL const kPPDebugInjectTestEmitter = NO;
 
+// Remove the lockscreen blur (MTMaterialView) so our wallpaper renders
+// crisp instead of through Apple's frosted-glass cover. iOS 15 stacks
+// a fullscreen blur on top of the wallpaper as part of the cover-sheet
+// presentation; on iOS 17+ Apple started rendering the lockscreen
+// without it, which is the modern look.
+//
+// We only kill blur views that are roughly fullscreen — small material
+// views (notification card backgrounds, dock blur, status bar) stay
+// intact so the rest of SpringBoard still looks right.
+static BOOL const kPPRemoveCoverSheetBlur = YES;
+
 // =====================================================================
 // State
 // =====================================================================
@@ -670,21 +681,35 @@ static void PPApplyProgress(CGFloat progress) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
 
-    if (gToState) {
-        for (PPCAMLDocument *d in gDocs) {
-            if (gFromState) {
-                [d applyTransitionFromState:gFromState toState:gToState progress:progress];
-            } else {
-                [d applyState:gToState progress:progress];
+    // The applyState:/applyTransition... calls feed into KVC
+    // (-[CALayer setValue:forKeyPath:]), which throws NSException
+    // on an unknown keyPath. Catch it here so a single bad CAML
+    // doesn't take down SpringBoard on every gesture frame.
+    @try {
+        if (gToState) {
+            for (PPCAMLDocument *d in gDocs) {
+                if (gFromState) {
+                    [d applyTransitionFromState:gFromState toState:gToState progress:progress];
+                } else {
+                    [d applyState:gToState progress:progress];
+                }
+            }
+            for (PPCAMLDocument *d in gHomeDocs) {
+                if (gFromState) {
+                    [d applyTransitionFromState:gFromState toState:gToState progress:progress];
+                } else {
+                    [d applyState:gToState progress:progress];
+                }
             }
         }
-        for (PPCAMLDocument *d in gHomeDocs) {
-            if (gFromState) {
-                [d applyTransitionFromState:gFromState toState:gToState progress:progress];
-            } else {
-                [d applyState:gToState progress:progress];
-            }
-        }
+    } @catch (NSException *e) {
+        // Disable the bad doc(s) so we don't keep throwing every frame.
+        // Safer than trying to rescue: subsequent gestures see no
+        // animation, but the static layers stay put and SpringBoard
+        // survives. Next respring rebuilds from scratch.
+        gFromState = nil;
+        gToState   = nil;
+        PPSetDebug(@"applyProgress: %@ -- frozen", e.name);
     }
 
     // Snap-hide the cover-sheet poster the moment we've fully unlocked.
@@ -704,21 +729,27 @@ static void PPApplyProgress(CGFloat progress) {
     // overriding both to 1.0 we guarantee identical poses across the
     // hand-off.
     BOOL fullyUnlocked = (progress >= 0.99);
-    if (fullyUnlocked && gToState) {
-        for (PPCAMLDocument *d in gDocs) {
-            if (gFromState) {
-                [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
-            } else {
-                [d applyState:gToState progress:1.0];
+    @try {
+        if (fullyUnlocked && gToState) {
+            for (PPCAMLDocument *d in gDocs) {
+                if (gFromState) {
+                    [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
+                } else {
+                    [d applyState:gToState progress:1.0];
+                }
+            }
+            for (PPCAMLDocument *d in gHomeDocs) {
+                if (gFromState) {
+                    [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
+                } else {
+                    [d applyState:gToState progress:1.0];
+                }
             }
         }
-        for (PPCAMLDocument *d in gHomeDocs) {
-            if (gFromState) {
-                [d applyTransitionFromState:gFromState toState:gToState progress:1.0];
-            } else {
-                [d applyState:gToState progress:1.0];
-            }
-        }
+    } @catch (NSException *e) {
+        gFromState = nil;
+        gToState   = nil;
+        PPSetDebug(@"applyProgress(snap): %@ -- frozen", e.name);
     }
     if (gPosterLayer) {
         BOOL wasHidden = gPosterLayer.hidden;
@@ -1105,6 +1136,46 @@ static void PPHideSystemWallpapersIn(UIView *root) {
     }
 }
 
+// Hides Apple's fullscreen blur (MTMaterialView / UIVisualEffectView /
+// _UIBackdropView) so our wallpaper renders crisp instead of through a
+// frosted-glass overlay -- the iOS 17+ aesthetic.
+//
+// Critical filter: we only hide views that are essentially fullscreen
+// (>= 80% of screen area). Notification card backgrounds, dock blur,
+// status bar, control center widgets etc. all use the same classes
+// at small sizes, and hiding those breaks UI. The size check keeps
+// them visible.
+static void PPHideCoverSheetBlurIn(UIView *root, CGSize screen) {
+    if (!root) return;
+    NSString *cls = NSStringFromClass([root class]);
+    BOOL isBlur = NO;
+    if (cls) {
+        // The three classes that show up under cover sheet on 15.x.
+        // MTMaterialView is the modern (15.4+) one, _UIBackdropView
+        // is the older private one, UIVisualEffectView is rare here
+        // but we cover it for safety.
+        if ([cls containsString:@"MTMaterialView"]      ||
+            [cls containsString:@"_UIBackdropView"]      ||
+            [cls isEqualToString:@"UIVisualEffectView"]) {
+            isBlur = YES;
+        }
+    }
+    if (isBlur && root.tag != 0xCAFE) {
+        // Fullscreen check: width >= 80% screen AND height >= 80% screen.
+        // This catches the cover-sheet background blur but ignores
+        // notification cards (~85pt tall) and the dock (~95pt tall).
+        CGRect b = root.bounds;
+        CGFloat ws = screen.width  > 0 ? (b.size.width  / screen.width)  : 0;
+        CGFloat hs = screen.height > 0 ? (b.size.height / screen.height) : 0;
+        if (ws >= 0.8 && hs >= 0.8) {
+            root.hidden = YES;
+        }
+    }
+    for (UIView *v in root.subviews) {
+        PPHideCoverSheetBlurIn(v, screen);
+    }
+}
+
 // Same but at window level — walks every window in every scene.
 static void PPHideAllSystemWallpapers(void) {
     NSArray<UIWindow *> *windows = nil;
@@ -1132,6 +1203,9 @@ static void PPHideAllSystemWallpapers(void) {
             || [wcls containsString:@"Lock"]
             || [wcls containsString:@"DashBoard"]) {
             PPHideSystemWallpapersIn(w);
+            if (kPPRemoveCoverSheetBlur) {
+                PPHideCoverSheetBlurIn(w, w.bounds.size);
+            }
         }
     }
 }
@@ -1273,13 +1347,28 @@ static void PPStartDisplayLink(void) {
 
     // Install poster directly on the cover sheet WINDOW. The window does
     // not move during unlock; only the cover sheet view (its child) does.
+    //
+    // The whole CAML pipeline is wrapped here too -- if a wallpaper has
+    // a state value with a key path CALayer doesn't recognise, KVC
+    // throws inside applyState:/applyTransition:, and an uncaught
+    // NSException inside SpringBoard means safe mode for the user. We
+    // already guard the apply path; this guard covers the boot path
+    // (left over from a previous bad install) so SpringBoard never
+    // dies on a wallpaper at startup.
     UIWindow *win = self.window;
     if (win && (!gPosterLayer || gPosterLayer.superlayer != win.layer)) {
-        PPInstallPosterIntoWindow(win);
-        PPCleanupStaleLayersInWindow(win, gPosterLayer);
-        // One more sweep AFTER install, so anything that was lurking in
-        // a sibling window is removed even if it tried to reattach.
-        PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        @try {
+            PPInstallPosterIntoWindow(win);
+            PPCleanupStaleLayersInWindow(win, gPosterLayer);
+            // One more sweep AFTER install, so anything that was lurking in
+            // a sibling window is removed even if it tried to reattach.
+            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        } @catch (NSException *e) {
+            PPSetDebug(@"install threw on boot: %@ -- %@", e.name, e.reason);
+            // Disable the broken doc so PPApplyProgress doesn't hit it.
+            gFromState = nil;
+            gToState   = nil;
+        }
     }
 
     // Cover sheet just (re-)appeared - whether from lock or from
@@ -1302,8 +1391,14 @@ static void PPStartDisplayLink(void) {
     }
     UIWindow *win = self.window;
     if (win && (!gPosterLayer || gPosterLayer.superlayer != win.layer)) {
-        PPInstallPosterIntoWindow(win);
-        PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        @try {
+            PPInstallPosterIntoWindow(win);
+            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        } @catch (NSException *e) {
+            PPSetDebug(@"install threw on layout: %@", e.name);
+            gFromState = nil;
+            gToState   = nil;
+        }
     }
 }
 
@@ -1457,6 +1552,32 @@ static BOOL PPInstallBundleIntoActiveSlot(NSString *srcBundle) {
     return YES;
 }
 
+// Append a line to the apply log file. Used for crash forensics --
+// if the live-rebuild step ever throws (CAML with a keyPath the
+// runtime doesn't recognise, etc.), we WILL see it here even though
+// the @try below quietly recovers.
+static void PPApplyLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *with = [NSString stringWithFormat:@"%@: %@\n",
+                      [NSDate date], s];
+    NSString *path = @"/var/mobile/pocketplayer-apply.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:[with dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
+
 static void PPHandleApplyNotification(void) {
     @autoreleasepool {
         NSDictionary *manifest =
@@ -1477,16 +1598,33 @@ static void PPHandleApplyNotification(void) {
         [[NSFileManager defaultManager] removeItemAtPath:kPPApplyManifestPath
                                                    error:NULL];
 
-        // Refresh OUR overlay in place so the user gets immediate
-        // visual feedback that the file landed. PosterKit and the
-        // home-screen wallpaper view ignore us until respring, but
-        // the cover-sheet overlay updates instantly using the same
-        // path that runs at SpringBoard launch.
+        // From here on, every step that touches the wallpaper bundle's
+        // CAML is wrapped in @try/@catch. Why: PPInstallPosterIntoWindow
+        // -> PPCAMLParser -> PPCAMLDocument applyState/applyTransition,
+        // which calls -[CALayer setValue:forKeyPath:]. If a wallpaper's
+        // <LKStateSetValue keyPath="..."> uses a key path CALayer doesn't
+        // recognise (private keys, typos, future-iOS keys we don't
+        // support yet), KVC throws NSUnknownKeyException. With the
+        // tweak running INSIDE SpringBoard, that exception is uncaught
+        // -> objc_terminate() -> SpringBoard crash -> safe mode for
+        // the user. Catching it here means a bad wallpaper at worst
+        // leaves the previous overlay in place; the user can pick a
+        // different one without ever leaving the home screen.
+        NSString *displayName = manifest[@"displayName"] ?: [src lastPathComponent];
+
         UIWindow *coverWin = gHostWindow;
         if (coverWin) {
-            PPInstallPosterIntoWindow(coverWin);
-            PPCleanupStaleLayersInWindow(coverWin, gPosterLayer);
-            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+            @try {
+                PPInstallPosterIntoWindow(coverWin);
+                PPCleanupStaleLayersInWindow(coverWin, gPosterLayer);
+                PPNukeAllStaleLayersEverywhere(gPosterLayer);
+            } @catch (NSException *e) {
+                PPApplyLog(@"apply EXCEPTION (cover) on %@: %@ -- %@",
+                           displayName, e.name, e.reason);
+                PPSetDebug(@"apply: cover rebuild threw %@", e.name);
+                // Don't rethrow -- bundle is already on disk; on the
+                // next respring our %ctor will retry from a clean state.
+            }
         }
 
         // Rebuild the home-screen poster too, if we already have one
@@ -1494,21 +1632,27 @@ static void PPHandleApplyNotification(void) {
         // the home install on whichever window currently hosts a home
         // poster instance.
         if (@available(iOS 15.0, *)) {
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if (![s isKindOfClass:[UIWindowScene class]]) continue;
-                for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                    if (w == coverWin) continue;
-                    NSString *cls = NSStringFromClass([w class]);
-                    if ([cls containsString:@"HomeScreen"] ||
-                        [cls containsString:@"SBHome"]) {
-                        PPInstallPosterIntoHomeWindow(w);
+            @try {
+                for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                    if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                    for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                        if (w == coverWin) continue;
+                        NSString *cls = NSStringFromClass([w class]);
+                        if ([cls containsString:@"HomeScreen"] ||
+                            [cls containsString:@"SBHome"]) {
+                            PPInstallPosterIntoHomeWindow(w);
+                        }
                     }
                 }
+            } @catch (NSException *e) {
+                PPApplyLog(@"apply EXCEPTION (home) on %@: %@ -- %@",
+                           displayName, e.name, e.reason);
+                PPSetDebug(@"apply: home rebuild threw %@", e.name);
             }
         }
 
-        PPSetDebug(@"apply OK: %@ (respring needed for full effect)",
-            manifest[@"displayName"] ?: [src lastPathComponent]);
+        PPApplyLog(@"apply OK: %@", displayName);
+        PPSetDebug(@"apply OK: %@ (respring needed for full effect)", displayName);
 
         // Note: NEVER auto-respring. The user opts in via the separate
         // "Respring" button in the app, which sends kPPRespringDarwinName.
@@ -1595,10 +1739,190 @@ static void PPRegisterApplyListener(void) {
     });
 }
 
+// =====================================================================
+// Panic recovery / kill-switch
+//
+// Story: PocketPlayer parses arbitrary CAML wallpaper bundles inside
+// SpringBoard's address space. Most failures throw NSException, which
+// we already catch around the apply / install paths. But a sufficiently
+// broken bundle can also cause:
+//   - EXC_BAD_ACCESS  (nil deref, dangling pointer in CG/CA internals)
+//   - SIGABRT from C++ destructors / assertions in QuartzCore
+//   - infinite loops -> watchdog kill at 120s
+// None of those are catchable in Objective-C. If SpringBoard repeatedly
+// crashes at boot trying to load the bundle, the user is stuck in safe
+// mode — they can't even open Settings to disable the tweak (the home
+// screen is unreachable while SB is crashing).
+//
+// Solution: heartbeat file + 30s boot-success watchdog.
+//   1. At %ctor entry we read heartbeat.plist.
+//   2. If the previous boot's record has succeeded=NO, the previous
+//      boot didn't survive 30s -> probably crashed. Increment badStreak.
+//   3. If badStreak hits 2, we conclude the active wallpaper is toxic.
+//      Move it to quarantine/ and remove from the active slot.
+//   4. Write a fresh "starting" record (succeeded=NO).
+//   5. After 30s of live operation, write succeeded=YES + reset streak.
+//
+// Net effect: one bad install costs the user 2-3 fast respring cycles
+// (~10-20 seconds total) and then they're back on the regular home
+// screen with no wallpaper. They can pick a different one from the
+// companion app. They never need SSH or DFU.
+// =====================================================================
+
+static NSString *const kPPHeartbeatPath =
+    @"/var/mobile/Library/PocketPlayer/heartbeat.plist";
+static NSString *const kPPQuarantineDir =
+    @"/var/mobile/Library/PocketPlayer/quarantine";
+static NSString *const kPPQuarantineLog =
+    @"/var/mobile/pocketplayer-quarantine.log";
+
+static const NSTimeInterval kPPBootSuccessGrace = 30.0; // seconds
+static const NSInteger kPPMaxConsecutiveBadBoots = 2;
+
+// Append one line to /var/mobile/pocketplayer-quarantine.log. Best-effort
+// — never throws.
+static void PPQuarantineLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"%@: %@\n", [NSDate date], s];
+    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kPPQuarantineLog];
+    if (!fh) {
+        [@"" writeToFile:kPPQuarantineLog atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:kPPQuarantineLog];
+    }
+    if (fh) {
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+        } @catch (NSException *e) {}
+    }
+}
+
+// Move every *.wallpaper out of the active PosterPlayer slot into the
+// quarantine directory, with a unix-time prefix so older quarantines
+// don't get clobbered. Active slot ends up empty -> next SpringBoard
+// boot reads no bundle -> %ctor's normal install path bails cleanly
+// in PPInstallPosterIntoWindow ("no caml at (null)") and the user
+// sees the stock iOS wallpaper instead of safe mode.
+static void PPQuarantineActiveWallpaper(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:kPPQuarantineDir
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    NSArray *contents = [fm contentsOfDirectoryAtPath:kPPWallpaperRoot
+                                                error:NULL];
+    for (NSString *kid in contents) {
+        if (![kid hasSuffix:@".wallpaper"]) continue;
+        NSString *src = [kPPWallpaperRoot stringByAppendingPathComponent:kid];
+        NSString *stamp = [NSString stringWithFormat:@"%.0f-%@",
+                           [NSDate date].timeIntervalSince1970, kid];
+        NSString *dst = [kPPQuarantineDir stringByAppendingPathComponent:stamp];
+        NSError *err = nil;
+        if ([fm moveItemAtPath:src toPath:dst error:&err]) {
+            PPQuarantineLog(@"quarantined %@ -> %@", kid, stamp);
+        } else {
+            // If move fails (rare; rootless permissions can rarely
+            // refuse), fall back to a destructive remove. Better to
+            // lose the bundle than to keep crashing.
+            [fm removeItemAtPath:src error:NULL];
+            PPQuarantineLog(@"removed %@ (move failed: %@)",
+                            kid, err.localizedDescription ?: @"?");
+        }
+    }
+}
+
+// Read previous heartbeat. If the last boot didn't record success
+// within 30s, treat it as a fast crash and increment the bad-streak
+// counter. If the counter hits the threshold, quarantine the active
+// wallpaper. Then write a fresh "starting" record and arm a 30-second
+// timer that will mark success.
+//
+// Wrapped in @try by its only caller (%ctor); even if NSDictionary
+// readers throw on a corrupt plist, the recovery path stays alive.
+static void PPPanicCheckAtBoot(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [kPPHeartbeatPath stringByDeletingLastPathComponent];
+    [fm createDirectoryAtPath:dir
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    NSDictionary *prev = [NSDictionary dictionaryWithContentsOfFile:kPPHeartbeatPath];
+    NSInteger badStreak = [prev[@"badStreak"] integerValue];
+    BOOL prevSucceeded  = [prev[@"succeeded"]  boolValue];
+    NSTimeInterval prevStart = [prev[@"startedAt"] doubleValue];
+
+    if (prev != nil && !prevSucceeded) {
+        // Previous boot ran our %ctor but never reached the 30s
+        // success mark. Almost always means a fast crash (or a
+        // watchdog kill within the first 30s of life). Count it.
+        badStreak += 1;
+        PPQuarantineLog(@"bad boot detected: prevStartedAt=%.0f badStreak=%ld",
+                        prevStart, (long)badStreak);
+        if (badStreak >= kPPMaxConsecutiveBadBoots) {
+            PPQuarantineLog(@"streak hit threshold (%ld) -- quarantining active slot",
+                            (long)kPPMaxConsecutiveBadBoots);
+            PPQuarantineActiveWallpaper();
+            badStreak = 0;
+        }
+    } else {
+        badStreak = 0;
+    }
+
+    NSDictionary *fresh = @{
+        @"startedAt": @([NSDate date].timeIntervalSince1970),
+        @"succeeded": @NO,
+        @"badStreak": @(badStreak),
+    };
+    [fresh writeToFile:kPPHeartbeatPath atomically:YES];
+
+    // Mark success after 30s on the main queue. If main thread is
+    // hung (worse than crashed), this block doesn't run, so the next
+    // boot still sees succeeded=NO and increments the streak.
+    // Captures the timestamp by value so we record when *this* boot
+    // actually started, not when the success block fired.
+    NSTimeInterval thisBootStart = [fresh[@"startedAt"] doubleValue];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kPPBootSuccessGrace * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            NSDictionary *ok = @{
+                @"startedAt": @(thisBootStart),
+                @"succeeded": @YES,
+                @"badStreak": @0,
+            };
+            [ok writeToFile:kPPHeartbeatPath atomically:YES];
+        } @catch (NSException *e) {
+            // Best-effort -- if we can't write the success mark, the
+            // worst that happens is we falsely "remember" this boot
+            // as bad next time, which is the safe failure mode.
+        }
+    });
+}
+
 %ctor {
     @autoreleasepool {
         NSString *exe = [[[NSBundle mainBundle] executablePath] lastPathComponent];
         if (![exe isEqualToString:@"SpringBoard"]) return;
+
+        // Run BEFORE %init so we count even a crash inside Logos
+        // initialization (e.g. a hooked class isn't found and Logos
+        // bails). PPPanicCheckAtBoot itself does no UIKit / QuartzCore
+        // work — it only touches the filesystem and dispatch_after,
+        // so it can't be the cause of a crash.
+        @try {
+            PPPanicCheckAtBoot();
+        } @catch (NSException *e) {
+            // Recovery should never itself break the boot.
+        }
+
         %init;
     }
 }
