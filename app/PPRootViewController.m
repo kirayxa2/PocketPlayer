@@ -318,19 +318,23 @@ static NSString *const kCellID = @"WPCell";
         [self_.grid reloadData];
     };
     // Local imports get the same Apply-now button experience as Browse.
+    // `progress` is captured weakly to avoid the retain cycle
+    // (progress.applyHandler -> block -> progress).
+    __weak PPImportProgressViewController *weakProgress = progress;
     progress.applyHandler = ^{
         __strong typeof(weakSelf) self_ = weakSelf;
+        __strong PPImportProgressViewController *progress_ = weakProgress;
         if (!self_) return;
         // The most-recently-imported item is items.firstObject (sorted
         // newest-first by the library).
         PPWallpaperItem *latest = [PPWallpaperLibrary shared].items.firstObject;
         if (!latest) {
-            [progress dismissAfterApplying];
+            [progress_ dismissAfterApplying];
             return;
         }
         NSError *err = nil;
         if (![PPApplyBridge applyItem:latest error:&err]) {
-            [progress dismissAfterApplying];
+            [progress_ dismissAfterApplying];
             UIAlertController *a = [UIAlertController
                 alertControllerWithTitle:@"Apply failed"
                                  message:err.localizedDescription ?: @"Unknown error"
@@ -341,7 +345,7 @@ static NSString *const kCellID = @"WPCell";
             [self_ presentViewController:a animated:YES completion:nil];
             return;
         }
-        [progress dismissAfterApplying];
+        [progress_ dismissAfterApplying];
     };
     [self presentViewController:progress animated:YES completion:^{
         [self runImportPipelineForURL:url progress:progress];

@@ -425,14 +425,21 @@ static NSString *const kCellID = @"BR";
     __block NSString *finalBundlePath = nil;
     __block PPWallpaperItem *finalItem = nil;
 
+    // Capture both `self` and `progress` weakly to avoid retain cycles
+    // (progress.applyHandler -> block -> progress, and -> self).
+    __weak typeof(self) weakSelf = self;
+    __weak PPImportProgressViewController *weakProgress = progress;
+
     progress.applyHandler = ^{
+        __strong typeof(weakSelf) self_ = weakSelf;
+        __strong PPImportProgressViewController *progress_ = weakProgress;
         if (!finalBundlePath.length) {
-            [progress dismissAfterApplying];
+            [progress_ dismissAfterApplying];
             return;
         }
         NSError *err = nil;
         if (![PPApplyBridge applyItem:finalItem error:&err]) {
-            [progress dismissAfterApplying];
+            [progress_ dismissAfterApplying];
             UIAlertController *a = [UIAlertController
                 alertControllerWithTitle:@"Apply failed"
                                  message:err.localizedDescription ?: @"Unknown error"
@@ -440,14 +447,14 @@ static NSString *const kCellID = @"BR";
             [a addAction:[UIAlertAction actionWithTitle:@"OK"
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
-            [self presentViewController:a animated:YES completion:nil];
+            [self_ presentViewController:a animated:YES completion:nil];
             return;
         }
         // Success -- close the card; the lockscreen overlay updates
         // automatically on the next CSCoverSheetView remount, and the
         // user can hit Respring from Detail later if they want it
         // applied everywhere.
-        [progress dismissAfterApplying];
+        [progress_ dismissAfterApplying];
     };
 
     [self presentViewController:progress animated:YES completion:^{
