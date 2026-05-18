@@ -2,6 +2,10 @@
 
 **Animated lockscreen wallpapers for jailbroken iOS 15.**
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d3405d66-dc54-445c-8a98-d9b808e03fd6" width="320" alt="PocketPlayer demo">
+</p>
+
 A Substrate tweak + companion app that loads `.tendies` wallpaper bundles
 (animated CAML scenes), parses them, draws the result on the lockscreen
 and home screen, and animates between states based on the unlock gesture.
