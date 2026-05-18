@@ -29,6 +29,9 @@ PocketPoster_FILES = \
     main.m \
     PPAppDelegate.m \
     PPRootViewController.m \
+    PPBrowseViewController.m \
+    PPCatalogService.m \
+    PPCatalogItem.m \
     PPDetailViewController.m \
     PPWallpaperLibrary.m \
     PPApplyBridge.m \

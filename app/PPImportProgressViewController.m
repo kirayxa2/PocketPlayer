@@ -3,7 +3,8 @@
 @interface PPImportStageRow : UIView
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UIImageView             *icon;     // ✓ or –
-@property (nonatomic, strong) UILabel                 *label;
+@property (nonatomic, strong) UILabel                 *titleLabel;
+@property (nonatomic, strong) UILabel                 *detailLabel;
 @property (nonatomic, copy)   NSString                *title;
 @end
 
@@ -13,7 +14,6 @@
         _title = [title copy];
         self.translatesAutoresizingMaskIntoConstraints = NO;
 
-        // Container that holds (icon|spinner) on the left, label on the right.
         _spinner = [[UIActivityIndicatorView alloc]
             initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
         _spinner.translatesAutoresizingMaskIntoConstraints = NO;
@@ -23,21 +23,26 @@
 
         _icon = [UIImageView new];
         _icon.translatesAutoresizingMaskIntoConstraints = NO;
-        _icon.tintColor = [UIColor secondaryLabelColor];
         _icon.contentMode = UIViewContentModeCenter;
         if (@available(iOS 13.0, *)) {
-            // U+2014 em-dash visually centered in the icon slot.
             _icon.image = [UIImage systemImageNamed:@"minus"];
             _icon.tintColor = [UIColor tertiaryLabelColor];
         }
         [self addSubview:_icon];
 
-        _label = [UILabel new];
-        _label.translatesAutoresizingMaskIntoConstraints = NO;
-        _label.text = title;
-        _label.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
-        _label.textColor = [UIColor secondaryLabelColor];
-        [self addSubview:_label];
+        _titleLabel = [UILabel new];
+        _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        _titleLabel.text = title;
+        _titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
+        _titleLabel.textColor = [UIColor secondaryLabelColor];
+        [self addSubview:_titleLabel];
+
+        _detailLabel = [UILabel new];
+        _detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        _detailLabel.font = [UIFont systemFontOfSize:13];
+        _detailLabel.textColor = [UIColor tertiaryLabelColor];
+        _detailLabel.textAlignment = NSTextAlignmentRight;
+        [self addSubview:_detailLabel];
 
         [NSLayoutConstraint activateConstraints:@[
             [_spinner.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:4],
@@ -50,9 +55,12 @@
             [_icon.widthAnchor      constraintEqualToConstant:24],
             [_icon.heightAnchor     constraintEqualToConstant:24],
 
-            [_label.leadingAnchor   constraintEqualToAnchor:_icon.trailingAnchor constant:14],
-            [_label.trailingAnchor  constraintEqualToAnchor:self.trailingAnchor constant:-4],
-            [_label.centerYAnchor   constraintEqualToAnchor:self.centerYAnchor],
+            [_titleLabel.leadingAnchor   constraintEqualToAnchor:_icon.trailingAnchor constant:14],
+            [_titleLabel.centerYAnchor   constraintEqualToAnchor:self.centerYAnchor],
+
+            [_detailLabel.leadingAnchor  constraintGreaterThanOrEqualToAnchor:_titleLabel.trailingAnchor constant:8],
+            [_detailLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-4],
+            [_detailLabel.centerYAnchor  constraintEqualToAnchor:self.centerYAnchor],
 
             [self.heightAnchor      constraintEqualToConstant:34],
         ]];
@@ -67,13 +75,14 @@
         _icon.image = [UIImage systemImageNamed:@"minus"];
         _icon.tintColor = [UIColor tertiaryLabelColor];
     }
-    _label.textColor = [UIColor tertiaryLabelColor];
+    _titleLabel.textColor = [UIColor tertiaryLabelColor];
+    _detailLabel.text = @"";
 }
 - (void)setStateRunning {
     _icon.hidden = YES;
     _spinner.hidden = NO;
     [_spinner startAnimating];
-    _label.textColor = [UIColor labelColor];
+    _titleLabel.textColor = [UIColor labelColor];
 }
 - (void)setStateDone {
     [_spinner stopAnimating];
@@ -83,7 +92,8 @@
         _icon.image = [UIImage systemImageNamed:@"checkmark.circle.fill"];
         _icon.tintColor = [UIColor systemGreenColor];
     }
-    _label.textColor = [UIColor labelColor];
+    _titleLabel.textColor = [UIColor labelColor];
+    _detailLabel.text = @"";
 }
 - (void)setStateFailed {
     [_spinner stopAnimating];
@@ -93,7 +103,7 @@
         _icon.image = [UIImage systemImageNamed:@"xmark.circle.fill"];
         _icon.tintColor = [UIColor systemRedColor];
     }
-    _label.textColor = [UIColor systemRedColor];
+    _titleLabel.textColor = [UIColor systemRedColor];
 }
 @end
 
@@ -101,17 +111,26 @@
 @property (nonatomic, strong) UIView   *card;
 @property (nonatomic, strong) UILabel  *titleLabel;
 @property (nonatomic, strong) NSArray<PPImportStageRow *> *rows;
-@property (nonatomic, assign) PPImportStage currentStage;
+@property (nonatomic, strong) NSArray<NSString *>         *stageTitles;
+@property (nonatomic, strong) UIButton *applyButton;
+@property (nonatomic, strong) UIButton *closeButton;
+@property (nonatomic, strong) UIStackView *buttonsStack;
+@property (nonatomic, assign) NSUInteger currentStage;
 @property (nonatomic, assign) BOOL completed;
 @end
 
 @implementation PPImportProgressViewController
 
 - (instancetype)init {
+    return [self initWithStageTitles:@[@"Importing", @"Resizing", @"Done"]];
+}
+
+- (instancetype)initWithStageTitles:(NSArray<NSString *> *)stageTitles {
     if ((self = [super initWithNibName:nil bundle:nil])) {
         self.modalPresentationStyle = UIModalPresentationOverFullScreen;
         self.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
-        _currentStage = PPImportStageImporting;
+        _stageTitles = [stageTitles copy];
+        _currentStage = 0;
     }
     return self;
 }
@@ -137,21 +156,51 @@
     _titleLabel.textAlignment = NSTextAlignmentCenter;
     [_card addSubview:_titleLabel];
 
-    PPImportStageRow *r1 = [[PPImportStageRow alloc] initWithTitle:@"Importing"];
-    PPImportStageRow *r2 = [[PPImportStageRow alloc] initWithTitle:@"Resizing"];
-    PPImportStageRow *r3 = [[PPImportStageRow alloc] initWithTitle:@"Done"];
-    _rows = @[r1, r2, r3];
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:_rows];
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSString *t in _stageTitles) {
+        [rows addObject:[[PPImportStageRow alloc] initWithTitle:t]];
+    }
+    _rows = rows;
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:rows];
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 6;
     stack.alignment = UIStackViewAlignmentFill;
     [_card addSubview:stack];
 
+    // Buttons row, hidden until success. Apply | Close.
+    _applyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _applyButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_applyButton setTitle:@"Apply now" forState:UIControlStateNormal];
+    [_applyButton.titleLabel setFont:[UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]];
+    [_applyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _applyButton.backgroundColor = [UIColor systemBlueColor];
+    _applyButton.layer.cornerRadius = 10;
+    [_applyButton addTarget:self action:@selector(tapApply)
+       forControlEvents:UIControlEventTouchUpInside];
+
+    _closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _closeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_closeButton setTitle:@"Close" forState:UIControlStateNormal];
+    [_closeButton.titleLabel setFont:[UIFont systemFontOfSize:16]];
+    [_closeButton setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+    _closeButton.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    _closeButton.layer.cornerRadius = 10;
+    [_closeButton addTarget:self action:@selector(tapClose)
+       forControlEvents:UIControlEventTouchUpInside];
+
+    _buttonsStack = [[UIStackView alloc] initWithArrangedSubviews:@[_closeButton, _applyButton]];
+    _buttonsStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _buttonsStack.axis = UILayoutConstraintAxisHorizontal;
+    _buttonsStack.distribution = UIStackViewDistributionFillEqually;
+    _buttonsStack.spacing = 8;
+    _buttonsStack.hidden = YES;
+    [_card addSubview:_buttonsStack];
+
     [NSLayoutConstraint activateConstraints:@[
         [_card.centerXAnchor   constraintEqualToAnchor:self.view.centerXAnchor],
         [_card.centerYAnchor   constraintEqualToAnchor:self.view.centerYAnchor constant:-30],
-        [_card.widthAnchor     constraintEqualToConstant:240],
+        [_card.widthAnchor     constraintEqualToConstant:280],
 
         [_titleLabel.topAnchor      constraintEqualToAnchor:_card.topAnchor constant:18],
         [_titleLabel.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:18],
@@ -160,13 +209,28 @@
         [stack.topAnchor       constraintEqualToAnchor:_titleLabel.bottomAnchor constant:18],
         [stack.leadingAnchor   constraintEqualToAnchor:_card.leadingAnchor constant:24],
         [stack.trailingAnchor  constraintEqualToAnchor:_card.trailingAnchor constant:-24],
-        [stack.bottomAnchor    constraintEqualToAnchor:_card.bottomAnchor constant:-22],
+
+        [_buttonsStack.topAnchor      constraintEqualToAnchor:stack.bottomAnchor constant:18],
+        [_buttonsStack.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:18],
+        [_buttonsStack.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-18],
+        [_buttonsStack.heightAnchor   constraintEqualToConstant:44],
+        [_buttonsStack.bottomAnchor   constraintEqualToAnchor:_card.bottomAnchor constant:-18],
     ]];
 
     // Start: stage 0 running, others idle.
-    [r1 setStateRunning];
-    [r2 setStateIdle];
-    [r3 setStateIdle];
+    if (_rows.count > 0) [_rows.firstObject setStateRunning];
+    for (NSUInteger i = 1; i < _rows.count; i++) {
+        [_rows[i] setStateIdle];
+    }
+}
+
+- (void)updateCurrentStageDetail:(NSString *)detail {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self updateCurrentStageDetail:detail]; });
+        return;
+    }
+    if (_currentStage >= _rows.count) return;
+    _rows[_currentStage].detailLabel.text = detail ?: @"";
 }
 
 - (void)finishCurrentStage {
@@ -175,22 +239,22 @@
         return;
     }
     if (_completed) return;
-    if (_currentStage >= self.rows.count) return;
+    if (_currentStage >= _rows.count) return;
 
-    [self.rows[_currentStage] setStateDone];
-    if (_currentStage + 1 < self.rows.count) {
+    [_rows[_currentStage] setStateDone];
+    if (_currentStage + 1 < _rows.count) {
         _currentStage++;
-        [self.rows[_currentStage] setStateRunning];
-    } else {
-        // All stages complete.
-        _completed = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [self dismissViewControllerAnimated:YES completion:^{
-                if (self.completion) self.completion();
-            }];
-        });
+        [_rows[_currentStage] setStateRunning];
+        return;
     }
+
+    // Last stage just finished. Show Apply button.
+    _completed = YES;
+    [UIView animateWithDuration:0.25 animations:^{
+        self.buttonsStack.hidden = NO;
+        self.titleLabel.text = @"Ready";
+    }];
+    if (self.completion) self.completion();
 }
 
 - (void)failWithMessage:(NSString *)message {
@@ -198,15 +262,38 @@
         dispatch_async(dispatch_get_main_queue(), ^{ [self failWithMessage:message]; });
         return;
     }
-    if (_currentStage < self.rows.count) {
-        [self.rows[_currentStage] setStateFailed];
+    if (_currentStage < _rows.count) {
+        [_rows[_currentStage] setStateFailed];
     }
     if (message.length) self.titleLabel.text = message;
     _completed = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self dismissViewControllerAnimated:YES completion:nil];
     });
+}
+
+- (void)tapApply {
+    // Block the buttons while the apply path runs so the user doesn't
+    // mash them. The caller is responsible for calling
+    // -dismissAfterApplying when it's done.
+    self.applyButton.enabled = NO;
+    self.closeButton.enabled = NO;
+    self.titleLabel.text = @"Applying…";
+    if (self.applyHandler) self.applyHandler();
+}
+
+- (void)tapClose {
+    if (self.closeHandler) self.closeHandler();
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)dismissAfterApplying {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self dismissAfterApplying]; });
+        return;
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 @end
