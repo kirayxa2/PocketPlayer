@@ -96,6 +96,7 @@ static UIWindow *PPFindHomeScreenWindow(void);
 static void PPInstallPosterIntoHomeWindow(UIWindow *window);
 static CALayer *PPFindFloatingLayer(CALayer *root);
 static void PPDebugAnnotateEmitters(CALayer *root, UIWindow *window);
+static void PPRegisterApplyListener(void);
 
 // =====================================================================
 // Filesystem helpers
@@ -1268,6 +1269,7 @@ static void PPStartDisplayLink(void) {
     PPInstallDebugLabel(self);
     PPInstallTestEmitter(self);
     PPStartDisplayLink();
+    PPRegisterApplyListener();
 
     // Install poster directly on the cover sheet WINDOW. The window does
     // not move during unlock; only the cover sheet view (its child) does.
@@ -1342,6 +1344,256 @@ static void PPStartDisplayLink(void) {
         (double)offset, (long)state);
 }
 %end
+
+// =====================================================================
+// Apply bridge — listen for two SEPARATE Darwin notifications from the
+// PocketPoster companion app:
+//
+//   "com.vortex.pocketplayer.apply"    -- copy a *.wallpaper bundle
+//                                         into the active PosterPlayer
+//                                         slot. NO respring. The user
+//                                         sees the new wallpaper in
+//                                         our overlay immediately, and
+//                                         everywhere else on the next
+//                                         natural respring.
+//
+//   "com.vortex.pocketplayer.respring" -- kill SpringBoard now. Same
+//                                         thing scripts/deploy.sh does
+//                                         at the end. Sent only when
+//                                         the user explicitly taps
+//                                         "Respring" in the app, so
+//                                         users on fragile jailbreaks
+//                                         can opt out and apply on a
+//                                         later natural reboot.
+//
+// The apply path is intentionally hands-off w.r.t. the rest of this
+// file: we only touch /var/mobile/Library/PosterPlayer/active/...
+// (replacing the .wallpaper bundle there) and trigger our existing
+// PPInstallPosterIntoWindow / PPInstallPosterIntoHomeWindow paths.
+// The CAML parser, emitter rebuild, animations, system-wallpaper
+// hide, etc. all run unmodified -- we just feed them a new bundle.
+// =====================================================================
+
+#import <notify.h>
+#import <fcntl.h>
+#import <signal.h>
+#import <unistd.h>
+
+static NSString *const kPPApplyManifestPath =
+    @"/var/mobile/Library/PocketPlayer/apply.plist";
+static const char *const kPPApplyDarwinName    = "com.vortex.pocketplayer.apply";
+static const char *const kPPRespringDarwinName = "com.vortex.pocketplayer.respring";
+
+// kill -9 ourselves. launchd brings SpringBoard back in ~3s and on
+// the next launch our %ctor reads the (already-updated) PosterPlayer
+// slot, PosterKit's own startup picks up the new bundle for the home
+// screen and behind the lock UI, and our overlay rebuilds from disk.
+//
+// Only called from the explicit "respring" notification path, never
+// automatically. The user has to tap the Respring button in the app.
+static void PPRespringNow(void) {
+    PPSetDebug(@"respring requested by app");
+    [@"respring requested" writeToFile:@"/var/mobile/pocketplayer-apply.log"
+                            atomically:YES
+                              encoding:NSUTF8StringEncoding
+                                 error:NULL];
+    // 200ms grace so any pending log flushes hit disk first.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        kill(getpid(), SIGKILL);
+    });
+}
+
+// Atomically replace the .wallpaper bundle inside
+//     /var/mobile/Library/PosterPlayer/active/versions/1/contents/
+// with the one at `srcBundle`. Returns YES on success.
+//
+// We deliberately do NOT touch sibling files (Wallpaper.plist,
+// .com.apple.posterkit.*, com.apple.posterkit.*) that PosterPlayer
+// manages — only the *.wallpaper folder is swapped in/out.
+static BOOL PPInstallBundleIntoActiveSlot(NSString *srcBundle) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!srcBundle.length) return NO;
+
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:srcBundle isDirectory:&isDir] || !isDir) {
+        NSString *msg = [NSString stringWithFormat:@"src not a dir: %@", srcBundle];
+        [msg writeToFile:@"/var/mobile/pocketplayer-apply.log"
+              atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return NO;
+    }
+
+    NSString *contents = kPPWallpaperRoot;
+    [fm createDirectoryAtPath:contents
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+
+    // Remove any pre-existing *.wallpaper sibling so PosterPlayer
+    // doesn't end up with two competing bundles.
+    for (NSString *kid in [fm contentsOfDirectoryAtPath:contents error:NULL]) {
+        if ([kid hasSuffix:@".wallpaper"]) {
+            NSString *victim = [contents stringByAppendingPathComponent:kid];
+            [fm removeItemAtPath:victim error:NULL];
+        }
+    }
+
+    NSString *dstName = [srcBundle lastPathComponent];
+    NSString *dstPath = [contents stringByAppendingPathComponent:dstName];
+
+    NSError *err = nil;
+    if (![fm copyItemAtPath:srcBundle toPath:dstPath error:&err]) {
+        NSString *msg = [NSString stringWithFormat:@"copy failed: %@",
+            err.localizedDescription ?: @"?"];
+        [msg writeToFile:@"/var/mobile/pocketplayer-apply.log"
+              atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return NO;
+    }
+
+    NSString *ok = [NSString stringWithFormat:@"copied %@ -> %@",
+                    [srcBundle lastPathComponent], contents];
+    [ok writeToFile:@"/var/mobile/pocketplayer-apply.log"
+         atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    return YES;
+}
+
+static void PPHandleApplyNotification(void) {
+    @autoreleasepool {
+        NSDictionary *manifest =
+            [NSDictionary dictionaryWithContentsOfFile:kPPApplyManifestPath];
+        NSString *src = manifest[@"sourceBundlePath"];
+        if (!src.length) {
+            PPSetDebug(@"apply: no manifest");
+            return;
+        }
+
+        if (!PPInstallBundleIntoActiveSlot(src)) {
+            PPSetDebug(@"apply: copy failed src=%@", src);
+            return;
+        }
+
+        // Manifest is one-shot — delete so the listener doesn't loop
+        // through it again on every fs event / poll tick.
+        [[NSFileManager defaultManager] removeItemAtPath:kPPApplyManifestPath
+                                                   error:NULL];
+
+        // Refresh OUR overlay in place so the user gets immediate
+        // visual feedback that the file landed. PosterKit and the
+        // home-screen wallpaper view ignore us until respring, but
+        // the cover-sheet overlay updates instantly using the same
+        // path that runs at SpringBoard launch.
+        UIWindow *coverWin = gHostWindow;
+        if (coverWin) {
+            PPInstallPosterIntoWindow(coverWin);
+            PPCleanupStaleLayersInWindow(coverWin, gPosterLayer);
+            PPNukeAllStaleLayersEverywhere(gPosterLayer);
+        }
+
+        // Rebuild the home-screen poster too, if we already have one
+        // staged. Walks every UIWindowScene's windows and reapplies
+        // the home install on whichever window currently hosts a home
+        // poster instance.
+        if (@available(iOS 15.0, *)) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                    if (w == coverWin) continue;
+                    NSString *cls = NSStringFromClass([w class]);
+                    if ([cls containsString:@"HomeScreen"] ||
+                        [cls containsString:@"SBHome"]) {
+                        PPInstallPosterIntoHomeWindow(w);
+                    }
+                }
+            }
+        }
+
+        PPSetDebug(@"apply OK: %@ (respring needed for full effect)",
+            manifest[@"displayName"] ?: [src lastPathComponent]);
+
+        // Note: NEVER auto-respring. The user opts in via the separate
+        // "Respring" button in the app, which sends kPPRespringDarwinName.
+    }
+}
+
+// Three independent triggers on the apply path, any one is enough:
+//   1. notify_register_dispatch on "com.vortex.pocketplayer.apply"
+//      — fires instantly when notify_post() from the app reaches us.
+//   2. dispatch_source(VNODE) on the manifest's parent directory
+//      — kqueue fires whenever the plist is created/replaced. This
+//      path doesn't require any entitlement to cross the sandbox
+//      boundary, so it works even if rootless signing strips the
+//      app's notify entitlement.
+//   3. NSTimer poll every 2s — paranoid backstop.
+//
+// Whichever fires first wins; PPHandleApplyNotification is idempotent
+// (deletes the manifest after handling) so duplicate triggers no-op.
+static void PPRegisterApplyListener(void) {
+    static dispatch_once_t once;
+    static int notifyToken;
+    static int respringToken;
+    static dispatch_source_t dirSource;
+    static NSTimer *pollTimer;
+
+    dispatch_once(&once, ^{
+        // --- apply via Darwin notification ---
+        notify_register_dispatch(kPPApplyDarwinName,
+                                 &notifyToken,
+                                 dispatch_get_main_queue(),
+                                 ^(int t) { PPHandleApplyNotification(); });
+
+        // --- respring via separate explicit notification ---
+        notify_register_dispatch(kPPRespringDarwinName,
+                                 &respringToken,
+                                 dispatch_get_main_queue(),
+                                 ^(int t) { PPRespringNow(); });
+
+        // --- vnode watcher on the manifest's parent directory ---
+        // Apply-only fallback for the case where the app's notify_post
+        // is filtered before reaching SpringBoard. Filesystem events
+        // never get filtered, so this one always works.
+        NSString *dir = [kPPApplyManifestPath stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:NULL];
+        int fd = open([dir fileSystemRepresentation], O_EVTONLY);
+        if (fd >= 0) {
+            dirSource = dispatch_source_create(
+                DISPATCH_SOURCE_TYPE_VNODE,
+                fd,
+                DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND |
+                DISPATCH_VNODE_RENAME | DISPATCH_VNODE_LINK,
+                dispatch_get_main_queue());
+            dispatch_source_set_event_handler(dirSource, ^{
+                if ([[NSFileManager defaultManager]
+                        fileExistsAtPath:kPPApplyManifestPath]) {
+                    PPHandleApplyNotification();
+                }
+            });
+            dispatch_source_set_cancel_handler(dirSource, ^{ close(fd); });
+            dispatch_resume(dirSource);
+        }
+
+        // --- 2s poll, paranoid backstop ---
+        pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                    repeats:YES
+                                                      block:^(NSTimer *t) {
+            if ([[NSFileManager defaultManager]
+                    fileExistsAtPath:kPPApplyManifestPath]) {
+                PPHandleApplyNotification();
+            }
+        }];
+
+        // --- one-shot: anything left over from before we attached ---
+        if ([[NSFileManager defaultManager] fileExistsAtPath:kPPApplyManifestPath]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                PPHandleApplyNotification();
+            });
+        }
+
+        PPSetDebug(@"apply listener: notify+vnode+poll armed at %@", dir);
+    });
+}
 
 %ctor {
     @autoreleasepool {
