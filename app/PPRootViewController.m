@@ -2,6 +2,7 @@
 #import "PPWallpaperLibrary.h"
 #import "PPApplyBridge.h"
 #import "PPDetailViewController.h"
+#import "PPImportProgressViewController.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static NSString *const kCellID = @"WP";
@@ -121,6 +122,77 @@ static NSString *const kCellID = @"WP";
 }
 
 - (void)importTendiesAtURL:(NSURL *)url {
+    // Show the progress card immediately. The card auto-dismisses after
+    // the third stage completes, or sooner on failure.
+    PPImportProgressViewController *progress = [PPImportProgressViewController new];
+    __weak typeof(self) weakSelf = self;
+    progress.completion = ^{
+        __strong typeof(weakSelf) self_ = weakSelf;
+        if (!self_) return;
+        [self_ refreshEmptyState];
+        [self_.grid reloadData];
+    };
+    [self presentViewController:progress animated:YES completion:^{
+        [self runImportPipelineForURL:url progress:progress];
+    }];
+}
+
+// Pipeline: stage 1 = unzip + locate bundle (heavy, off-main),
+//           stage 2 = resize CAML to native screen (heavy, off-main),
+//           stage 3 = mark Done and let the card auto-dismiss.
+- (void)runImportPipelineForURL:(NSURL *)url
+                       progress:(PPImportProgressViewController *)progress {
+    // We need the URL string AND want to keep the security-scoped
+    // accessor open across the background unzip. PPWallpaperLibrary's
+    // begin... method handles startAccessingSecurityScopedResource
+    // internally, so we just hand it the URL.
+
+    CGSize targetSize = [UIScreen mainScreen].bounds.size;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // Stage 1: import (unzip + locate bundle)
+        NSError *e1 = nil;
+        PPWallpaperItem *it = [[PPWallpaperLibrary shared]
+            beginImportTendiesAtURL:url error:&e1];
+        if (!it) {
+            [progress failWithMessage:@"Import failed"];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *msg = e1.localizedDescription ?: @"Unknown error";
+                UIAlertController *a = [UIAlertController
+                    alertControllerWithTitle:@"Import failed"
+                                     message:msg
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+            });
+            return;
+        }
+
+        [progress finishCurrentStage]; // Importing -> done; Resizing -> spinner
+
+        // Stage 2: resize the CAML for our screen.
+        NSError *e2 = nil;
+        BOOL ok2 = [[PPWallpaperLibrary shared] resizeItem:it
+                                                    toSize:targetSize
+                                                     error:&e2];
+        if (!ok2) {
+            // Resize failure isn't fatal -- the unscaled bundle still
+            // renders -- but we surface a soft warning so it's visible.
+            // The library already kept the unscaled bundle on disk;
+            // continue to the Done stage and let the user retry later
+            // by re-importing.
+            NSLog(@"[PocketPoster] resize warning: %@",
+                  e2.localizedDescription ?: @"unknown");
+        }
+
+        [progress finishCurrentStage]; // Resizing -> done; Done -> spinner
+        [progress finishCurrentStage]; // Done -> done -> auto-dismiss
+    });
+}
+
+- (void)importTendiesLegacyAtURL:(NSURL *)url {
     NSError *err = nil;
     PPWallpaperItem *it = [[PPWallpaperLibrary shared] importTendiesAtURL:url
                                                                     error:&err];
