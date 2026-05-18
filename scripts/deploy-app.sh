@@ -30,6 +30,24 @@ cd "$ROOT"
 : "${THEOS:=$HOME/theos}"
 [ -d "$THEOS" ] || { warn "THEOS not found at $THEOS"; exit 1; }
 
+# (Re)generate icon variants from the 1024x1024 master, if it exists
+# AND any of the variants are missing or older than the master. Cheap
+# to run -- the script itself short-circuits if the master is missing.
+if [ -f "$ROOT/app/Resources/posterPlayer.png" ] && [ -f "$ROOT/scripts/gen-icons.sh" ]; then
+  needs_icons=0
+  for v in AppIcon@2x.png AppIcon@3x.png AppIcon~ipad.png AppIcon@2x~ipad.png; do
+    if [ ! -f "$ROOT/app/Resources/$v" ] || \
+       [ "$ROOT/app/Resources/$v" -ot "$ROOT/app/Resources/posterPlayer.png" ]; then
+      needs_icons=1
+      break
+    fi
+  done
+  if [ "$needs_icons" = 1 ]; then
+    say "Regenerating icon variants from posterPlayer.png"
+    "$ROOT/scripts/gen-icons.sh" || warn "icon generation failed; continuing without"
+  fi
+fi
+
 # Wipe stale build state from BOTH possible roots. The first failed
 # build can leave a half-staged tree at PocketPlayer/.theos/obj/debug/
 # because Theos was confused about which directory was the project
