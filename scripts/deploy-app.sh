@@ -111,14 +111,25 @@ say "scp -> $PP_HOST"
 scp -i "$PP_KEY" -o StrictHostKeyChecking=accept-new "$DEB" "$PP_HOST:/var/mobile/"
 
 DEB_BASE="$(basename "$DEB")"
-say "dpkg -i + uicache"
+say "dpkg -i + uicache + respring (so SpringBoard sees the new icons)"
+# Aggressive icon-cache reset: dpkg -> wipe SpringBoard's icon caches
+# -> uicache -a (full rebuild from disk) -> killall SpringBoard.
+# Plain `uicache -p` doesn't always evict the in-memory cache on
+# rootless iOS 15, leaving the white square; the wipe + respring
+# combo always works.
+REMOTE_CMD="dpkg -i /var/mobile/'$DEB_BASE' \
+  && rm -f /var/mobile/Library/Caches/com.apple.IconsCache.plist \
+           /var/mobile/Library/Caches/com.apple.springboard-imagecache* \
+           /var/mobile/Library/Caches/SpringBoard/Application*Cache* 2>/dev/null \
+  ; uicache -a \
+  ; killall SpringBoard"
+
 if [ -n "$PP_PASS" ]; then
   ssh -i "$PP_KEY" "$PP_HOST" \
-    "echo '$PP_PASS' | sudo -S dpkg -i /var/mobile/'$DEB_BASE' && echo '$PP_PASS' | sudo -S uicache -p /var/jb/Applications/PocketPoster.app" 2>&1 \
+    "echo '$PP_PASS' | sudo -S sh -c \"$REMOTE_CMD\"" 2>&1 \
     | grep -vE 'password for|пароль для|tcgetattr' || true
 else
-  ssh -i "$PP_KEY" "$PP_HOST" \
-    "sudo -S dpkg -i /var/mobile/'$DEB_BASE' && sudo -S uicache -p /var/jb/Applications/PocketPoster.app"
+  ssh -i "$PP_KEY" "$PP_HOST" "sudo -S sh -c \"$REMOTE_CMD\""
 fi
 
-say "Done. Look for the PocketPoster icon on the home screen."
+say "Done. SpringBoard should respawn in ~3s with the PocketPoster icon visible."
