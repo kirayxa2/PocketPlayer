@@ -46,6 +46,17 @@
 - (PPWallpaperItem *)beginImportTendiesAtURL:(NSURL *)url
                                        error:(NSError **)error;
 
+// Same as the URL form, but takes a plain absolute file path AND lets
+// the caller override the displayName so a download from the online
+// catalog ends up with a pretty title ("Mario Galaxy") instead of the
+// raw filename ("mario_galaxy.tendies").
+//
+// `displayName` may be nil; if so, the filename's stem is used as in
+// the URL form.
+- (PPWallpaperItem *)beginImportTendiesAtPath:(NSString *)path
+                                  displayName:(NSString *)displayName
+                                        error:(NSError **)error;
+
 // Stage 2 of staged import: rescale every CAML inside the item's
 // bundle to fit `targetSize`. After this returns YES, the bundle on
 // disk is guaranteed renderable on a device of `targetSize`.

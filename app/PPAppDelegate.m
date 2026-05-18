@@ -1,5 +1,6 @@
 #import "PPAppDelegate.h"
 #import "PPRootViewController.h"
+#import "PPBrowseViewController.h"
 
 @implementation PPAppDelegate
 
@@ -8,27 +9,61 @@
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
 
-    PPRootViewController *root = [[PPRootViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc]
-                                   initWithRootViewController:root];
+    // Tab 1 — Library (local wallpapers, current screen).
+    PPRootViewController *library = [[PPRootViewController alloc] init];
+    UINavigationController *libraryNav = [[UINavigationController alloc]
+                                         initWithRootViewController:library];
+    if (@available(iOS 13.0, *)) {
+        libraryNav.tabBarItem = [[UITabBarItem alloc]
+            initWithTitle:@"Library"
+                    image:[UIImage systemImageNamed:@"photo.stack"]
+                      tag:0];
+    } else {
+        libraryNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Library" image:nil tag:0];
+    }
 
-    self.window.rootViewController = nav;
+    // Tab 2 — Browse (online catalog).
+    PPBrowseViewController *browse = [[PPBrowseViewController alloc] init];
+    UINavigationController *browseNav = [[UINavigationController alloc]
+                                         initWithRootViewController:browse];
+    if (@available(iOS 13.0, *)) {
+        browseNav.tabBarItem = [[UITabBarItem alloc]
+            initWithTitle:@"Browse"
+                    image:[UIImage systemImageNamed:@"square.grid.2x2"]
+                      tag:1];
+    } else {
+        browseNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Browse" image:nil tag:1];
+    }
+
+    UITabBarController *tabs = [UITabBarController new];
+    tabs.viewControllers = @[ libraryNav, browseNav ];
+
+    // Subtle tint that matches Apple's stock apps.
+    if (@available(iOS 13.0, *)) {
+        tabs.tabBar.tintColor = [UIColor labelColor];
+    }
+
+    self.window.rootViewController = tabs;
     [self.window makeKeyAndVisible];
     return YES;
 }
 
 // Handle "Open With ... PocketPoster" from Files.app / AirDrop / Safari.
-// We just hand the URL to the root VC and let it deal with the import.
+// Routes to the Library tab and triggers an import there.
 - (BOOL)application:(UIApplication *)app
             openURL:(NSURL *)url
             options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options {
-    UINavigationController *nav = (UINavigationController *)self.window.rootViewController;
-    if ([nav isKindOfClass:[UINavigationController class]]) {
-        UIViewController *top = nav.viewControllers.firstObject;
-        if ([top isKindOfClass:[PPRootViewController class]]) {
-            [(PPRootViewController *)top importTendiesAtURL:url];
-            return YES;
-        }
+    UITabBarController *tabs = (UITabBarController *)self.window.rootViewController;
+    if (![tabs isKindOfClass:[UITabBarController class]]) return NO;
+
+    // Library tab is index 0; switch to it so the user sees the result.
+    tabs.selectedIndex = 0;
+    UINavigationController *nav = tabs.viewControllers.firstObject;
+    if (![nav isKindOfClass:[UINavigationController class]]) return NO;
+    UIViewController *top = nav.viewControllers.firstObject;
+    if ([top isKindOfClass:[PPRootViewController class]]) {
+        [(PPRootViewController *)top importTendiesAtURL:url];
+        return YES;
     }
     return NO;
 }

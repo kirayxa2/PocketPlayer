@@ -227,6 +227,66 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
         }
     }
 
+    // Default display name from the source filename: "mario_galaxy.tendies"
+    // -> "mario galaxy". Caller of -beginImportTendiesAtPath:displayName:
+    // can override this by passing a non-nil string.
+    NSString *baseFromURL = [[url.lastPathComponent stringByDeletingPathExtension]
+                             stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+
+    return [self _finishStagedImportAtItemDir:itemDir
+                                    stagedZip:stagedZip
+                                  displayName:baseFromURL
+                                    sourceURL:url.absoluteString
+                                        error:error];
+}
+
+- (PPWallpaperItem *)beginImportTendiesAtPath:(NSString *)path
+                                  displayName:(NSString *)displayName
+                                        error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = [self libraryRoot];
+
+    NSString *uuid = [[NSUUID UUID] UUIDString];
+    NSString *itemDir = [root stringByAppendingPathComponent:uuid];
+    if (![fm createDirectoryAtPath:itemDir
+       withIntermediateDirectories:YES
+                        attributes:nil
+                             error:error]) {
+        return nil;
+    }
+
+    // Already a plain absolute path inside our sandbox -- no security
+    // scope dance, just copy.
+    NSString *stagedZip = [itemDir stringByAppendingPathComponent:@"src.tendies"];
+    if (![fm copyItemAtPath:path toPath:stagedZip error:error]) {
+        [fm removeItemAtPath:itemDir error:NULL];
+        return nil;
+    }
+
+    // Use caller's displayName if provided, else stem-of-filename.
+    NSString *fallback = [[[path lastPathComponent] stringByDeletingPathExtension]
+                          stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+    NSString *useName = displayName.length ? displayName : fallback;
+
+    return [self _finishStagedImportAtItemDir:itemDir
+                                    stagedZip:stagedZip
+                                  displayName:useName
+                                    sourceURL:path
+                                        error:error];
+}
+
+// Shared tail of both -beginImportTendiesAtURL: and ...AtPath:. The two
+// public entries differ only in HOW they get the .tendies bytes onto
+// disk (security-scoped URL read vs. plain copy). After that, the work
+// is identical: unzip, locate the wallpaper bundle, wrap it if needed,
+// drop scratch, write meta, reload.
+- (PPWallpaperItem *)_finishStagedImportAtItemDir:(NSString *)itemDir
+                                        stagedZip:(NSString *)stagedZip
+                                      displayName:(NSString *)displayName
+                                        sourceURL:(NSString *)sourceURL
+                                            error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
     // Unzip into a scratch subdir (NOT itemDir directly) so we can move
     // just the relevant payload into place after we figure out the
     // archive's layout. Avoids littering itemDir with __MACOSX/ etc.
@@ -261,14 +321,12 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
     // Decide the bundle name and (if needed) wrap a bare *.ca tree into
     // a synthetic .wallpaper folder so the rest of the codebase (and
     // PosterPlayer itself) sees the layout it expects.
-    NSString *baseName = [[url.lastPathComponent stringByDeletingPathExtension]
-                          stringByReplacingOccurrencesOfString:@"_" withString:@" "];
     NSString *bundleName;
     NSString *bundlePath;
 
     if (needsWrap) {
         // foundDir is the parent of a *.ca/main.caml. Wrap it.
-        bundleName = [baseName stringByAppendingPathExtension:@"wallpaper"];
+        bundleName = [displayName stringByAppendingPathExtension:@"wallpaper"];
         bundlePath = [itemDir stringByAppendingPathComponent:bundleName];
         [fm createDirectoryAtPath:bundlePath
       withIntermediateDirectories:YES
@@ -292,9 +350,9 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
     [fm removeItemAtPath:scratch error:NULL];
 
     NSDictionary *meta = @{
-        @"displayName": baseName.length ? baseName : [bundleName stringByDeletingPathExtension],
+        @"displayName": displayName.length ? displayName : [bundleName stringByDeletingPathExtension],
         @"importedAt":  [NSDate date],
-        @"sourceURL":   url.absoluteString ?: @"",
+        @"sourceURL":   sourceURL ?: @"",
         @"wrapped":     @(needsWrap),
     };
     [meta writeToFile:[itemDir stringByAppendingPathComponent:@"meta.plist"]
@@ -305,6 +363,7 @@ static NSString *PPDescribeArchiveContents(NSString *root) {
     // the unscaled CAML, which then needs re-rendering).
 
     [self reload];
+    NSString *uuid = itemDir.lastPathComponent;
     for (PPWallpaperItem *it in self.cache) {
         if ([it.itemID isEqualToString:uuid]) return it;
     }
