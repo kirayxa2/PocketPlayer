@@ -7,13 +7,16 @@
 // 6.1" device (iPhone 14 etc.) for the default clock.
 static const CGFloat kLFClockReferenceFontSize = 84.0;
 
-// Drag-handle visual constants. iOS 16/26 uses a small VERTICAL PILL
-// (rounded with full-radius ends), not a circle, sitting on the
-// right edge of the clock. The visible pill is 8pt wide x 14pt tall;
-// the touch target around it is the full 44pt minimum required by
-// UIKit guidelines so it doesn't feel "missy" under a fingertip.
-static const CGFloat kLFHandleVisibleW       = 8.0;
-static const CGFloat kLFHandleVisibleH       = 14.0;
+// Drag-handle visual constants. iOS 16/26 uses a wide HORIZONTAL pill
+// that sits SQUARELY ON the bottom rounded border of the clock's
+// selection rectangle, not on the side. The pill is "liquid glass"
+// translucent with a thin rim so it's visible on any wallpaper but
+// doesn't dominate. Width 40pt / height 6pt is what Apple ships on
+// the 6.1" reference layout. The 44pt invisible touch zone around
+// it gives a fingertip-comfortable target without sticking out
+// visually.
+static const CGFloat kLFHandleVisibleW       = 40.0;
+static const CGFloat kLFHandleVisibleH       = 6.0;
 static const CGFloat kLFHandleTouchDiameter  = 44.0;
 
 // Date pill (iOS 16/26 floats the date in a small rounded rectangle
@@ -25,31 +28,25 @@ static const CGFloat kLFDatePillVPad         = 4.0;
 static const CGFloat kLFDatePillHPad         = 14.0;
 static const CGFloat kLFDatePillToTimeGap    = 12.0;
 
-// Distance the finger has to travel away from the touch-down point
-// before we lock to a single axis. 12pt matches the system's
-// UIPanGestureRecognizer default pan-detection slop, so the lock
-// happens just as the gesture is recognised "for real".
-static const CGFloat kLFAxisLockThreshold     = 12.0;
-
 @interface LFClockOverlay () <UIGestureRecognizerDelegate> {
     id _gyroSubscriberKey;
-    // Cached natural size after font/scale resolve. The position-pan
+    // Cached natural size after the font/stretch resolve. layoutSubviews
     // and refreshFromSettings both need to know the size; computing
-    // it inside layoutSubviews and again in refresh causes the clock
-    // to jitter mid-drag, so we keep one cached result.
+    // it twice causes the clock to jitter, so we keep one cached
+    // result and have recomputeMetrics own it.
     CGSize  _naturalSize;
-    BOOL    _isUserDragging;     // bug-1 fix: pause auto-positioning
-    CGFloat _resizeStartScale;   // captured on resize-pan Began
-    CGFloat _resizeStartStretch; // captured on resize-pan Began
+    BOOL    _isUserDragging;     // pause auto-positioning while user resizes
     CGFloat _resizeStartVStretch;// captured on resize-pan Began (Y axis)
-    // iOS 26-style axis lock. On gesture Began, `Unknown`. As soon as
-    // the finger has moved >= kLFAxisLockThreshold pt away from the
-    // start point in EITHER direction, we commit to that axis (Y or X)
-    // and ignore the other axis for the rest of the gesture. Each axis
-    // controls its OWN independent stretch, so the user can build a
-    // tall thin clock, a short wide clock, or any combo. Y dragging
-    // never changes width; X dragging never changes height.
-    NSInteger _resizeAxis;       // 0=unknown, 1=Y(verticalStretch), 2=X(horizontalStretch)
+    // Top edge of the clock's frame in superview coordinates. iOS
+    // 16/26 lock screen clocks have a FIXED top: when the user
+    // resizes via the handle, the top edge stays put and the clock
+    // grows/shrinks ONLY toward the bottom. The date pill above
+    // the digits, which sits at frame.origin.y=0 in our local space,
+    // therefore never moves on screen as the digits grow.
+    // Cached on -centerInParentApplyingSettings so the resize-pan
+    // logic doesn't have to sample superview safe-area insets each
+    // call.
+    CGFloat _fixedTopY;
 }
 @property (nonatomic, strong) LFLiquidGlassView *glassBackground;
 // Date pill: small rounded rect with a thin white border that floats
@@ -59,12 +56,12 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
 @property (nonatomic, strong) UILabel           *timeLabel;
 @property (nonatomic, strong) UILabel           *dateLabel;
 
-// Resize handle: visible 8x14pt VERTICAL PILL on the right edge of
-// the clock, but the actual UIView is 44pt for a generous touch
-// area. Standard iOS pattern, used by Apple in the iOS 16/26 lock
-// screen editor.
-@property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible
-@property (nonatomic, strong) UIView            *resizeHandleVisible; // 8x14 vertical pill inside
+// Resize handle: visible 40x6pt HORIZONTAL pill that sits ON the
+// rounded bottom border of the clock's selection rectangle. The
+// actual UIView is 44pt for a generous touch area. Standard iOS
+// pattern, used by Apple in the iOS 16/26 lock screen editor.
+@property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible touch zone
+@property (nonatomic, strong) UIView            *resizeHandleVisible; // 40x6 horizontal pill inside
 
 @property (nonatomic, strong) NSTimer           *tickTimer;
 @property (nonatomic, strong) UIPanGestureRecognizer *resizePan;
@@ -80,10 +77,8 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     self.userInteractionEnabled = YES;
     self.backgroundColor        = [UIColor clearColor];
     _isUserDragging             = NO;
-    _resizeStartScale           = 1.0;
-    _resizeStartStretch         = 1.0;
     _resizeStartVStretch        = 1.0;
-    _resizeAxis                 = 0;
+    _fixedTopY                  = 0;
     _naturalSize                = CGSizeMake(200, 100); // sane initial
 
     [self buildSubviews];
@@ -136,10 +131,12 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     [self buildResizeHandle];
 }
 
-// 44pt invisible touch view containing a centered 8x14 visible
-// vertical PILL. Pill is white-translucent with a thin dark border
-// and a tiny shadow, exactly the style Apple uses on iOS 16/26's
-// drag-resize handle.
+// 44pt invisible touch view containing a centered 40x6 visible
+// HORIZONTAL pill. The pill is white-translucent (liquid-glass-ish)
+// with a subtle white rim and a soft drop-shadow so it reads on any
+// wallpaper. It is positioned to sit DIRECTLY ON the bottom rounded
+// border of the clock's selection rectangle -- exactly the iOS 16/26
+// resize handle visual.
 - (void)buildResizeHandle {
     _resizeHandle = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
         kLFHandleTouchDiameter, kLFHandleTouchDiameter)];
@@ -152,14 +149,19 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     CGFloat offY = (kLFHandleTouchDiameter - kLFHandleVisibleH) / 2.0;
     _resizeHandleVisible = [[UIView alloc] initWithFrame:CGRectMake(
         offX, offY, kLFHandleVisibleW, kLFHandleVisibleH)];
-    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.85];
-    // Full-radius ends so the rectangle becomes a vertical pill.
-    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleW / 2.0;
+    // Translucent white core: shows through the wallpaper behind it
+    // but stays bright enough to read. The thin bright-white rim
+    // gives the "glass edge" look, and the soft shadow lifts the
+    // pill off the border so it doesn't visually merge with the
+    // selection-rect outline.
+    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.55];
+    // Full-radius ends turn the rectangle into a horizontal pill.
+    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleH / 2.0;
     _resizeHandleVisible.layer.borderWidth  = 0.5;
-    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:0.0 alpha:0.20] CGColor];
+    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:1.0 alpha:0.85] CGColor];
     _resizeHandleVisible.layer.shadowColor  = [[UIColor blackColor] CGColor];
-    _resizeHandleVisible.layer.shadowOpacity = 0.18;
-    _resizeHandleVisible.layer.shadowRadius  = 2.5;
+    _resizeHandleVisible.layer.shadowOpacity = 0.22;
+    _resizeHandleVisible.layer.shadowRadius  = 3.0;
     _resizeHandleVisible.layer.shadowOffset  = CGSizeMake(0, 1);
     _resizeHandleVisible.userInteractionEnabled = NO;
     [_resizeHandle addSubview:_resizeHandleVisible];
@@ -231,20 +233,21 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     CGSize dateSize = [(_dateLabel.text ?: @" ")
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
 
-    // iOS 26-style independent axis stretches. Each axis is owned by
-    // its own setting and is changed independently by the resize
-    // handle's drag direction. The font's intrinsic point size is
-    // unchanged -- we render at natural size and then apply a
-    // CGAffineTransform with both axes' stretch factors. This is
-    // exactly how Apple does it: rasterise at native size, then
-    // bitmap-stretch in either direction.
+    // iOS 16/26 lock screen clock resize is VERTICAL ONLY: the user
+    // drags the resize handle DOWN to grow the digits, and dragging
+    // up never compresses below the natural size (i.e. min vStretch
+    // is 1.0, NOT 0.6). The horizontal stretch setting still exists
+    // in the plist (so old saves don't break) but is forced to 1.0
+    // here -- the editor no longer exposes a way to change it, and
+    // a stale value from an older build would otherwise make the
+    // digits look mis-proportioned.
     //
-    // Drag DOWN  -> verticalStretch goes 1.0 -> 5.0  (digits get tall, lots of room)
-    // Drag UP    -> verticalStretch goes 1.0 -> 0.6  (digits get short)
-    // Drag RIGHT -> horizontalStretch        1.0 -> 2.5  (digits get really wide)
-    // Drag LEFT  -> horizontalStretch        1.0 -> 0.6  (digits get narrow)
-    CGFloat hStretch = MAX(0.6, MIN(2.5, s.horizontalStretch));
-    CGFloat vStretch = MAX(0.6, MIN(5.0, s.verticalStretch));
+    // Drag DOWN -> verticalStretch grows 1.0 -> 5.0 (digits get tall
+    //              and fill most of the screen on a 6s)
+    // Drag UP   -> verticalStretch already at 1.0 stays at 1.0
+    //              (the handle simply doesn't react further up)
+    CGFloat hStretch = 1.0;
+    CGFloat vStretch = MAX(1.0, MIN(5.0, s.verticalStretch));
     CGFloat stretchedTimeWidth  = timeSize.width  * hStretch;
     CGFloat stretchedTimeHeight = timeSize.height * vStretch;
 
@@ -284,16 +287,21 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
 
     // The time label spans the full overlay width and uses
     // textAlignment to glue glyphs to the chosen edge. We then apply
-    // both axes' stretch via a single CGAffineTransform, around the
-    // matching anchor point so the stretch pivots on that edge.
+    // the vertical stretch via a CGAffineTransform, anchored at the
+    // TOP edge of the label (anchorPoint Y=0.0). That anchor placement
+    // is what makes the iOS 16/26 "grow downward only" behaviour
+    // correct: as the user drags the resize handle down,
+    // verticalStretch grows and the digits expand toward the bottom
+    // of the screen while their top edge stays exactly where it was
+    // -- which is what keeps the date pill above the clock visually
+    // anchored in place. Anchoring at center-Y (the previous version)
+    // caused the digits to grow both upward and downward, which made
+    // the date pill appear to shift up when the user resized.
     _timeLabel.transform = CGAffineTransformIdentity;
-    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.5);
     CGFloat timeY = datePillH + kLFDatePillToTimeGap;
     _timeLabel.frame = CGRectMake(0, timeY, width, timeSize.height);
-    // Reposition layer so anchor sits at the matching X edge of the
-    // label's frame -- (0, mid), (width/2, mid) or (width, mid).
-    CGFloat px = ax * width;
-    _timeLabel.layer.position = CGPointMake(px, timeY + timeSize.height / 2.0);
+    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
+    _timeLabel.layer.position    = CGPointMake(ax * width, timeY);
     if (fabs(hStretch - 1.0) > 0.001 || fabs(vStretch - 1.0) > 0.001) {
         _timeLabel.transform = CGAffineTransformMakeScale(hStretch, vStretch);
     }
@@ -302,13 +310,16 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
     _glassBackground.intensity = s.liquidGlassIntensity;
 
-    // Resize handle: 44x44 invisible touch view positioned so that
-    // its center sits on the right edge of the time label, vertically
-    // aligned with the time's vertical center. The visible 8x14 pill
-    // sits inside the touch zone, so it appears half-outside the
-    // clock content -- exactly the iOS 16/26 visual.
-    CGFloat handleCx = width;
-    CGFloat handleCy = timeY + (stretchedTimeHeight / 2.0);
+    // Resize handle: 44x44 invisible touch view with the visible
+    // 40x6 horizontal pill centered inside it. Positioned so that
+    // the visible pill sits SQUARELY ON the bottom rounded border
+    // of the clock's selection rectangle, horizontally centered.
+    // This is the iOS 16/26 visual: a translucent glass pill resting
+    // on the curved bottom outline. The 44pt touch zone extends both
+    // above and below the visible pill so a fingertip can grab it
+    // generously without aiming.
+    CGFloat handleCx = width / 2.0;
+    CGFloat handleCy = height;
     _resizeHandle.frame = CGRectMake(handleCx - kLFHandleTouchDiameter / 2.0,
                                      handleCy - kLFHandleTouchDiameter / 2.0,
                                      kLFHandleTouchDiameter,
@@ -326,6 +337,14 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
         self.layer.borderColor = nil;
         self.layer.borderWidth = 0.0;
     }
+
+    // Anchor the top edge in superview coordinates so vertical growth
+    // never pushes the date pill upward off-screen and never tugs
+    // the clock above its iOS 16/26 default position. This is the
+    // single owner of self.center.y; every recomputeMetrics call
+    // ends here so resize, font swaps, and minute-text-changes all
+    // converge to the same fixed top.
+    [self centerInParentApplyingSettings];
 }
 
 // Apply the clock's DEFAULT iOS 16/26 position. The clock is locked to
@@ -335,14 +354,22 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
 // Default vertical placement: just below the safe-area top, with the
 // date pill ~24pt down so it doesn't kiss the status bar / dynamic
 // island. Centered horizontally.
+//
+// IMPORTANT: this function is the SINGLE SOURCE OF TRUTH for self's
+// position on screen. It's called at the end of every
+// -recomputeMetrics, so vertical-stretch resize, font swaps, and
+// minute-text-changes all reset to the same fixed top, which is what
+// makes "the clock can only resize down" feel correct: as bounds.height
+// grows, center.y grows by exactly the same amount -- frame.origin.y
+// stays put.
 - (void)centerInParentApplyingSettings {
-    if (_isUserDragging) return;        // resize-pan drag in progress
     UIView *parent = self.superview;
     if (!parent) return;
 
     CGFloat topPadding = parent.safeAreaInsets.top + 24.0;
+    _fixedTopY = topPadding;
     CGPoint center = CGPointMake(parent.bounds.size.width / 2.0,
-                                 topPadding + _naturalSize.height / 2.0);
+                                 topPadding + self.bounds.size.height / 2.0);
     self.center = center;
 }
 
@@ -499,10 +526,8 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
 
     if (pan.state == UIGestureRecognizerStateBegan) {
         _isUserDragging      = YES;
-        _resizeStartScale    = [LFClockSettings shared].scale;
-        _resizeStartStretch  = [LFClockSettings shared].horizontalStretch;
         _resizeStartVStretch = [LFClockSettings shared].verticalStretch;
-        _resizeAxis          = 0;  // unknown; decided as soon as finger moves
+        if (_resizeStartVStretch < 1.0) _resizeStartVStretch = 1.0;
     }
 
     // Use translation in PARENT coordinate space, not self -- since
@@ -512,54 +537,28 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     UIView *parent = self.superview ?: self;
     CGPoint t = [pan translationInView:parent];
 
-    // iOS 26 axis-lock decision. We commit to one axis as soon as
-    // the user has moved past the slop threshold in either
-    // direction. After that, the OTHER axis is ignored for the
-    // remainder of this gesture.
-    if (_resizeAxis == 0) {
-        CGFloat ax = fabs(t.x);
-        CGFloat ay = fabs(t.y);
-        if (ax >= kLFAxisLockThreshold || ay >= kLFAxisLockThreshold) {
-            _resizeAxis = (ay >= ax) ? 1 : 2;
-        }
-        // Until the threshold is crossed, don't move the clock --
-        // matches Apple's behaviour where a tiny finger jiggle
-        // doesn't immediately resize anything.
-    }
+    // iOS 16/26 lock screen clock resize is VERTICAL ONLY. We map
+    // vertical translation to verticalStretch directly:
+    //
+    //   drag DOWN by N pt   -> vStretch += N / 350 * (5.0 - 1.0)
+    //   drag UP   by N pt   -> vStretch -= N / 350 * (5.0 - 1.0)
+    //
+    // The result is then CLAMPED at 1.0 on the low end and 5.0 on the
+    // high end. The clamp at 1.0 is what makes "you can only resize
+    // DOWN" correct: dragging up while already at the natural size
+    // simply does nothing -- the digits never compress below default.
+    //
+    // Divisor 350 keeps the same finger-feel as before: ~350pt of
+    // vertical drag traverses min<->max, which is the full available
+    // swipe height on a 6s.
+    CGFloat range       = 5.0 - 1.0;
+    CGFloat delta       = t.y / 350.0 * range;
+    CGFloat newVStretch = MAX(1.0, MIN(5.0, _resizeStartVStretch + delta));
 
     BOOL changed = NO;
-
-    if (_resizeAxis == 1) {
-        // Y dominant -> verticalStretch ONLY. Down = taller (up to
-        // 5.0x at the bottom of the range, which is huge -- on iPhone
-        // 6s the natural digit height is ~84pt, so 5x lands at ~420pt
-        // and fills most of the screen). Up = shorter (down to 0.6x).
-        // Width is untouched -- the user explicitly asked for Y to
-        // not bleed into width on iOS 26 axis lock.
-        //
-        // Divisor 350 keeps finger feel similar to before with the
-        // smaller range: roughly 1pt of finger movement = 1.25% of
-        // range, so 350pt of vertical drag traverses min<->max,
-        // which is the full available swipe height on a 6s.
-        CGFloat range       = 5.0 - 0.6;
-        CGFloat delta       = t.y / 350.0 * range;
-        CGFloat newVStretch = MAX(0.6, MIN(5.0, _resizeStartVStretch + delta));
-        if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {
-            [LFClockSettings shared].verticalStretch = newVStretch;
-            changed = YES;
-        }
-    } else if (_resizeAxis == 2) {
-        // X dominant -> horizontalStretch ONLY. Right = wider
-        // (up to 2.5x), left = narrower (down to 0.6x). Vertical
-        // size of the digits is unchanged. Divisor 250 matches the
-        // sensitivity feel of the Y axis.
-        CGFloat range      = 2.5 - 0.6;
-        CGFloat delta      = t.x / 250.0 * range;
-        CGFloat newStretch = MAX(0.6, MIN(2.5, _resizeStartStretch + delta));
-        if (fabs(newStretch - [LFClockSettings shared].horizontalStretch) > 0.001) {
-            [LFClockSettings shared].horizontalStretch = newStretch;
-            changed = YES;
-        }
+    if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {
+        [LFClockSettings shared].verticalStretch = newVStretch;
+        changed = YES;
     }
 
     if (changed) {
@@ -577,7 +576,6 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         pan.state == UIGestureRecognizerStateCancelled ||
         pan.state == UIGestureRecognizerStateFailed) {
         _isUserDragging = NO;
-        _resizeAxis     = 0;
         [[LFClockSettings shared] save];
     }
 }

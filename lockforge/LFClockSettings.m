@@ -144,8 +144,25 @@ static NSString *const kLFSettingsPath =
         // change). Migrate: copy the user's saved size onto the
         // axis where it now lives, then reset scale so it doesn't
         // double-multiply on top of the new transform-based stretch.
-        _verticalStretch = MAX(0.6, MIN(5.0, _scale));
+        _verticalStretch = MAX(1.0, MIN(5.0, _scale));
         _scale           = 1.0;
+    }
+    // iOS 16/26 lock screen clock cannot be horizontally resized; the
+    // editor no longer exposes a way to change horizontalStretch.
+    // Old plists (from a build where the resize handle did X-axis
+    // stretching) may have a non-1.0 value saved -- reset it so
+    // older users don't see oddly-proportioned digits and so the
+    // value matches what the editor can produce going forward.
+    if (fabs(_horizontalStretch - 1.0) > 0.001) {
+        _horizontalStretch = 1.0;
+    }
+    // Same for verticalStretch: the new minimum is 1.0 (no
+    // compression below natural size). An older plist with a
+    // sub-1.0 value would otherwise be displayed as 1.0 (clamp in
+    // recomputeMetrics) but written back unchanged, producing a
+    // permanently-stale plist. Snap it now.
+    if (_verticalStretch < 1.0) {
+        _verticalStretch = 1.0;
     }
     if (d[@"alignment"])            _alignment            = (LFClockAlignment)[d[@"alignment"] integerValue];
     if (d[@"positionOffsetX"] && d[@"positionOffsetY"]) {
