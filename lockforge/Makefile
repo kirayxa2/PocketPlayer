@@ -23,7 +23,8 @@ LockForge_FILES = \
     LFLiquidGlassView.m \
     LFGyroscopeManager.m \
     LFClockOverlay.m \
-    LFLockEditor.m
+    LFLockEditor.m \
+    LFLockScreenSelector.m
 
 LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
 LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion

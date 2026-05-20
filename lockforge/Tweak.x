@@ -22,6 +22,7 @@
 #import "LFClockSettings.h"
 #import "LFClockOverlay.h"
 #import "LFLockEditor.h"
+#import "LFLockScreenSelector.h"
 
 // =====================================================================
 // Globals
@@ -30,6 +31,11 @@
 static __weak UIView          *gCoverSheetView;
 static LFClockOverlay         *gClockOverlay;
 static LFLockEditor           *gEditor;
+// Carousel selector that opens FIRST on long-press, then lets the user
+// pick "Customize" to drop into the editor (gEditor). This mirrors
+// Apple's iOS 16/26 flow exactly: long-press -> wallpaper picker
+// carousel -> Customize -> editor.
+static LFLockScreenSelector   *gSelector;
 static UILongPressGestureRecognizer *gLongPress;
 
 // Tracks whether we've already done the (heavy-ish) install pass for
@@ -125,7 +131,7 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
 // Long-press gesture target / editor lifecycle
 // =====================================================================
 
-@interface LFGestureTarget : NSObject <LFLockEditorDelegate>
+@interface LFGestureTarget : NSObject <LFLockEditorDelegate, LFLockScreenSelectorDelegate>
 + (instancetype)shared;
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g;
 @end
@@ -141,15 +147,48 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    if (gEditor) return;       // an editor is currently on screen
+    if (gSelector || gEditor) return;       // a chrome panel is already up
     if (!gClockOverlay) return;
     UIWindow *win = gCoverSheetView.window;
     if (!win) return;
 
+    // iOS 16/26 flow: long-press goes to the carousel selector first,
+    // not the editor. Editor is reachable via the "Customize" button
+    // INSIDE the selector. Behaves identically to Apple.
+    gSelector = [[LFLockScreenSelector alloc]
+        initWithCoverSheetView:gCoverSheetView
+                  clockOverlay:gClockOverlay];
+    gSelector.delegate = self;
+    [gSelector presentInWindow:win];
+}
+
+#pragma mark - LFLockScreenSelectorDelegate
+
+// User tapped "Customize" on the selector. The selector animates out
+// in parallel; we kick off the editor presentation right away so the
+// transition feels instant (matches iOS 26).
+- (void)selectorDidRequestEditor:(LFLockScreenSelector *)selector {
+    if (gSelector == selector) {
+        gSelector = nil;        // selector is animating out, free the slot
+    }
+    if (gEditor) return;        // shouldn't happen but be safe
+    UIWindow *win = gCoverSheetView.window;
+    if (!win || !gClockOverlay) return;
+
     gEditor = [[LFLockEditor alloc] initWithClockOverlay:gClockOverlay];
-    gEditor.delegate = self;          // bug-1 fix: get notified on dismiss
+    gEditor.delegate = self;
     [gEditor presentInWindow:win];
 }
+
+// User dismissed the selector without picking Customize (swipe-down,
+// etc). Just clean the slot so the next long-press can spawn fresh.
+- (void)selectorDidDismiss:(LFLockScreenSelector *)selector {
+    if (gSelector == selector) {
+        gSelector = nil;
+    }
+}
+
+#pragma mark - LFLockEditorDelegate
 
 // Editor finished animating out -- we're free to start a new one on
 // the next long-press.
