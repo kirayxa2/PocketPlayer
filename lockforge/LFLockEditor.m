@@ -93,6 +93,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
         @"colorMode":            @(s.colorMode),
         @"customColorRGBA":      s.customColorRGBA ?: @[ @1, @1, @1, @1 ],
         @"scale":                @(s.scale),
+        @"horizontalStretch":    @(s.horizontalStretch),
         @"positionOffsetX":      @(s.positionOffset.x),
         @"positionOffsetY":      @(s.positionOffset.y),
         @"liquidGlassIntensity": @(s.liquidGlassIntensity),
@@ -105,6 +106,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     s.colorMode            = (LFClockColorMode)[_initialSnapshot[@"colorMode"] integerValue];
     s.customColorRGBA      = _initialSnapshot[@"customColorRGBA"];
     s.scale                = [_initialSnapshot[@"scale"] doubleValue];
+    s.horizontalStretch    = [_initialSnapshot[@"horizontalStretch"] doubleValue];
     s.positionOffset       = CGPointMake([_initialSnapshot[@"positionOffsetX"] doubleValue],
                                          [_initialSnapshot[@"positionOffsetY"] doubleValue]);
     s.liquidGlassIntensity = [_initialSnapshot[@"liquidGlassIntensity"] integerValue];

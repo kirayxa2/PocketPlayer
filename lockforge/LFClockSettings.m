@@ -28,6 +28,7 @@ static NSString *const kLFSettingsPath =
     _colorMode            = LFClockColorAdaptive;
     _customColorRGBA      = @[ @1.0, @1.0, @1.0, @1.0 ];
     _scale                = 1.0;
+    _horizontalStretch    = 1.0;
     _positionOffset       = CGPointZero;
     _liquidGlassIntensity = 0;
     _gyroEffectsEnabled   = YES;
@@ -131,6 +132,7 @@ static NSString *const kLFSettingsPath =
     if (d[@"colorMode"])            _colorMode            = (LFClockColorMode)[d[@"colorMode"] integerValue];
     if (d[@"customColorRGBA"])      _customColorRGBA      = d[@"customColorRGBA"];
     if (d[@"scale"])                _scale                = [d[@"scale"]                doubleValue];
+    if (d[@"horizontalStretch"])    _horizontalStretch    = [d[@"horizontalStretch"]    doubleValue];
     if (d[@"positionOffsetX"] && d[@"positionOffsetY"]) {
         _positionOffset = CGPointMake([d[@"positionOffsetX"] doubleValue],
                                       [d[@"positionOffsetY"] doubleValue]);
@@ -151,6 +153,7 @@ static NSString *const kLFSettingsPath =
         @"colorMode":            @(_colorMode),
         @"customColorRGBA":      _customColorRGBA ?: @[ @1, @1, @1, @1 ],
         @"scale":                @(_scale),
+        @"horizontalStretch":    @(_horizontalStretch),
         @"positionOffsetX":      @(_positionOffset.x),
         @"positionOffsetY":      @(_positionOffset.y),
         @"liquidGlassIntensity": @(_liquidGlassIntensity),
