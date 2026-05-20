@@ -5,49 +5,52 @@
 // =====================================================================
 // LFPassthroughView -- transparent container for the editor.
 //
-// Why we need it: the editor's root view covers the whole window and
-// sits ABOVE the cover-sheet view (which contains the clock). UIKit
-// hit-tests top-down, so any touch that lands on the editor root
-// (anywhere except top bar / bottom panel) was being intercepted by
-// the root or the dimmer instead of reaching the clock underneath.
-// That's why drag-resize "didn't react" -- the gesture recognizer
-// on the resize handle was correct, but the touch never reached it.
+// Earlier in the project's life this class forwarded touches through
+// to the cover-sheet underneath (via -hitTest: returning nil) because
+// the clock lived in the cover-sheet and we needed its drag-resize
+// gestures to keep working from inside the editor's overlay.
 //
-// The passthrough trick: -hitTest: returns nil whenever the result
-// is self -- meaning "the touch landed in empty container space, not
-// on a real subview". UIKit then continues searching siblings of the
-// editor root in the window, finding the cover-sheet view, which in
-// turn finds the clock and handle.
+// Now the clock is REPARENTED into the editor's view in
+// -presentInWindow:, so every editor-mode interaction (tap, drag-
+// resize) hit-tests through this view directly. We keep the class
+// for symmetry with the rest of the file, but it's a plain UIView
+// today -- there's no longer any pass-through behaviour.
 // =====================================================================
 @interface LFPassthroughView : UIView
 @end
 @implementation LFPassthroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return (hit == self) ? nil : hit;
-}
 @end
 
-// Layout constants for the editor's bottom panel. Picked to match iOS
-// 26's customize sheet density: 60pt-tall font row, 44pt color dot
-// row, 36pt slider row, 12pt vertical padding.
-static const CGFloat kLFFontRowHeight      = 64;
-static const CGFloat kLFColorRowHeight     = 48;
-static const CGFloat kLFSliderRowHeight    = 40;
-static const CGFloat kLFAlignmentRowHeight = 44;  // small icon row, centered
-static const CGFloat kLFEditorBottomPanelHeight =
-    kLFFontRowHeight + kLFColorRowHeight + kLFSliderRowHeight +
-    kLFAlignmentRowHeight + 24 + 80; // + safeArea
-// (Top bar removed -- the editor now uses a small close-X on the
-// bottom panel instead, matching iOS 16/26's customize sheet.)
+// Layout constants for the editor's bottom panel. iOS 16/26 customize
+// sheet density: 64pt-tall font row, 48pt color dot row, 40pt slider
+// row. Total content sits inside ~16pt vertical padding -- the
+// overall panel height is computed in viewDidLayoutSubviews because
+// safeAreaInsets.bottom isn't known at compile time.
+//
+// The font row Y-origin is now offset by `kLFPanelTopPad` so the row
+// sits BELOW the close-X button at the panel's top-right corner --
+// without that offset the picker cells overlap the X visually and
+// catch touches meant for it.
+static const CGFloat kLFFontRowHeight   = 64;
+static const CGFloat kLFColorRowHeight  = 48;
+static const CGFloat kLFSliderRowHeight = 40;
+static const CGFloat kLFPanelTopPad     = 50;  // leaves room for the close-X
+static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
+// (Top bar removed earlier -- the editor uses a small close-X on
+// the bottom panel instead, matching iOS 16/26's customize sheet.
+// Alignment row removed in this pass: iOS 16/26 lock-screen clocks
+// are always centred; the row served no purpose and just made the
+// panel taller than necessary.)
 
-@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate>
+@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate>
 @property (nonatomic, weak)   LFClockOverlay      *clockOverlay;
 @property (nonatomic, weak)   UIView              *clockOriginalParent;  // remember home for re-parenting on dismiss
 @property (nonatomic, strong) UIVisualEffectView  *dimmer;       // covers wallpaper
 // Compact close button -- small "x" pill at the top-right of the
 // bottom panel. Replaces the old top bar with Cancel / Done; tapping
-// it saves and dismisses (no separate Cancel anymore).
+// it saves and dismisses (no separate Cancel anymore). Lives INSIDE
+// the bottom panel so it slides in/out together with the rest of
+// the customize sheet.
 @property (nonatomic, strong) UIButton            *closeButton;
 @property (nonatomic, strong) UIView              *bottomPanel;
 @property (nonatomic, strong) UIVisualEffectView  *bottomPanelBlur;
@@ -55,12 +58,14 @@ static const CGFloat kLFEditorBottomPanelHeight =
 @property (nonatomic, strong) UICollectionView    *colorPickerRow;
 @property (nonatomic, strong) UISlider            *glassSlider;
 @property (nonatomic, strong) UILabel             *glassLabel;
-// Alignment row -- three small icon buttons (left / center / right),
-// horizontally centered in the bottom panel. Maps to LFClockAlignment.
-@property (nonatomic, strong) UIView              *alignmentRow;
-@property (nonatomic, strong) UIButton            *alignLeftButton;
-@property (nonatomic, strong) UIButton            *alignCenterButton;
-@property (nonatomic, strong) UIButton            *alignRightButton;
+// iOS 16/26 customize-sheet behaviour: the bottom panel is HIDDEN
+// when the editor first appears (just selection rect + handle on
+// the clock). Tapping the clock toggles the panel up/down. Tapping
+// outside the clock and the panel either slides the panel down (if
+// up) or dismisses the editor entirely (if already down). This
+// state mirrors the panel's current on-screen position.
+@property (nonatomic) BOOL   bottomPanelVisible;
+@property (nonatomic) CGFloat panelHeight;            // recomputed each layout pass
 @end
 
 @implementation LFLockEditor
@@ -108,7 +113,10 @@ static const CGFloat kLFEditorBottomPanelHeight =
 // Small "x" close button -- replaces the old Cancel/Done top bar.
 // Anchored at the top-right corner of the bottom panel; tapping it
 // saves all current settings and dismisses the editor (no separate
-// Cancel anymore -- everything is live-saved on close).
+// Cancel anymore -- everything is live-saved on close). Lives as a
+// subview of `_bottomPanel` so it slides in/out together with the
+// rest of the customize sheet -- when the panel is hidden, the X is
+// hidden too.
 - (void)buildCloseButton {
     _closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     if (@available(iOS 13.0, *)) {
@@ -128,7 +136,7 @@ static const CGFloat kLFEditorBottomPanelHeight =
     [_closeButton addTarget:self
                      action:@selector(onClose)
            forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:_closeButton];
+    [_bottomPanel addSubview:_closeButton];
 }
 
 - (void)buildBottomPanel {
@@ -148,78 +156,6 @@ static const CGFloat kLFEditorBottomPanelHeight =
     [self buildFontRow];
     [self buildColorRow];
     [self buildGlassSlider];
-    [self buildAlignmentRow];
-}
-
-// Three small icon-only buttons arranged horizontally and centered in
-// the bottom panel. Each is 36x36 with an SF Symbol (left/center/right
-// alignment). The currently chosen one gets a subtle white border;
-// the rest are neutral. Tapping flips LFClockSettings.alignment and
-// triggers a live re-layout of the clock.
-- (void)buildAlignmentRow {
-    _alignmentRow = [UIView new];
-    _alignmentRow.backgroundColor = [UIColor clearColor];
-    [_bottomPanel addSubview:_alignmentRow];
-
-    _alignLeftButton   = [self makeAlignmentButtonWithSymbol:@"text.alignleft"
-                                                         tag:LFClockAlignmentLeft];
-    _alignCenterButton = [self makeAlignmentButtonWithSymbol:@"text.aligncenter"
-                                                         tag:LFClockAlignmentCenter];
-    _alignRightButton  = [self makeAlignmentButtonWithSymbol:@"text.alignright"
-                                                         tag:LFClockAlignmentRight];
-    [_alignmentRow addSubview:_alignLeftButton];
-    [_alignmentRow addSubview:_alignCenterButton];
-    [_alignmentRow addSubview:_alignRightButton];
-    [self refreshAlignmentSelection];
-}
-
-- (UIButton *)makeAlignmentButtonWithSymbol:(NSString *)symbol tag:(NSInteger)tag {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.tag = tag;
-    b.tintColor = [UIColor whiteColor];
-    if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
-            configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
-        UIImage *img = [UIImage systemImageNamed:symbol withConfiguration:cfg];
-        [b setImage:img forState:UIControlStateNormal];
-    } else {
-        // Fallback labels on the slim chance someone runs this on a
-        // pre-iOS-13 build, which Dopamine doesn't actually support.
-        NSString *txt = (tag == LFClockAlignmentLeft) ? @"L"
-                      : (tag == LFClockAlignmentRight) ? @"R" : @"C";
-        [b setTitle:txt forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    }
-    b.layer.cornerRadius = 10;
-    b.layer.borderWidth = 1.0;
-    b.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor];
-    [b addTarget:self
-          action:@selector(onAlignmentTap:)
-forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-- (void)refreshAlignmentSelection {
-    LFClockAlignment a = [LFClockSettings shared].alignment;
-    UIButton *all[3] = { _alignLeftButton, _alignCenterButton, _alignRightButton };
-    for (NSInteger i = 0; i < 3; i++) {
-        BOOL on = (i == (NSInteger)a);
-        all[i].layer.borderColor =
-            (on ? [[UIColor whiteColor] CGColor]
-                : [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor]);
-        all[i].layer.borderWidth = on ? 2.0 : 1.0;
-        all[i].backgroundColor = on
-            ? [UIColor colorWithWhite:1.0 alpha:0.10]
-            : [UIColor clearColor];
-    }
-}
-
-- (void)onAlignmentTap:(UIButton *)b {
-    LFClockAlignment a = (LFClockAlignment)b.tag;
-    if ([LFClockSettings shared].alignment == a) return;
-    [LFClockSettings shared].alignment = a;
-    [_clockOverlay refreshFromSettings];
-    [self refreshAlignmentSelection];
 }
 
 - (void)buildFontRow {
@@ -283,44 +219,126 @@ forControlEvents:UIControlEventTouchUpInside];
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     UIEdgeInsets safe = self.view.safeAreaInsets;
-    (void)safe;
 
-    CGFloat panelH = kLFEditorBottomPanelHeight;
+    // Total panel height: top pad (room for close-X) + 3 rows + bottom
+    // pad + safe-area inset. Computed dynamically because
+    // safeAreaInsets isn't available at compile time.
+    CGFloat panelH = kLFPanelTopPad + kLFFontRowHeight + kLFColorRowHeight +
+                     kLFSliderRowHeight + kLFPanelBotPad + safe.bottom;
+    _panelHeight = panelH;
+
+    // Panel position: at the screen bottom when visible, fully OFF
+    // the bottom edge when hidden. Both states are laid out by frame
+    // (no transform) so child layout stays simple.
+    CGFloat panelY = _bottomPanelVisible
+        ? (self.view.bounds.size.height - panelH)
+        : self.view.bounds.size.height;
     _bottomPanel.frame = CGRectMake(0,
-                                    self.view.bounds.size.height - panelH,
+                                    panelY,
                                     self.view.bounds.size.width,
                                     panelH);
     _bottomPanelBlur.frame = _bottomPanel.bounds;
 
-    // Close button -- 30x30 icon button at the top-right corner of
-    // the bottom panel, 12pt margin from the panel edges. Sits in
-    // self.view (not _bottomPanel) so its tap target isn't masked by
-    // the panel's rounded-corner clip.
+    // Close X: 30pt circle at top-right of the panel, 12pt margin.
+    // Lives inside _bottomPanel now, so its position is in panel
+    // coordinates -- it slides with the panel automatically.
     const CGFloat closeSize = 30.0;
     _closeButton.frame = CGRectMake(self.view.bounds.size.width - 12 - closeSize,
-                                    _bottomPanel.frame.origin.y + 12,
+                                    12,
                                     closeSize, closeSize);
 
-    CGFloat y = 16;
-    _fontPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFFontRowHeight);
+    // Picker rows. Font row starts BELOW the close-X (kLFPanelTopPad
+    // = 50pt = 12pt top inset + 30pt button + 8pt gap) so its cells
+    // never overlap the X visually or steal touches from it.
+    CGFloat y = kLFPanelTopPad;
+    _fontPickerRow.frame  = CGRectMake(0, y, self.view.bounds.size.width, kLFFontRowHeight);
     y += kLFFontRowHeight;
     _colorPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFColorRowHeight);
     y += kLFColorRowHeight;
-    _glassLabel.frame = CGRectMake(16, y + 6, 60, 24);
+    _glassLabel.frame  = CGRectMake(16, y + 6, 60, 24);
     _glassSlider.frame = CGRectMake(76, y + 4, self.view.bounds.size.width - 92, 28);
-    y += kLFSliderRowHeight;
+}
 
-    // Alignment row: three small 36pt buttons centred horizontally
-    // inside the panel with 12pt spacing between them.
-    _alignmentRow.frame = CGRectMake(0, y, self.view.bounds.size.width,
-                                     kLFAlignmentRowHeight);
-    const CGFloat btn = 36, gap = 12;
-    CGFloat groupW = btn * 3 + gap * 2;
-    CGFloat startX = (self.view.bounds.size.width - groupW) / 2.0;
-    CGFloat btnY   = (kLFAlignmentRowHeight - btn) / 2.0;
-    _alignLeftButton.frame   = CGRectMake(startX,                       btnY, btn, btn);
-    _alignCenterButton.frame = CGRectMake(startX + btn + gap,           btnY, btn, btn);
-    _alignRightButton.frame  = CGRectMake(startX + (btn + gap) * 2,     btnY, btn, btn);
+#pragma mark - Bottom panel show / hide
+
+// iOS 16/26-style customize-sheet animation: the bottom panel slides
+// up from below the screen when the clock is tapped, and slides back
+// down when the user taps anywhere outside it. We tween via
+// -setNeedsLayout + UIView animation so the layout pass handles the
+// frame change, keeping all subview positions correct relative to the
+// panel's current bounds without us having to maintain a transform.
+- (void)setBottomPanelVisible:(BOOL)visible animated:(BOOL)animated {
+    if (_bottomPanelVisible == visible) return;
+    _bottomPanelVisible = visible;
+    [self.view setNeedsLayout];
+    if (animated) {
+        // Spring damping 0.9 / no initial velocity is the same curve
+        // Apple uses for sheet-up/-down on iOS 16, soft and quick.
+        [UIView animateWithDuration:0.32
+                              delay:0
+             usingSpringWithDamping:0.9
+              initialSpringVelocity:0.0
+                            options:UIViewAnimationOptionCurveEaseOut |
+                                    UIViewAnimationOptionAllowUserInteraction
+                         animations:^{
+            [self.view layoutIfNeeded];
+        }
+                         completion:nil];
+    } else {
+        [self.view layoutIfNeeded];
+    }
+}
+
+#pragma mark - Tap recognizers
+
+- (void)installEditorTapRecognizers {
+    // Tap on the clock toggles the customize sheet up/down. Lives on
+    // the clock overlay so it observes touches anywhere inside its
+    // bounds (including the resize handle, where a tap with no drag
+    // doesn't trigger a resize and so falls through here).
+    UITapGestureRecognizer *clockTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onClockTap:)];
+    clockTap.delegate = self;
+    [_clockOverlay addGestureRecognizer:clockTap];
+
+    // Tap anywhere ELSE in the editor view (the dimmer area, in
+    // practice). Default UIKit recognizer-resolution rules pick the
+    // most-specific recognizer, so taps inside _clockOverlay or
+    // _bottomPanel never reach this one -- only true "outside"
+    // taps fire it.
+    UITapGestureRecognizer *outsideTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onOutsideTap:)];
+    outsideTap.delegate = self;
+    [self.view addGestureRecognizer:outsideTap];
+}
+
+// Tap on the clock: bring the customize sheet up if it's down,
+// otherwise hide it again. Same finger affordance as iOS 16's editor
+// where tapping a widget toggles its option sheet.
+- (void)onClockTap:(UITapGestureRecognizer *)tap {
+    [self setBottomPanelVisible:!_bottomPanelVisible animated:YES];
+}
+
+// Tap on the dimmer / empty area:
+//   - if the panel is UP   -> slide it down (one-step retreat)
+//   - if the panel is DOWN -> dismiss the editor (no other close
+//                              affordance is on screen at this point)
+- (void)onOutsideTap:(UITapGestureRecognizer *)tap {
+    if (_bottomPanelVisible) {
+        [self setBottomPanelVisible:NO animated:YES];
+    } else {
+        [self onClose];
+    }
+}
+
+#pragma mark - UIGestureRecognizerDelegate
+
+// Allow our editor-level taps to coexist with the clock's pan
+// recognizer (drag-resize). Without this, the recognizer system
+// might fail one of them prematurely on a fast tap-then-drag.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
 }
 
 #pragma mark - Buttons
@@ -398,8 +416,21 @@ forControlEvents:UIControlEventTouchUpInside];
         // for chrome; the clock itself stays above the dimmer.
         [self.view bringSubviewToFront:_clockOverlay];
         [self.view bringSubviewToFront:_bottomPanel];
-        [self.view bringSubviewToFront:_closeButton];
     }
+
+    // Customize sheet starts HIDDEN -- the editor first reveals just
+    // the clock with its selection rect + resize handle, exactly the
+    // iOS 16/26 entrance state. The user taps the clock to bring up
+    // font / colour / glass options.
+    _bottomPanelVisible = NO;
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+
+    // Editor-level tap recognizers: clock-tap (toggle sheet) and
+    // outside-tap (hide sheet, then dismiss). Installed AFTER the
+    // clock has been re-parented so the recognizer is attached to
+    // the right view instance.
+    [self installEditorTapRecognizers];
 
     _clockOverlay.isEditing = YES;
     [UIView animateWithDuration:0.25 animations:^{
