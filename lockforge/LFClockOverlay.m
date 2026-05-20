@@ -4,45 +4,38 @@
 #import "LFGyroscopeManager.h"
 
 // Reference digit size at scale=1.0. Matches the size Apple uses on a
-// 6.1" device (iPhone 14 etc.) for the default clock; we'll scale it
-// down naturally to whatever screen we're on via Auto-Layout / size
-// fitting, but the reference stays here so settings.scale == 1.0
-// always means "Apple default".
+// 6.1" device (iPhone 14 etc.) for the default clock.
 static const CGFloat kLFClockReferenceFontSize = 84.0;
 
-// Drag-handle visual constants. Matches the iOS 26 pulltab look:
-// 22pt circle, white fill 90%, 1pt grey border, drop shadow.
-static const CGFloat kLFHandleDiameter = 22.0;
+// Drag-handle visual constants. Visible circle is 22pt (matching iOS 26),
+// but the touch target is the full 44pt minimum required by UIKit
+// guidelines so it doesn't feel "missy" under a fingertip.
+static const CGFloat kLFHandleVisibleDiameter = 22.0;
+static const CGFloat kLFHandleTouchDiameter   = 44.0;
 
-@interface LFClockOverlay () {
-    // Keyed weakly into the gyroscope subscriber map so we auto-leave
-    // when this view is dealloc'd.
+@interface LFClockOverlay () <UIGestureRecognizerDelegate> {
     id _gyroSubscriberKey;
+    // Cached natural size after font/scale resolve. The position-pan
+    // and refreshFromSettings both need to know the size; computing
+    // it inside layoutSubviews and again in refresh causes the clock
+    // to jitter mid-drag, so we keep one cached result.
+    CGSize  _naturalSize;
+    BOOL    _isUserDragging;     // bug-1 fix: pause auto-positioning
+    CGFloat _resizeStartScale;   // captured on resize-pan Began
 }
 @property (nonatomic, strong) LFLiquidGlassView *glassBackground;
 @property (nonatomic, strong) UILabel           *timeLabel;
 @property (nonatomic, strong) UILabel           *dateLabel;
 
-// Resize handle (iOS 26). Hidden in normal mode. The user drags this
-// down/right to enlarge the clock; release to keep the size.
-@property (nonatomic, strong) UIView            *resizeHandle;
+// Resize handle: visible 22pt dot, but the actual UIView is 44pt for a
+// generous touch area (and a centered 22pt subview for the visible
+// circle). Standard iOS pattern, used by Apple in Photos / Numbers etc.
+@property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible
+@property (nonatomic, strong) UIView            *resizeHandleVisible; // 22x22 dot inside
 
-// Updates the clock once a second. NSTimer is fine here; we don't
-// need sub-second precision for showing HH:MM, and CADisplayLink
-// would just waste cycles.
 @property (nonatomic, strong) NSTimer           *tickTimer;
-
-// Position drag, separate from resize drag.
 @property (nonatomic, strong) UIPanGestureRecognizer *positionPan;
 @property (nonatomic, strong) UIPanGestureRecognizer *resizePan;
-
-// Live edit-time scale buffer. While the user is dragging the resize
-// handle we mutate this; on release we commit it back to settings.
-// Lets the user see live feedback without saving partial values.
-@property (nonatomic, assign) CGFloat            liveScale;
-
-// Last sampled wallpaper luminance for adaptive color. Cached so
-// quick redraws (font change etc.) don't need a fresh sample.
 @property (nonatomic, strong, nullable) NSNumber *cachedLuminance;
 @end
 
@@ -54,11 +47,14 @@ static const CGFloat kLFHandleDiameter = 22.0;
 
     self.userInteractionEnabled = YES;
     self.backgroundColor        = [UIColor clearColor];
-    _liveScale                  = [LFClockSettings shared].scale;
+    _isUserDragging             = NO;
+    _resizeStartScale           = 1.0;
+    _naturalSize                = CGSizeMake(200, 100); // sane initial
 
     [self buildSubviews];
     [self installGestures];
-    [self refreshFromSettings];
+    [self recomputeMetrics];
+    [self centerInParentApplyingSettings];
     [self startTicker];
     [self subscribeToGyroscope];
 
@@ -92,42 +88,56 @@ static const CGFloat kLFHandleDiameter = 22.0;
     [self buildResizeHandle];
 }
 
+// 44pt invisible touch view containing a centered 22pt visible dot.
+// The invisible parent gets the gesture recognizer; the dot is just
+// for show.
 - (void)buildResizeHandle {
-    _resizeHandle              = [UIView new];
-    _resizeHandle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.92];
-    _resizeHandle.layer.cornerRadius = kLFHandleDiameter / 2.0;
-    _resizeHandle.layer.borderWidth  = 1.0;
-    _resizeHandle.layer.borderColor  = [[UIColor colorWithWhite:0.0 alpha:0.18] CGColor];
-    _resizeHandle.layer.shadowColor  = [[UIColor blackColor] CGColor];
-    _resizeHandle.layer.shadowOpacity = 0.18;
-    _resizeHandle.layer.shadowRadius  = 3;
-    _resizeHandle.layer.shadowOffset  = CGSizeMake(0, 1);
-    _resizeHandle.hidden = YES;
+    _resizeHandle = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
+        kLFHandleTouchDiameter, kLFHandleTouchDiameter)];
+    _resizeHandle.backgroundColor    = [UIColor clearColor];
+    _resizeHandle.userInteractionEnabled = YES;
+    _resizeHandle.hidden             = YES;
     [self addSubview:_resizeHandle];
+
+    CGFloat off = (kLFHandleTouchDiameter - kLFHandleVisibleDiameter) / 2.0;
+    _resizeHandleVisible = [[UIView alloc] initWithFrame:CGRectMake(
+        off, off, kLFHandleVisibleDiameter, kLFHandleVisibleDiameter)];
+    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.92];
+    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleDiameter / 2.0;
+    _resizeHandleVisible.layer.borderWidth  = 1.0;
+    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:0.0 alpha:0.18] CGColor];
+    _resizeHandleVisible.layer.shadowColor  = [[UIColor blackColor] CGColor];
+    _resizeHandleVisible.layer.shadowOpacity = 0.20;
+    _resizeHandleVisible.layer.shadowRadius  = 3;
+    _resizeHandleVisible.layer.shadowOffset  = CGSizeMake(0, 1);
+    _resizeHandleVisible.userInteractionEnabled = NO;
+    [_resizeHandle addSubview:_resizeHandleVisible];
 }
 
 - (void)installGestures {
     _positionPan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(handlePositionPan:)];
+    _positionPan.delegate = self;          // bug-2 fix: simultaneous gestures
+    _positionPan.maximumNumberOfTouches = 1;
     [self addGestureRecognizer:_positionPan];
 
-    _resizePan   = [[UIPanGestureRecognizer alloc]
+    _resizePan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(handleResizePan:)];
+    _resizePan.delegate = self;
+    _resizePan.maximumNumberOfTouches = 1;
     [_resizeHandle addGestureRecognizer:_resizePan];
-    _resizeHandle.userInteractionEnabled = YES;
 
-    // Position pan should lose to resize pan when both could fire on
-    // the handle. Standard pattern: resize requires position to fail.
+    // Position pan should defer to resize pan on the handle.
     [_positionPan requireGestureRecognizerToFail:_resizePan];
 }
 
 - (void)startTicker {
+    __weak __typeof(self) weakSelf = self;
     _tickTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                  repeats:YES
                                                    block:^(NSTimer *_) {
-        [self updateTimeText];
+        [weakSelf updateTimeText];
     }];
-    // Fire immediately so the first frame has correct text.
     [self updateTimeText];
 }
 
@@ -140,16 +150,24 @@ static const CGFloat kLFHandleDiameter = 22.0;
     }];
 }
 
-#pragma mark - Layout
+#pragma mark - Metrics
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
-
+// Computes the natural size based on current font + scale + text and
+// applies it to bounds / sub-frames. Does NOT touch self.center -- that
+// is owned by centerInParentApplyingSettings or the position pan.
+//
+// Why split this out: layoutSubviews fires constantly (any time the
+// parent re-layouts), and if we re-derived the position from settings
+// every time, the user's mid-drag movements would get reverted under
+// them on the very next layout pass. Now layoutSubviews is a no-op
+// for position; only this function (called when settings change)
+// touches it.
+- (void)recomputeMetrics {
     LFClockSettings *s = [LFClockSettings shared];
+
     UIFont *timeFont = [s resolvedFontForReferenceSize:kLFClockReferenceFontSize];
     _timeLabel.font  = timeFont;
 
-    // Date label: smaller, semibold, system rounded for distinction.
     UIFont *dateFont = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     if (@available(iOS 13.0, *)) {
         UIFontDescriptor *d = [dateFont.fontDescriptor
@@ -158,73 +176,94 @@ static const CGFloat kLFHandleDiameter = 22.0;
     }
     _dateLabel.font  = dateFont;
 
-    // Color application -- adaptive uses cached luminance, others
-    // use the literal color.
     UIColor *color = [s resolvedColorForBackgroundLuminance:_cachedLuminance];
     _timeLabel.textColor = color;
     _dateLabel.textColor = [color colorWithAlphaComponent:0.8];
 
-    // Sizing pass: measure the time label first; date sits above it.
-    CGSize timeSize = [_timeLabel.text
+    CGSize timeSize = [(_timeLabel.text ?: @"00:00")
         sizeWithAttributes:@{ NSFontAttributeName: _timeLabel.font }];
-    CGSize dateSize = [_dateLabel.text
+    CGSize dateSize = [(_dateLabel.text ?: @" ")
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
 
-    CGFloat width  = MAX(timeSize.width,  dateSize.width)  + 24; // padding
+    CGFloat width  = MAX(timeSize.width,  dateSize.width)  + 24;
     CGFloat height = timeSize.height + dateSize.height + 12;
+    _naturalSize = CGSizeMake(width, height);
 
     self.bounds = CGRectMake(0, 0, width, height);
-
-    _dateLabel.frame = CGRectMake(0, 0,                       width, dateSize.height);
-    _timeLabel.frame = CGRectMake(0, dateSize.height + 4,      width, timeSize.height);
+    _dateLabel.frame = CGRectMake(0, 0, width, dateSize.height);
+    _timeLabel.frame = CGRectMake(0, dateSize.height + 4, width, timeSize.height);
 
     _glassBackground.frame = self.bounds;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
+    _glassBackground.intensity = s.liquidGlassIntensity;
 
-    // Handle sits at bottom-right, just outside the bounds so it's
-    // clearly grippable. Visible only when editing.
-    _resizeHandle.frame = CGRectMake(width - kLFHandleDiameter * 0.5,
-                                     height - kLFHandleDiameter * 0.5,
-                                     kLFHandleDiameter, kLFHandleDiameter);
+    // Handle is 44x44 invisible, positioned bottom-right with its
+    // CENTER at the bottom-right corner of the clock frame. Visible
+    // dot inside is centered, so it appears half-outside the clock,
+    // matching iOS 26 visually.
+    _resizeHandle.frame = CGRectMake(width  - kLFHandleTouchDiameter / 2.0,
+                                     height - kLFHandleTouchDiameter / 2.0,
+                                     kLFHandleTouchDiameter,
+                                     kLFHandleTouchDiameter);
     _resizeHandle.hidden = !_isEditing;
-}
 
-#pragma mark - Editing
-
-- (void)setIsEditing:(BOOL)e {
-    _isEditing = e;
-    _resizeHandle.hidden = !e;
-    // Subtle dashed border around the clock during editing tells the
-    // user this is the draggable element.
-    if (e) {
-        self.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.35] CGColor];
-        self.layer.borderWidth = 1.0;
-        self.layer.cornerRadius = _glassBackground.glassCornerRadius;
+    if (_isEditing) {
+        self.layer.borderColor   = [[UIColor colorWithWhite:1.0 alpha:0.35] CGColor];
+        self.layer.borderWidth   = 1.0;
+        self.layer.cornerRadius  = _glassBackground.glassCornerRadius;
     } else {
         self.layer.borderColor = nil;
         self.layer.borderWidth = 0.0;
     }
 }
 
-#pragma mark - Refresh
+// Apply the saved position offset to self.center. Called only when
+// (a) the overlay gets attached to a parent, (b) settings change
+// non-positionally, (c) editor opens/closes. Never during a drag.
+- (void)centerInParentApplyingSettings {
+    if (_isUserDragging) return;        // bug-1 fix
+    UIView *parent = self.superview;
+    if (!parent) return;
+
+    LFClockSettings *s = [LFClockSettings shared];
+    CGPoint base = CGPointMake(parent.bounds.size.width / 2.0,
+                               parent.safeAreaInsets.top + _naturalSize.height / 2.0 + 60);
+    self.center = CGPointMake(base.x + s.positionOffset.x,
+                              base.y + s.positionOffset.y);
+}
+
+#pragma mark - Layout
+
+// Slim layoutSubviews -- frames of children are set in recomputeMetrics
+// after font/scale changes. We only get called here on rotation /
+// when bounds change for unrelated reasons. No more constant fight
+// with the user's drag.
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    // intentionally empty -- recomputeMetrics handles our internal frames
+}
+
+- (void)didMoveToSuperview {
+    [super didMoveToSuperview];
+    if (self.superview) {
+        [self centerInParentApplyingSettings];
+    }
+}
+
+#pragma mark - Editing toggle
+
+- (void)setIsEditing:(BOOL)e {
+    if (_isEditing == e) return;
+    _isEditing = e;
+    [self recomputeMetrics];
+}
+
+#pragma mark - Refresh from settings
 
 - (void)refreshFromSettings {
-    LFClockSettings *s = [LFClockSettings shared];
-    _liveScale = s.scale;
-    _glassBackground.intensity = s.liquidGlassIntensity;
     [self updateTimeText];
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
-
-    // Apply stored offset to position so user's last drag-position
-    // sticks across reloads.
-    UIView *parent = self.superview;
-    if (parent) {
-        CGPoint base = CGPointMake(parent.bounds.size.width / 2.0,
-                                   parent.safeAreaInsets.top + self.bounds.size.height / 2.0 + 60);
-        self.center = CGPointMake(base.x + s.positionOffset.x,
-                                  base.y + s.positionOffset.y);
-    }
+    [self recomputeMetrics];
+    [self centerInParentApplyingSettings];
 }
 
 - (void)updateTimeText {
@@ -233,27 +272,28 @@ static const CGFloat kLFHandleDiameter = 22.0;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         timeF = [NSDateFormatter new];
-        timeF.dateFormat = @"H:mm";   // matches Apple iOS 26 default (no zero pad)
+        timeF.dateFormat = @"H:mm";
         dateF = [NSDateFormatter new];
         dateF.dateFormat = @"EEEE, d MMMM";
     });
     NSDate *now = [NSDate date];
-    _timeLabel.text = [timeF stringFromDate:now];
-    _dateLabel.text = [[dateF stringFromDate:now] localizedUppercaseString];
-    [self setNeedsLayout];
+    NSString *t = [timeF stringFromDate:now];
+    NSString *d = [[dateF stringFromDate:now] localizedUppercaseString];
+    BOOL textChanged = (![t isEqualToString:_timeLabel.text] ||
+                        ![d isEqualToString:_dateLabel.text]);
+    _timeLabel.text = t;
+    _dateLabel.text = d;
+    // Only redo metrics if text actually changed shape (e.g. minute
+    // rolled, or HH digit width changed). Otherwise we waste cycles.
+    if (textChanged) [self recomputeMetrics];
 }
 
 - (void)applyAdaptiveColorWithBackgroundImage:(UIImage *)bgImage {
     if (!bgImage) {
         _cachedLuminance = nil;
-        [self setNeedsLayout];
+        [self recomputeMetrics];
         return;
     }
-    // Sample the small region of the wallpaper that sits behind us.
-    // Convert our frame to the bgImage's coordinate space approximately
-    // by assuming bgImage covers the whole screen. We sample a 20x20
-    // region of the bitmap centered on our viewport center -> average
-    // luminance.
     UIWindow *win = self.window;
     if (!win) return;
     CGRect frameInWin = [self convertRect:self.bounds toView:win];
@@ -268,7 +308,6 @@ static const CGFloat kLFHandleDiameter = 22.0;
     CGImageRef cropped = CGImageCreateWithImageInRect(cg, sample);
     if (!cropped) return;
 
-    // Average the pixels by drawing 1x1 and reading. Cheap on A9.
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(1, 1), YES, 1);
     [[[UIImage alloc] initWithCGImage:cropped] drawInRect:CGRectMake(0,0,1,1)];
     UIImage *avg = UIGraphicsGetImageFromCurrentImageContext();
@@ -283,30 +322,51 @@ static const CGFloat kLFHandleDiameter = 22.0;
     CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
 
-    // Rec. 709 luminance.
     CGFloat lum = (0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]) / 255.0;
     _cachedLuminance = @(lum);
-    [self setNeedsLayout];
+    [self recomputeMetrics];
 }
 
-#pragma mark - Gesture handlers
+#pragma mark - UIGestureRecognizerDelegate (bug-2 fix)
+
+// Tell the system that our pans CAN run alongside other recognizers.
+// Without this, the cover-sheet's swipe-to-unlock recognizer would
+// claim the gesture before ours can get the first translation update.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
+}
+
+// Begin our pans only when:
+// - we are in editing mode (otherwise ignore -- swipe-to-unlock wins)
+// - for resize, the touch must actually be on the handle's frame
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    if (!_isEditing) return NO;
+    return YES;
+}
+
+#pragma mark - Position pan
 
 - (void)handlePositionPan:(UIPanGestureRecognizer *)pan {
     if (!_isEditing) return;
     UIView *parent = self.superview;
     if (!parent) return;
 
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        _isUserDragging = YES;
+    }
+
     CGPoint t = [pan translationInView:parent];
     [pan setTranslation:CGPointZero inView:parent];
-
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
 
     if (pan.state == UIGestureRecognizerStateEnded ||
-        pan.state == UIGestureRecognizerStateCancelled) {
-        // Commit offset relative to the default base position.
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+        _isUserDragging = NO;
         CGPoint base = CGPointMake(parent.bounds.size.width / 2.0,
                                    parent.safeAreaInsets.top +
-                                   self.bounds.size.height / 2.0 + 60);
+                                   _naturalSize.height / 2.0 + 60);
         CGPoint offset = CGPointMake(self.center.x - base.x,
                                      self.center.y - base.y);
         [LFClockSettings shared].positionOffset = offset;
@@ -314,31 +374,28 @@ static const CGFloat kLFHandleDiameter = 22.0;
     }
 }
 
-// Drag down/right -> bigger; drag up/left -> smaller. Matches iOS 26
-// behaviour exactly (both axes contribute, dominant one wins).
+#pragma mark - Resize pan
+
 - (void)handleResizePan:(UIPanGestureRecognizer *)pan {
     if (!_isEditing) return;
-    CGPoint t = [pan translationInView:self];
 
-    // Sensitivity: 200pt of drag covers the full 0.6 -> 2.8 range.
-    // Combine the two axes into one scalar; vertical dominates because
-    // the iOS 26 hint is "drag down to grow".
-    CGFloat delta = (t.y * 0.7 + t.x * 0.3) / 200.0 * (2.8 - 0.6);
-
-    // Apply to the live buffer; commit on release.
-    static CGFloat startScale = 1.0;
     if (pan.state == UIGestureRecognizerStateBegan) {
-        startScale = _liveScale;
+        _isUserDragging   = YES;
+        _resizeStartScale = [LFClockSettings shared].scale;
     }
-    CGFloat newScale = MAX(0.6, MIN(2.8, startScale + delta));
-    _liveScale = newScale;
+
+    CGPoint t = [pan translationInView:self];
+    // Combine axes; vertical dominates per iOS 26 behaviour.
+    CGFloat delta = (t.y * 0.7 + t.x * 0.3) / 200.0 * (2.8 - 0.6);
+    CGFloat newScale = MAX(0.6, MIN(2.8, _resizeStartScale + delta));
     [LFClockSettings shared].scale = newScale;
 
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
+    [self recomputeMetrics];
 
     if (pan.state == UIGestureRecognizerStateEnded ||
-        pan.state == UIGestureRecognizerStateCancelled) {
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+        _isUserDragging = NO;
         [[LFClockSettings shared] save];
     }
 }

@@ -31,7 +31,18 @@ static __weak UIView          *gCoverSheetView;
 static LFClockOverlay         *gClockOverlay;
 static LFLockEditor           *gEditor;
 static UILongPressGestureRecognizer *gLongPress;
-static BOOL                    gSystemDateHidden = NO;
+
+// Tracks whether we've already done the (heavy-ish) install pass for
+// the current cover-sheet view. We flip it to NO when the cover sheet
+// remounts. Using this guard, layoutSubviews becomes essentially a
+// no-op after the first install -- we don't keep re-creating overlays
+// or hide-walking the entire view tree dozens of times per second.
+static BOOL                    gInstalledForCurrentMount = NO;
+
+// Adaptive-color sampling is comparatively expensive (drawViewHierarchy
+// + 1x1 pixel read). Throttle to once every 3 seconds; the wallpaper
+// doesn't change faster than that for our purposes.
+static CFTimeInterval          gLastAdaptiveSample = 0;
 
 // =====================================================================
 // Forward decls of private classes we hook.
@@ -58,7 +69,6 @@ static void LFHideSystemDateViewsIn(UIView *root) {
                 [cls containsString:@"LSLockTimeView"]      ||
                 [cls containsString:@"DateView"]            ||
                 [cls containsString:@"_MTLumaDeterminationImageView"])) {
-        // Tag check: don't hide our own LFClockOverlay subviews.
         if (![root isKindOfClass:[LFClockOverlay class]] &&
              root.tag != 0xC10C) {
             root.hidden = YES;
@@ -88,13 +98,16 @@ static void LFInstallClockIntoCoverSheet(UIView *coverSheetView) {
 }
 
 // Reads the current cover-sheet wallpaper as a UIImage so the clock can
-// adapt its color. We use UIView -drawViewHierarchyInRect: on a small
-// canvas (1/4 native size) -- reasonably cheap, runs on a timer once
-// every few seconds, only when needed.
+// adapt its color. Throttled (gLastAdaptiveSample) so it doesn't fire
+// every layout pass; expensive on A9.
 static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
     if (!gClockOverlay) return;
     if ([LFClockSettings shared].colorMode != LFClockColorAdaptive) return;
     if (!coverSheetView.window) return;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - gLastAdaptiveSample < 3.0) return;
+    gLastAdaptiveSample = now;
 
     CGSize size = CGSizeMake(coverSheetView.bounds.size.width / 4.0,
                              coverSheetView.bounds.size.height / 4.0);
@@ -109,43 +122,43 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
 }
 
 // =====================================================================
-// Long-press gesture -> editor.
+// Long-press gesture target / editor lifecycle
 // =====================================================================
 
-@interface LFGestureTarget : NSObject
+@interface LFGestureTarget : NSObject <LFLockEditorDelegate>
 + (instancetype)shared;
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g;
 @end
 
 @implementation LFGestureTarget
+
 + (instancetype)shared {
     static LFGestureTarget *t;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ t = [LFGestureTarget new]; });
     return t;
 }
+
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    if (gEditor) return;       // already showing
-    if (!gClockOverlay)  return;
+    if (gEditor) return;       // an editor is currently on screen
+    if (!gClockOverlay) return;
     UIWindow *win = gCoverSheetView.window;
     if (!win) return;
 
     gEditor = [[LFLockEditor alloc] initWithClockOverlay:gClockOverlay];
+    gEditor.delegate = self;          // bug-1 fix: get notified on dismiss
     [gEditor presentInWindow:win];
-
-    // Auto-clear our reference when the editor's view is gone, so
-    // next long-press creates a fresh one.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:UIWindowDidBecomeHiddenNotification
-                        object:nil
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *n) {
-            if (!gEditor.view.superview) gEditor = nil;
-        }];
-    });
 }
+
+// Editor finished animating out -- we're free to start a new one on
+// the next long-press.
+- (void)lockEditorDidDismiss:(LFLockEditor *)editor {
+    if (gEditor == editor) {
+        gEditor = nil;
+    }
+}
+
 @end
 
 // =====================================================================
@@ -156,30 +169,46 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
 
 - (void)didMoveToWindow {
     %orig;
-    if (self.window == nil) return;
+    if (self.window == nil) {
+        // Cover sheet was removed -- forget our install so the next
+        // mount re-attaches a fresh overlay rather than dangling.
+        gInstalledForCurrentMount = NO;
+        return;
+    }
     gCoverSheetView = self;
     LFHideSystemDateViewsIn(self);
     LFInstallClockIntoCoverSheet(self);
+    gInstalledForCurrentMount = YES;
 
     // Long-press recognizer: 0.6s minimum -- matches iOS 16/26's
-    // "long press to customize" feel. Fail-on-touch-move is YES so
-    // a normal swipe-to-unlock still works.
+    // "long press to customize" feel. cancelsTouchesInView=NO so a
+    // normal swipe-to-unlock still works, and minimumPressDuration is
+    // safely longer than swipe-trigger so they don't interfere.
     if (!gLongPress) {
         gLongPress = [[UILongPressGestureRecognizer alloc]
             initWithTarget:[LFGestureTarget shared]
                     action:@selector(handleLongPress:)];
         gLongPress.minimumPressDuration = 0.6;
         gLongPress.allowableMovement    = 12;
-        gLongPress.cancelsTouchesInView = NO; // let other gestures through
+        gLongPress.cancelsTouchesInView = NO;
         [self addGestureRecognizer:gLongPress];
     }
 }
 
 - (void)layoutSubviews {
     %orig;
-    LFHideSystemDateViewsIn(self);
-    LFInstallClockIntoCoverSheet(self);
-    LFRefreshAdaptiveColor(self);
+    // Cheap path: only reinstall if we lost our overlay. Repeated
+    // layoutSubviews fire dozens of times per second and the previous
+    // version did unconditional install + adaptive sample on each
+    // call, which murdered scroll perf and (worse) competed with
+    // the user's drag gesture.
+    if (!gInstalledForCurrentMount ||
+        gClockOverlay.superview != self) {
+        LFHideSystemDateViewsIn(self);
+        LFInstallClockIntoCoverSheet(self);
+        gInstalledForCurrentMount = YES;
+    }
+    LFRefreshAdaptiveColor(self);   // throttled to 3s internally
 }
 
 %end

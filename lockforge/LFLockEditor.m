@@ -237,10 +237,19 @@ static const CGFloat kLFEditorTopBarHeight = 64;
 
 - (void)dismissEditor {
     _clockOverlay.isEditing = NO;
+    __weak __typeof(self) weakSelf = self;
     [UIView animateWithDuration:0.25 animations:^{
         self.view.alpha = 0;
     } completion:^(BOOL ok) {
-        [self.view removeFromSuperview];
+        __strong __typeof(weakSelf) self_ = weakSelf;
+        if (!self_) return;
+        [self_.view removeFromSuperview];
+        // Tell the tweak's gesture handler we're gone so the next
+        // long-press spawns a fresh editor (bug-1 fix).
+        id<LFLockEditorDelegate> d = self_.delegate;
+        if ([d respondsToSelector:@selector(lockEditorDidDismiss:)]) {
+            [d lockEditorDidDismiss:self_];
+        }
     }];
 }
 
