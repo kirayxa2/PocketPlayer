@@ -33,10 +33,20 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @class LFClockOverlay;
+@class LFLockEditor;
+
+// Notifies the tweak's gesture handler when the editor goes away,
+// so the next long-press can spawn a fresh editor. Without this the
+// handler caches `gEditor` forever and ignores subsequent long-presses.
+@protocol LFLockEditorDelegate <NSObject>
+- (void)lockEditorDidDismiss:(LFLockEditor *)editor;
+@end
 
 @interface LFLockEditor : UIViewController
 
 - (instancetype)initWithClockOverlay:(LFClockOverlay *)clockOverlay;
+
+@property (nonatomic, weak) id<LFLockEditorDelegate> delegate;
 
 // Present the editor inside the cover-sheet window. Adds a full-screen
 // dimming layer above the original wallpaper so the editor UI reads.
