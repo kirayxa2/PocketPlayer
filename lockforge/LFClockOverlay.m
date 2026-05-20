@@ -240,27 +240,8 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _timeLabel.textColor = color;
     _dateLabel.textColor = [color colorWithAlphaComponent:0.85];
 
-    CGSize timeSize = [(_timeLabel.text ?: @"00:00")
-        sizeWithAttributes:@{ NSFontAttributeName: _timeLabel.font }];
     CGSize dateSize = [(_dateLabel.text ?: @" ")
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
-
-    // iOS 16/26 lock screen clock resize is VERTICAL ONLY: the user
-    // drags the resize handle DOWN to grow the digits, and dragging
-    // up never compresses below the natural size (i.e. min vStretch
-    // is 1.0, NOT 0.6). The horizontal stretch setting still exists
-    // in the plist (so old saves don't break) but is forced to 1.0
-    // here -- the editor no longer exposes a way to change it, and
-    // a stale value from an older build would otherwise make the
-    // digits look mis-proportioned.
-    //
-    // Drag DOWN -> verticalStretch grows 1.0 -> 5.0 (digits get tall
-    //              and fill most of the screen on a 6s)
-    // Drag UP   -> verticalStretch already at 1.0 stays at 1.0
-    //              (the handle simply doesn't react further up)
-    CGFloat hStretch = 1.0;
-    CGFloat vStretch = MAX(1.0, MIN(5.0, s.verticalStretch));
-    CGFloat stretchedTimeHeight = timeSize.height * vStretch;
 
     // Date pill geometry: text size + symmetric padding, rounded
     // ends. Pill is wider than the date text by 2 * kLFDatePillHPad.
@@ -269,18 +250,63 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 
     // FULL-WIDTH iOS 16/26-style selection rectangle. The clock
     // overlay's WIDTH is the screen width minus a small bezel inset
-    // -- NOT the natural width of the time text. Apple lays the
-    // clock area out edge-to-edge so the user can left- /
-    // center- / right-align the digits inside the same wide
-    // selection box. Using natural-text-width (the previous
-    // behaviour) made the box look "tiny and centered" on the 6s
-    // even when there was plenty of room left and right.
+    // -- NOT the natural width of the time text.
     UIView *parentForWidth = self.superview;
     CGFloat parentW = parentForWidth ? parentForWidth.bounds.size.width : 393.0;
     CGFloat width   = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);  // never narrower than the date pill
-    CGFloat height  = datePillH + kLFDatePillToTimeGap + stretchedTimeHeight + 12;
-    _naturalSize = CGSizeMake(width, height);
+
+    // === Auto-fit digit width to the selection rectangle ===
+    //
+    // iOS 16/26 lock screen clock resize is VERTICAL ONLY: the user
+    // drags the resize handle DOWN to grow the digits, and dragging
+    // up never compresses below the minimum (clamped at 1.0).
+    //
+    // Earlier builds rendered the digits at a fixed reference font
+    // size and then applied a CGAffineTransform along Y to "stretch"
+    // them taller. That produced two visual bugs the user pointed
+    // out: (1) the digit cluster was always narrow inside a wide
+    // selection rect, leaving big empty bands left and right; and
+    // (2) stretched glyphs looked anti-aliased / smeared because
+    // the rasteriser ran at the small reference size and then the
+    // bitmap was scaled up.
+    //
+    // New approach: change the FONT POINT SIZE itself based on
+    // `verticalStretch`. We pick a target digit-cluster width that
+    // is `width - 2*sidePad`, where `sidePad` LERPs between a
+    // comfortable inset at the minimum and an almost-flush fit at
+    // the maximum. Then we compute the font size that makes
+    // "00:00" naturally render at exactly that target width. Width
+    // AND height grow uniformly because the font itself is bigger,
+    // and the rasteriser draws crisp pixels at every size.
+    //
+    //   verticalStretch = 1.0  -> digit cluster fills (width - 32pt)
+    //   verticalStretch = 3.5  -> digit cluster fills (width -  8pt)
+    CGFloat vStretch    = MAX(1.0, MIN(3.5, s.verticalStretch));
+    CGFloat normStretch = (vStretch - 1.0) / (3.5 - 1.0);   // 0..1
+    if (normStretch < 0.0) normStretch = 0.0;
+    if (normStretch > 1.0) normStretch = 1.0;
+    CGFloat sidePadAtMin = 16.0;
+    CGFloat sidePadAtMax =  4.0;
+    CGFloat sidePad      = sidePadAtMin + (sidePadAtMax - sidePadAtMin) * normStretch;
+    CGFloat targetTextW  = MAX(80.0, width - 2.0 * sidePad);
+
+    // SF Pro / SF Rounded glyphs at the same weight advance linearly
+    // with point size, so one measurement at the reference size is
+    // enough -- multiply by the width ratio and that's our target.
+    NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
+    UIFont   *refFont   = [s resolvedFontForReferenceSize:kLFClockReferenceFontSize];
+    CGFloat   refTextW  = [probeText sizeWithAttributes:@{ NSFontAttributeName: refFont }].width;
+    if (refTextW < 1.0) refTextW = 1.0;
+    CGFloat   fontPoints = MAX(20.0, kLFClockReferenceFontSize * (targetTextW / refTextW));
+
+    UIFont *timeFont = [s resolvedFontForReferenceSize:fontPoints];
+    _timeLabel.font  = timeFont;
+
+    CGSize timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
+
+    CGFloat height = datePillH + kLFDatePillToTimeGap + ceil(timeSize.height) + 12;
+    _naturalSize   = CGSizeMake(width, height);
 
     // Apply alignment to the labels' textAlignment so date and time
     // glue to the same edge. Then anchor the time label's layer at
@@ -316,14 +342,17 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     // anchored in place. Anchoring at center-Y (the previous version)
     // caused the digits to grow both upward and downward, which made
     // the date pill appear to shift up when the user resized.
+    // No CGAffineTransform stretch -- the font itself was sized to
+    // match targetTextW, so the digits already render at the right
+    // width AND height (uniformly, with crisp glyphs at every step).
+    // We still set the layer's anchorPoint to the text-aligned edge
+    // so that any future transform-based effect would pivot from the
+    // correct edge, but no transform is applied here.
     _timeLabel.transform = CGAffineTransformIdentity;
     CGFloat timeY = datePillH + kLFDatePillToTimeGap;
-    _timeLabel.frame = CGRectMake(0, timeY, width, timeSize.height);
+    _timeLabel.frame = CGRectMake(0, timeY, width, ceil(timeSize.height));
     _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
     _timeLabel.layer.position    = CGPointMake(ax * width, timeY);
-    if (fabs(hStretch - 1.0) > 0.001 || fabs(vStretch - 1.0) > 0.001) {
-        _timeLabel.transform = CGAffineTransformMakeScale(hStretch, vStretch);
-    }
 
     _glassBackground.frame = self.bounds;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
@@ -589,20 +618,22 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     // iOS 16/26 lock screen clock resize is VERTICAL ONLY. We map
     // vertical translation to verticalStretch directly:
     //
-    //   drag DOWN by N pt   -> vStretch += N / 350 * (5.0 - 1.0)
-    //   drag UP   by N pt   -> vStretch -= N / 350 * (5.0 - 1.0)
+    //   drag DOWN by N pt   -> vStretch += N / 350 * (3.5 - 1.0)
+    //   drag UP   by N pt   -> vStretch -= N / 350 * (3.5 - 1.0)
     //
-    // The result is then CLAMPED at 1.0 on the low end and 5.0 on the
+    // The result is then CLAMPED at 1.0 on the low end and 3.5 on the
     // high end. The clamp at 1.0 is what makes "you can only resize
     // DOWN" correct: dragging up while already at the natural size
     // simply does nothing -- the digits never compress below default.
     //
-    // Divisor 350 keeps the same finger-feel as before: ~350pt of
-    // vertical drag traverses min<->max, which is the full available
-    // swipe height on a 6s.
-    CGFloat range       = 5.0 - 1.0;
+    // The 3.5 cap is the largest stretch where the auto-fit font
+    // calculation in -recomputeMetrics still leaves the digits
+    // inside the screen on the smallest supported device (iPhone 6s,
+    // 375pt wide). Going higher made glyphs clip the left/right
+    // bezels.
+    CGFloat range       = 3.5 - 1.0;
     CGFloat delta       = t.y / 350.0 * range;
-    CGFloat newVStretch = MAX(1.0, MIN(5.0, _resizeStartVStretch + delta));
+    CGFloat newVStretch = MAX(1.0, MIN(3.5, _resizeStartVStretch + delta));
 
     BOOL changed = NO;
     if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {

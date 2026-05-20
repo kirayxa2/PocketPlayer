@@ -87,16 +87,18 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 // fully horizontal stretch reach the screen edges on iPhone.
 @property (nonatomic, assign) CGFloat horizontalStretch;
 
-// Vertical stretch factor. 1.0 == natural height, >1.0 == taller
-// digits, <1.0 == shorter. Sister of horizontalStretch -- dragging
-// the handle DOWN stretches digits along Y only, without touching
-// width. The two stretches are independent: the user can have tall
-// thin digits, short wide digits, anything in between. Range
-// extends up to 5.0x so a vertical drag can really grow digits
-// large -- on iPhone 6s reference font is ~84pt, so 5x lands at
-// ~420pt, which fills most of the screen. Applied via the same
-// CGAffineTransform on the time label as horizontalStretch.
-// Clamped to [0.6, 5.0].
+// Vertical stretch factor. 1.0 == minimum size (digits inside the
+// selection rect with a comfortable side padding), 3.5 == maximum
+// (digits almost flush with the left and right edges, much taller
+// because the FONT POINT SIZE itself scales -- not a CGAffineTransform
+// any more). The clock overlay reads this value and computes the
+// font size that makes "00:00" naturally render at the target width
+// for the current stretch, so digits scale uniformly width AND
+// height. Drag DOWN on the resize handle increases this; drag UP
+// at 1.0 does nothing (clamp).
+//
+// Clamped to [1.0, 3.5]. Old plists with values outside this range
+// are migrated up/down at load time.
 @property (nonatomic, assign) CGFloat verticalStretch;
 
 // Horizontal alignment of the clock contents (time digits + date

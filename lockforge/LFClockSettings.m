@@ -140,11 +140,10 @@ static NSString *const kLFSettingsPath =
     } else if (d[@"scale"] && fabs(_scale - 1.0) > 0.01) {
         // Legacy plist from a build where Y-axis drag wrote `scale`
         // (uniform font-size multiplier). Now Y-axis writes
-        // `verticalStretch` (CGAffineTransform along Y, no width
-        // change). Migrate: copy the user's saved size onto the
-        // axis where it now lives, then reset scale so it doesn't
-        // double-multiply on top of the new transform-based stretch.
-        _verticalStretch = MAX(1.0, MIN(5.0, _scale));
+        // `verticalStretch`. Migrate: copy the user's saved size
+        // onto the axis where it now lives, then reset scale so
+        // it doesn't double-multiply.
+        _verticalStretch = MAX(1.0, MIN(3.5, _scale));
         _scale           = 1.0;
     }
     // iOS 16/26 lock screen clock cannot be horizontally resized; the
@@ -156,13 +155,22 @@ static NSString *const kLFSettingsPath =
     if (fabs(_horizontalStretch - 1.0) > 0.001) {
         _horizontalStretch = 1.0;
     }
-    // Same for verticalStretch: the new minimum is 1.0 (no
-    // compression below natural size). An older plist with a
-    // sub-1.0 value would otherwise be displayed as 1.0 (clamp in
-    // recomputeMetrics) but written back unchanged, producing a
-    // permanently-stale plist. Snap it now.
+    // Clamp verticalStretch into the current valid range [1.0, 3.5].
+    // The minimum 1.0 enforces "you can only resize DOWN" -- there
+    // is no compression below natural size. The maximum 3.5 is the
+    // largest stretch where the auto-fit font calculation still
+    // leaves the digits inside the screen on a 6s. Older plists
+    // (from a build where max was 5.0) are scaled down so the user
+    // sees proportionally similar size on the new build.
     if (_verticalStretch < 1.0) {
         _verticalStretch = 1.0;
+    } else if (_verticalStretch > 3.5) {
+        // Map [3.5, 5.0] onto the new [3.0, 3.5] band so a user who
+        // had previously dragged "almost to the max" still feels
+        // like they're near the max here. Clamp to 3.5 either way.
+        CGFloat t = (_verticalStretch - 3.5) / (5.0 - 3.5);  // 0..1
+        if (t > 1.0) t = 1.0;
+        _verticalStretch = 3.0 + 0.5 * t;
     }
     if (d[@"alignment"])            _alignment            = (LFClockAlignment)[d[@"alignment"] integerValue];
     if (d[@"positionOffsetX"] && d[@"positionOffsetY"]) {
