@@ -26,6 +26,20 @@ typedef NS_ENUM(NSInteger, LFClockFont) {
     LFClockFontCount,               // sentinel
 };
 
+// Horizontal alignment of the clock content (time + date) within the
+// overlay. Drives both -textAlignment on the labels and the layer
+// anchor point for transform-based stretch, so dragging the resize
+// handle scales OUTWARD from the chosen edge:
+//   Left  -> scaling pivots on the left edge   (digits grow rightward)
+//   Center-> scaling pivots on the centre      (digits grow both sides)
+//   Right -> scaling pivots on the right edge  (digits grow leftward)
+typedef NS_ENUM(NSInteger, LFClockAlignment) {
+    LFClockAlignmentLeft   = 0,
+    LFClockAlignmentCenter = 1,
+    LFClockAlignmentRight  = 2,
+    LFClockAlignmentCount,
+};
+
 // Color choices: 6 presets + custom (UIColor stored as RGBA in plist).
 // `Adaptive` reads the wallpaper luminance under the clock and picks
 // white or black for legibility (iOS 26 "adaptive time").
@@ -69,7 +83,8 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 // only without changing the font's vertical size. Applied via a
 // CGAffineTransform on the time label after recomputeMetrics, so
 // it is independent of the font's intrinsic point size. Clamped
-// to [0.6, 1.6].
+// to [0.6, 2.5] -- 2.5x covers most practical needs and makes a
+// fully horizontal stretch reach the screen edges on iPhone.
 @property (nonatomic, assign) CGFloat horizontalStretch;
 
 // Vertical stretch factor. 1.0 == natural height, >1.0 == taller
@@ -77,12 +92,17 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 // the handle DOWN stretches digits along Y only, without touching
 // width. The two stretches are independent: the user can have tall
 // thin digits, short wide digits, anything in between. Range
-// extends up to 2.8x so a vertical drag can grow digits to roughly
-// half-screen (matches what `scale` used to do, but cleanly per
-// axis instead of scaling both at once). Applied via the same
+// extends up to 5.0x so a vertical drag can really grow digits
+// large -- on iPhone 6s reference font is ~84pt, so 5x lands at
+// ~420pt, which fills most of the screen. Applied via the same
 // CGAffineTransform on the time label as horizontalStretch.
-// Clamped to [0.6, 2.8].
+// Clamped to [0.6, 5.0].
 @property (nonatomic, assign) CGFloat verticalStretch;
+
+// Horizontal alignment of the clock contents (time digits + date
+// label). Set by the editor's three small icon buttons (left, centre,
+// right). Default Center.
+@property (nonatomic, assign) LFClockAlignment alignment;
 
 // Explicit position offset for the clock, in points relative to the
 // default centered-top position. Editor lets user drag clock around;

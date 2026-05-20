@@ -31,11 +31,13 @@
 // Layout constants for the editor's bottom panel. Picked to match iOS
 // 26's customize sheet density: 60pt-tall font row, 44pt color dot
 // row, 36pt slider row, 12pt vertical padding.
-static const CGFloat kLFFontRowHeight   = 64;
-static const CGFloat kLFColorRowHeight  = 48;
-static const CGFloat kLFSliderRowHeight = 40;
+static const CGFloat kLFFontRowHeight      = 64;
+static const CGFloat kLFColorRowHeight     = 48;
+static const CGFloat kLFSliderRowHeight    = 40;
+static const CGFloat kLFAlignmentRowHeight = 44;  // small icon row, centered
 static const CGFloat kLFEditorBottomPanelHeight =
-    kLFFontRowHeight + kLFColorRowHeight + kLFSliderRowHeight + 24 + 80; // + safeArea
+    kLFFontRowHeight + kLFColorRowHeight + kLFSliderRowHeight +
+    kLFAlignmentRowHeight + 24 + 80; // + safeArea
 // Top toolbar height (Cancel / Done).
 static const CGFloat kLFEditorTopBarHeight = 64;
 
@@ -52,6 +54,12 @@ static const CGFloat kLFEditorTopBarHeight = 64;
 @property (nonatomic, strong) UICollectionView    *colorPickerRow;
 @property (nonatomic, strong) UISlider            *glassSlider;
 @property (nonatomic, strong) UILabel             *glassLabel;
+// Alignment row -- three small icon buttons (left / center / right),
+// horizontally centered in the bottom panel. Maps to LFClockAlignment.
+@property (nonatomic, strong) UIView              *alignmentRow;
+@property (nonatomic, strong) UIButton            *alignLeftButton;
+@property (nonatomic, strong) UIButton            *alignCenterButton;
+@property (nonatomic, strong) UIButton            *alignRightButton;
 // Snapshot of settings at the moment the editor opened. Used to
 // revert if the user taps Cancel.
 @property (nonatomic, strong) NSDictionary        *initialSnapshot;
@@ -95,6 +103,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
         @"scale":                @(s.scale),
         @"horizontalStretch":    @(s.horizontalStretch),
         @"verticalStretch":      @(s.verticalStretch),
+        @"alignment":            @(s.alignment),
         @"positionOffsetX":      @(s.positionOffset.x),
         @"positionOffsetY":      @(s.positionOffset.y),
         @"liquidGlassIntensity": @(s.liquidGlassIntensity),
@@ -109,6 +118,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     s.scale                = [_initialSnapshot[@"scale"] doubleValue];
     s.horizontalStretch    = [_initialSnapshot[@"horizontalStretch"] doubleValue];
     s.verticalStretch      = [_initialSnapshot[@"verticalStretch"] doubleValue];
+    s.alignment            = (LFClockAlignment)[_initialSnapshot[@"alignment"] integerValue];
     s.positionOffset       = CGPointMake([_initialSnapshot[@"positionOffsetX"] doubleValue],
                                          [_initialSnapshot[@"positionOffsetY"] doubleValue]);
     s.liquidGlassIntensity = [_initialSnapshot[@"liquidGlassIntensity"] integerValue];
@@ -178,6 +188,78 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     [self buildFontRow];
     [self buildColorRow];
     [self buildGlassSlider];
+    [self buildAlignmentRow];
+}
+
+// Three small icon-only buttons arranged horizontally and centered in
+// the bottom panel. Each is 36x36 with an SF Symbol (left/center/right
+// alignment). The currently chosen one gets a subtle white border;
+// the rest are neutral. Tapping flips LFClockSettings.alignment and
+// triggers a live re-layout of the clock.
+- (void)buildAlignmentRow {
+    _alignmentRow = [UIView new];
+    _alignmentRow.backgroundColor = [UIColor clearColor];
+    [_bottomPanel addSubview:_alignmentRow];
+
+    _alignLeftButton   = [self makeAlignmentButtonWithSymbol:@"text.alignleft"
+                                                         tag:LFClockAlignmentLeft];
+    _alignCenterButton = [self makeAlignmentButtonWithSymbol:@"text.aligncenter"
+                                                         tag:LFClockAlignmentCenter];
+    _alignRightButton  = [self makeAlignmentButtonWithSymbol:@"text.alignright"
+                                                         tag:LFClockAlignmentRight];
+    [_alignmentRow addSubview:_alignLeftButton];
+    [_alignmentRow addSubview:_alignCenterButton];
+    [_alignmentRow addSubview:_alignRightButton];
+    [self refreshAlignmentSelection];
+}
+
+- (UIButton *)makeAlignmentButtonWithSymbol:(NSString *)symbol tag:(NSInteger)tag {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.tag = tag;
+    b.tintColor = [UIColor whiteColor];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+            configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
+        UIImage *img = [UIImage systemImageNamed:symbol withConfiguration:cfg];
+        [b setImage:img forState:UIControlStateNormal];
+    } else {
+        // Fallback labels on the slim chance someone runs this on a
+        // pre-iOS-13 build, which Dopamine doesn't actually support.
+        NSString *txt = (tag == LFClockAlignmentLeft) ? @"L"
+                      : (tag == LFClockAlignmentRight) ? @"R" : @"C";
+        [b setTitle:txt forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    }
+    b.layer.cornerRadius = 10;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor];
+    [b addTarget:self
+          action:@selector(onAlignmentTap:)
+forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)refreshAlignmentSelection {
+    LFClockAlignment a = [LFClockSettings shared].alignment;
+    UIButton *all[3] = { _alignLeftButton, _alignCenterButton, _alignRightButton };
+    for (NSInteger i = 0; i < 3; i++) {
+        BOOL on = (i == (NSInteger)a);
+        all[i].layer.borderColor =
+            (on ? [[UIColor whiteColor] CGColor]
+                : [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor]);
+        all[i].layer.borderWidth = on ? 2.0 : 1.0;
+        all[i].backgroundColor = on
+            ? [UIColor colorWithWhite:1.0 alpha:0.10]
+            : [UIColor clearColor];
+    }
+}
+
+- (void)onAlignmentTap:(UIButton *)b {
+    LFClockAlignment a = (LFClockAlignment)b.tag;
+    if ([LFClockSettings shared].alignment == a) return;
+    [LFClockSettings shared].alignment = a;
+    [_clockOverlay refreshFromSettings];
+    [self refreshAlignmentSelection];
 }
 
 - (void)buildFontRow {
@@ -262,12 +344,29 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     y += kLFColorRowHeight;
     _glassLabel.frame = CGRectMake(16, y + 6, 60, 24);
     _glassSlider.frame = CGRectMake(76, y + 4, self.view.bounds.size.width - 92, 28);
+    y += kLFSliderRowHeight;
+
+    // Alignment row: three small 36pt buttons centred horizontally
+    // inside the panel with 12pt spacing between them.
+    _alignmentRow.frame = CGRectMake(0, y, self.view.bounds.size.width,
+                                     kLFAlignmentRowHeight);
+    const CGFloat btn = 36, gap = 12;
+    CGFloat groupW = btn * 3 + gap * 2;
+    CGFloat startX = (self.view.bounds.size.width - groupW) / 2.0;
+    CGFloat btnY   = (kLFAlignmentRowHeight - btn) / 2.0;
+    _alignLeftButton.frame   = CGRectMake(startX,                       btnY, btn, btn);
+    _alignCenterButton.frame = CGRectMake(startX + btn + gap,           btnY, btn, btn);
+    _alignRightButton.frame  = CGRectMake(startX + (btn + gap) * 2,     btnY, btn, btn);
 }
 
 #pragma mark - Buttons
 
 - (void)onCancel {
     [self restoreFromSnapshot];
+    [self refreshAlignmentSelection];
+    [_fontPickerRow reloadData];
+    [_colorPickerRow reloadData];
+    _glassSlider.value = (float)[LFClockSettings shared].liquidGlassIntensity;
     [self dismissEditor];
 }
 

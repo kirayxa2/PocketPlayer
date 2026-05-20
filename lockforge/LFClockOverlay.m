@@ -212,12 +212,12 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     // exactly how Apple does it: rasterise at native size, then
     // bitmap-stretch in either direction.
     //
-    // Drag DOWN  -> verticalStretch goes 1.0 -> 2.8  (digits get tall)
+    // Drag DOWN  -> verticalStretch goes 1.0 -> 5.0  (digits get tall, lots of room)
     // Drag UP    -> verticalStretch goes 1.0 -> 0.6  (digits get short)
-    // Drag RIGHT -> horizontalStretch        1.0 -> 1.6  (digits get wide)
+    // Drag RIGHT -> horizontalStretch        1.0 -> 2.5  (digits get really wide)
     // Drag LEFT  -> horizontalStretch        1.0 -> 0.6  (digits get narrow)
-    CGFloat hStretch = MAX(0.6, MIN(1.6, s.horizontalStretch));
-    CGFloat vStretch = MAX(0.6, MIN(2.8, s.verticalStretch));
+    CGFloat hStretch = MAX(0.6, MIN(2.5, s.horizontalStretch));
+    CGFloat vStretch = MAX(0.6, MIN(5.0, s.verticalStretch));
     CGFloat stretchedTimeWidth  = timeSize.width  * hStretch;
     CGFloat stretchedTimeHeight = timeSize.height * vStretch;
 
@@ -225,26 +225,38 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     CGFloat height = stretchedTimeHeight + dateSize.height + 12;
     _naturalSize = CGSizeMake(width, height);
 
+    // Apply alignment to the labels' textAlignment so date and time
+    // glue to the same edge. Then anchor the time label's layer at
+    // that edge so the CGAffineTransform stretch grows OUT of the
+    // anchored side instead of from the centre. This is exactly
+    // what iOS 26 does -- the digit cluster's edge stays put while
+    // the rest of the digits expand outward.
+    NSTextAlignment ta = NSTextAlignmentCenter;
+    CGFloat        ax = 0.5;
+    if (s.alignment == LFClockAlignmentLeft)  { ta = NSTextAlignmentLeft;  ax = 0.0; }
+    if (s.alignment == LFClockAlignmentRight) { ta = NSTextAlignmentRight; ax = 1.0; }
+    _timeLabel.textAlignment = ta;
+    _dateLabel.textAlignment = ta;
+
     self.bounds = CGRectMake(0, 0, width, height);
     _dateLabel.frame = CGRectMake(0, 0, width, dateSize.height);
-    // The time label keeps its NATURAL (unstretched) frame and we
-    // apply both axes' scale via a single CGAffineTransform. This
-    // lets UIKit size the glyphs at their true point size and then
-    // stretch the rasterised bitmap independently along X and Y --
-    // exactly how Apple does it on iOS 26 (cheap and looks correct).
+
+    // The time label spans the full overlay width and uses
+    // textAlignment to glue glyphs to the chosen edge. We then apply
+    // both axes' stretch via a single CGAffineTransform, around the
+    // matching anchor point so the stretch pivots on that edge.
     _timeLabel.transform = CGAffineTransformIdentity;
-    _timeLabel.frame = CGRectMake((width - timeSize.width) / 2.0,
+    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.5);
+    _timeLabel.frame = CGRectMake(0,
                                   dateSize.height + 4,
-                                  timeSize.width,
+                                  width,
                                   timeSize.height);
+    // Reposition layer so anchor sits at the matching X edge of the
+    // label's frame -- (0, mid), (width/2, mid) or (width, mid).
+    CGFloat px = ax * width;
+    _timeLabel.layer.position = CGPointMake(px, dateSize.height + 4 + timeSize.height / 2.0);
     if (fabs(hStretch - 1.0) > 0.001 || fabs(vStretch - 1.0) > 0.001) {
         _timeLabel.transform = CGAffineTransformMakeScale(hStretch, vStretch);
-        // Re-center after transform: setting a transform doesn't
-        // move the layer's position, but our frame above assumed
-        // identity. Restore the correct centered position based on
-        // the stretched bitmap's footprint.
-        _timeLabel.center = CGPointMake(width / 2.0,
-                                        dateSize.height + 4 + stretchedTimeHeight / 2.0);
     }
 
     _glassBackground.frame = self.bounds;
@@ -500,24 +512,31 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
 
     if (_resizeAxis == 1) {
         // Y dominant -> verticalStretch ONLY. Down = taller (up to
-        // 2.8x at the bottom of the range, which lands the digits at
-        // about half-screen on a 6s), up = shorter (down to 0.6x).
+        // 5.0x at the bottom of the range, which is huge -- on iPhone
+        // 6s the natural digit height is ~84pt, so 5x lands at ~420pt
+        // and fills most of the screen). Up = shorter (down to 0.6x).
         // Width is untouched -- the user explicitly asked for Y to
         // not bleed into width on iOS 26 axis lock.
-        CGFloat range       = 2.8 - 0.6;
-        CGFloat delta       = t.y / 200.0 * range;
-        CGFloat newVStretch = MAX(0.6, MIN(2.8, _resizeStartVStretch + delta));
+        //
+        // Divisor 350 keeps finger feel similar to before with the
+        // smaller range: roughly 1pt of finger movement = 1.25% of
+        // range, so 350pt of vertical drag traverses min<->max,
+        // which is the full available swipe height on a 6s.
+        CGFloat range       = 5.0 - 0.6;
+        CGFloat delta       = t.y / 350.0 * range;
+        CGFloat newVStretch = MAX(0.6, MIN(5.0, _resizeStartVStretch + delta));
         if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {
             [LFClockSettings shared].verticalStretch = newVStretch;
             changed = YES;
         }
     } else if (_resizeAxis == 2) {
         // X dominant -> horizontalStretch ONLY. Right = wider
-        // (up to 1.6x), left = narrower (down to 0.6x). Vertical
-        // size of the digits is unchanged.
-        CGFloat range      = 1.6 - 0.6;
-        CGFloat delta      = t.x / 200.0 * range;
-        CGFloat newStretch = MAX(0.6, MIN(1.6, _resizeStartStretch + delta));
+        // (up to 2.5x), left = narrower (down to 0.6x). Vertical
+        // size of the digits is unchanged. Divisor 250 matches the
+        // sensitivity feel of the Y axis.
+        CGFloat range      = 2.5 - 0.6;
+        CGFloat delta      = t.x / 250.0 * range;
+        CGFloat newStretch = MAX(0.6, MIN(2.5, _resizeStartStretch + delta));
         if (fabs(newStretch - [LFClockSettings shared].horizontalStretch) > 0.001) {
             [LFClockSettings shared].horizontalStretch = newStretch;
             changed = YES;

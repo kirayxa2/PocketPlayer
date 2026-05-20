@@ -30,6 +30,7 @@ static NSString *const kLFSettingsPath =
     _scale                = 1.0;
     _horizontalStretch    = 1.0;
     _verticalStretch      = 1.0;
+    _alignment            = LFClockAlignmentCenter;
     _positionOffset       = CGPointZero;
     _liquidGlassIntensity = 0;
     _gyroEffectsEnabled   = YES;
@@ -143,9 +144,10 @@ static NSString *const kLFSettingsPath =
         // change). Migrate: copy the user's saved size onto the
         // axis where it now lives, then reset scale so it doesn't
         // double-multiply on top of the new transform-based stretch.
-        _verticalStretch = MAX(0.6, MIN(2.8, _scale));
+        _verticalStretch = MAX(0.6, MIN(5.0, _scale));
         _scale           = 1.0;
     }
+    if (d[@"alignment"])            _alignment            = (LFClockAlignment)[d[@"alignment"] integerValue];
     if (d[@"positionOffsetX"] && d[@"positionOffsetY"]) {
         _positionOffset = CGPointMake([d[@"positionOffsetX"] doubleValue],
                                       [d[@"positionOffsetY"] doubleValue]);
@@ -168,6 +170,7 @@ static NSString *const kLFSettingsPath =
         @"scale":                @(_scale),
         @"horizontalStretch":    @(_horizontalStretch),
         @"verticalStretch":      @(_verticalStretch),
+        @"alignment":            @(_alignment),
         @"positionOffsetX":      @(_positionOffset.x),
         @"positionOffsetY":      @(_positionOffset.y),
         @"liquidGlassIntensity": @(_liquidGlassIntensity),
