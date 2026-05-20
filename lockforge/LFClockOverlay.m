@@ -9,15 +9,20 @@ static const CGFloat kLFClockReferenceFontSize = 84.0;
 
 // Drag-handle visual constants. iOS 16/26 wraps the resize handle
 // AROUND the bottom-right rounded corner of the clock's selection
-// rectangle: it's a thick liquid-glass pill that hugs the curve,
-// sitting on the 45° tangent of the corner arc and rotated to lie
-// along that tangent. Width 32pt / height 10pt is the on-screen
-// reference; the visible pill is THICK (10pt) so it reads as a
-// substantial drag target -- the previous 6pt version was too
-// fine. The 44pt invisible touch zone around it keeps the
-// fingertip-friendly hit area.
-static const CGFloat kLFHandleVisibleW       = 32.0;
-static const CGFloat kLFHandleVisibleH       = 10.0;
+// rectangle: it's a thick liquid-glass STROKE that traces the curve
+// of the corner radius, so the handle doesn't look like a separate
+// straight pill sitting near the corner -- it IS a piece of the
+// corner outline, drawn fatter than the surrounding selection
+// border. We render it as a stroked CAShapeLayer arc whose radius
+// matches the bordering rectangle's corner radius.
+//
+// Stroke width 10pt is the visual thickness ("thicker than the
+// border, draws the eye"). Arc sweep 56° is the on-screen length
+// of the handle along the curve (~28pt at radius 28pt) -- comfortable
+// fingertip target without dominating the corner. Round line caps
+// give the stroke softly rounded ends.
+static const CGFloat kLFHandleStrokeWidth    = 10.0;
+static const CGFloat kLFHandleArcSweepDeg    = 56.0;
 static const CGFloat kLFHandleTouchDiameter  = 44.0;
 
 // Side inset for the FULL-WIDTH selection rectangle. iOS 16/26's
@@ -67,12 +72,14 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 @property (nonatomic, strong) UILabel           *timeLabel;
 @property (nonatomic, strong) UILabel           *dateLabel;
 
-// Resize handle: visible 40x6pt HORIZONTAL pill that sits ON the
-// rounded bottom border of the clock's selection rectangle. The
-// actual UIView is 44pt for a generous touch area. Standard iOS
-// pattern, used by Apple in the iOS 16/26 lock screen editor.
+// Resize handle: visible curved STROKE that traces the bottom-right
+// corner radius of the clock's selection rectangle, drawn into a
+// CAShapeLayer that lives directly on `self.layer` (so the path can
+// span beyond _resizeHandle's 44pt touch box). The 44pt invisible
+// touch view sits on top of the arc to give the fingertip a
+// generous drag target.
 @property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible touch zone
-@property (nonatomic, strong) UIView            *resizeHandleVisible; // 40x6 horizontal pill inside
+@property (nonatomic, strong) CAShapeLayer      *resizeHandleArc;     // curved stroke along the corner
 
 @property (nonatomic, strong) NSTimer           *tickTimer;
 @property (nonatomic, strong) UIPanGestureRecognizer *resizePan;
@@ -142,16 +149,12 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     [self buildResizeHandle];
 }
 
-// 44pt invisible touch view containing a centered 32x10 visible
-// pill that gets rotated -45° to lie along the bottom-right
-// corner-arc tangent. The pill is white-translucent (liquid-
-// glass) with a bright rim and a soft drop-shadow so it reads on
-// any wallpaper. In recomputeMetrics we move the entire 44pt touch
-// view so its CENTER sits exactly on the corner-arc tangent point
-// (45° between the bottom and right edges). The pill, anchored at
-// its own center, rotates around that same tangent point and so
-// appears to "wrap" the rounded corner -- exactly the iOS 16/26
-// resize-handle visual.
+// 44pt invisible touch view + a CAShapeLayer arc drawn directly on
+// self.layer. The arc traces the bottom-right corner radius (same
+// radius as the editing-mode border) so the handle reads as a
+// "thicker piece" of that border curve -- iOS 16/26's exact resize-
+// handle visual. The touch zone sits on top of the arc, centered on
+// the arc's midpoint, so a fingertip can grab it without aiming.
 - (void)buildResizeHandle {
     _resizeHandle = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
         kLFHandleTouchDiameter, kLFHandleTouchDiameter)];
@@ -160,35 +163,20 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _resizeHandle.hidden             = YES;
     [self addSubview:_resizeHandle];
 
-    CGFloat offX = (kLFHandleTouchDiameter - kLFHandleVisibleW) / 2.0;
-    CGFloat offY = (kLFHandleTouchDiameter - kLFHandleVisibleH) / 2.0;
-    _resizeHandleVisible = [[UIView alloc] initWithFrame:CGRectMake(
-        offX, offY, kLFHandleVisibleW, kLFHandleVisibleH)];
-    // Translucent white core: shows through the wallpaper behind it
-    // but stays bright enough to read. The thin bright-white rim
-    // gives the "glass edge" look, and the soft shadow lifts the
-    // pill off the border so it doesn't visually merge with the
-    // selection-rect outline.
-    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.55];
-    // Full-radius ends turn the rectangle into a thick pill.
-    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleH / 2.0;
-    _resizeHandleVisible.layer.borderWidth  = 0.5;
-    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:1.0 alpha:0.85] CGColor];
-    _resizeHandleVisible.layer.shadowColor  = [[UIColor blackColor] CGColor];
-    _resizeHandleVisible.layer.shadowOpacity = 0.22;
-    _resizeHandleVisible.layer.shadowRadius  = 3.0;
-    _resizeHandleVisible.layer.shadowOffset  = CGSizeMake(0, 1);
-    _resizeHandleVisible.userInteractionEnabled = NO;
-    // Rotate the visible pill -45° so it lies along the tangent of
-    // the bottom-right corner arc. Default anchorPoint (0.5, 0.5)
-    // means the rotation pivots around the pill's centre, which
-    // sits at the centre of the 44pt touch zone -- and that touch
-    // zone is positioned on the arc-tangent point in
-    // recomputeMetrics. The rotation is set ONCE at build time;
-    // recomputeMetrics only needs to update the touch view's
-    // origin.
-    _resizeHandleVisible.transform = CGAffineTransformMakeRotation(-M_PI_4);
-    [_resizeHandle addSubview:_resizeHandleVisible];
+    // Arc layer. Stroke = translucent white liquid-glass core; rim is
+    // simulated by a brighter shadow than the selection border has,
+    // so the handle stands out against the wallpaper behind it.
+    _resizeHandleArc = [CAShapeLayer layer];
+    _resizeHandleArc.fillColor    = [[UIColor clearColor] CGColor];
+    _resizeHandleArc.strokeColor  = [[UIColor colorWithWhite:1.0 alpha:0.85] CGColor];
+    _resizeHandleArc.lineWidth    = kLFHandleStrokeWidth;
+    _resizeHandleArc.lineCap      = kCALineCapRound;
+    _resizeHandleArc.shadowColor  = [[UIColor blackColor] CGColor];
+    _resizeHandleArc.shadowOpacity = 0.25;
+    _resizeHandleArc.shadowRadius  = 3.0;
+    _resizeHandleArc.shadowOffset  = CGSizeMake(0, 1);
+    _resizeHandleArc.hidden       = YES;
+    [self.layer addSublayer:_resizeHandleArc];
 }
 
 - (void)installGestures {
@@ -341,25 +329,41 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
     _glassBackground.intensity = s.liquidGlassIntensity;
 
-    // Resize handle: 44x44 invisible touch view positioned so that
-    // its CENTRE sits exactly on the bottom-right corner-arc tangent
-    // point of the selection rectangle. The visible 32x10 pill
-    // inside is rotated -45° (in buildResizeHandle) so it lies
-    // along that tangent, hugging the curve. This is the iOS 16/26
-    // resize-handle visual: the pill "wraps" the rounded corner
-    // rather than sitting separately above or beside it.
+    // Resize handle: a CAShapeLayer arc whose radius matches the
+    // editing-mode border's corner radius, so the handle reads as a
+    // FATTER PIECE OF THE BORDER itself rather than a separate pill
+    // floating near the corner. Plus a 44pt invisible touch view
+    // centered on the arc's midpoint for fingertip comfort.
     //
-    // Math: for a rounded rectangle with corner radius R, the inset
-    // from the bounds-corner (width, height) to the nearest point
-    // on the corner-arc (the 45° tangent point, where the arc
-    // meets the inscribed circle of the bounds-square) is
-    //   R * (1 - cos 45°) = R * (1 - sqrt(2)/2) ≈ R * 0.2929
-    CGFloat cornerR    = MIN(28, height / 2.0);
-    CGFloat cornerInset = cornerR * (1.0 - 0.70710678);
-    CGFloat handleCx   = width  - cornerInset;
-    CGFloat handleCy   = height - cornerInset;
-    _resizeHandle.frame = CGRectMake(handleCx - kLFHandleTouchDiameter / 2.0,
-                                     handleCy - kLFHandleTouchDiameter / 2.0,
+    // Math: the bottom-right corner-radius circle is centered at
+    // (width - R, height - R). The arc sweeps from `mid - sweep/2`
+    // to `mid + sweep/2` around 45° (i.e. the diagonal toward the
+    // corner). All angles in radians; UIBezierPath uses standard
+    // math convention (0 = +X axis, 90° = +Y axis in UIKit's
+    // y-down coords, so 45° points down-and-right toward the
+    // corner).
+    CGFloat cornerR     = MIN(28, height / 2.0);
+    CGFloat sweep       = kLFHandleArcSweepDeg * M_PI / 180.0;
+    CGFloat midAngle    = M_PI_4;                    // 45° = toward bottom-right corner
+    CGPoint cornerCircleC = CGPointMake(width - cornerR, height - cornerR);
+
+    UIBezierPath *arcPath =
+        [UIBezierPath bezierPathWithArcCenter:cornerCircleC
+                                       radius:cornerR
+                                   startAngle:midAngle - sweep / 2.0
+                                     endAngle:midAngle + sweep / 2.0
+                                    clockwise:YES];
+    _resizeHandleArc.path   = arcPath.CGPath;
+    _resizeHandleArc.frame  = self.bounds;
+    _resizeHandleArc.hidden = !_isEditing;
+
+    // Touch zone: 44x44 centered on the midpoint of the arc (the 45°
+    // tangent point). Since the arc passes through this point,
+    // dragging the touch zone is dragging the visible handle.
+    CGFloat midX = cornerCircleC.x + cornerR * cos(midAngle);
+    CGFloat midY = cornerCircleC.y + cornerR * sin(midAngle);
+    _resizeHandle.frame = CGRectMake(midX - kLFHandleTouchDiameter / 2.0,
+                                     midY - kLFHandleTouchDiameter / 2.0,
                                      kLFHandleTouchDiameter,
                                      kLFHandleTouchDiameter);
     _resizeHandle.hidden = !_isEditing;

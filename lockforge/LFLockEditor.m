@@ -66,6 +66,12 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 // state mirrors the panel's current on-screen position.
 @property (nonatomic) BOOL   bottomPanelVisible;
 @property (nonatomic) CGFloat panelHeight;            // recomputed each layout pass
+// Tap recognizers stored as properties so the gesture-recognizer
+// delegate can compare against them by identity (not just class) --
+// we want VERY specific behaviour for clock-tap vs outside-tap, see
+// gestureRecognizerShouldBegin:.
+@property (nonatomic, strong) UITapGestureRecognizer *clockTap;
+@property (nonatomic, strong) UITapGestureRecognizer *outsideTap;
 @end
 
 @implementation LFLockEditor
@@ -296,20 +302,19 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     // the clock overlay so it observes touches anywhere inside its
     // bounds (including the resize handle, where a tap with no drag
     // doesn't trigger a resize and so falls through here).
-    UITapGestureRecognizer *clockTap = [[UITapGestureRecognizer alloc]
+    _clockTap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(onClockTap:)];
-    clockTap.delegate = self;
-    [_clockOverlay addGestureRecognizer:clockTap];
+    _clockTap.delegate = self;
+    [_clockOverlay addGestureRecognizer:_clockTap];
 
     // Tap anywhere ELSE in the editor view (the dimmer area, in
-    // practice). Default UIKit recognizer-resolution rules pick the
-    // most-specific recognizer, so taps inside _clockOverlay or
-    // _bottomPanel never reach this one -- only true "outside"
-    // taps fire it.
-    UITapGestureRecognizer *outsideTap = [[UITapGestureRecognizer alloc]
+    // practice). gestureRecognizerShouldBegin: filters out taps that
+    // land inside the clock overlay or inside the bottom panel, so
+    // this recognizer only ever fires on TRULY outside taps.
+    _outsideTap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(onOutsideTap:)];
-    outsideTap.delegate = self;
-    [self.view addGestureRecognizer:outsideTap];
+    _outsideTap.delegate = self;
+    [self.view addGestureRecognizer:_outsideTap];
 }
 
 // Tap on the clock: bring the customize sheet up if it's down,
@@ -333,11 +338,31 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 
 #pragma mark - UIGestureRecognizerDelegate
 
-// Allow our editor-level taps to coexist with the clock's pan
-// recognizer (drag-resize). Without this, the recognizer system
-// might fail one of them prematurely on a fast tap-then-drag.
+// Filter outsideTap so it ONLY fires for taps that land in the
+// dimmer (i.e. neither in the clock overlay nor in the bottom panel).
+// Without this filter, taps inside the panel's empty regions would
+// fall through and close it; and a tap on the clock could race
+// against clockTap, causing the panel to flash up-then-immediately-
+// down on a single touch.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    if (g == _outsideTap) {
+        CGPoint p = [g locationInView:self.view];
+        if (CGRectContainsPoint(_bottomPanel.frame, p))   return NO;
+        if (CGRectContainsPoint(_clockOverlay.frame, p))  return NO;
+    }
+    return YES;
+}
+
+// Tap+tap MUST NOT recognize simultaneously: clockTap and
+// outsideTap on the same touch sequence would toggle the panel
+// twice in a single tap (visible -> hidden -> visible) which
+// looks like the panel "flashes". Tap+pan IS allowed (so the
+// clock-tap can coexist with the resize handle's pan recognizer).
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    BOOL gIsTap = [g     isKindOfClass:[UITapGestureRecognizer class]];
+    BOOL oIsTap = [other isKindOfClass:[UITapGestureRecognizer class]];
+    if (gIsTap && oIsTap) return NO;
     return YES;
 }
 
