@@ -42,3 +42,18 @@ app-deploy:
 
 app-clean:
 	rm -rf app/.theos app/packages
+
+# ----- LockForge tweak (separate .deb, lives in lockforge/) -----
+# Independent tweak that adds iOS 16/26-style lock-screen editor
+# (long-press, custom clock fonts/colors/sizes, Liquid Glass).
+# Loads alongside PocketPlayer in the SpringBoard process.
+
+.PHONY: lockforge lockforge-deploy lockforge-clean
+lockforge:
+	./scripts/deploy-lockforge.sh build-only
+
+lockforge-deploy:
+	./scripts/deploy-lockforge.sh
+
+lockforge-clean:
+	rm -rf lockforge/.theos lockforge/packages
