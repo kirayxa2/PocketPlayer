@@ -225,8 +225,9 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 - (void)recomputeMetrics {
     LFClockSettings *s = [LFClockSettings shared];
 
-    UIFont *timeFont = [s resolvedFontForReferenceSize:kLFClockReferenceFontSize];
-    _timeLabel.font  = timeFont;
+    // (Time font is computed below by auto-fit-to-width, after we know
+    // the parent's bounds and the current verticalStretch. We don't
+    // assign a placeholder here -- it would just be overwritten.)
 
     UIFont *dateFont = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     if (@available(iOS 13.0, *)) {
