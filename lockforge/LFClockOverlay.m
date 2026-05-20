@@ -7,17 +7,28 @@
 // 6.1" device (iPhone 14 etc.) for the default clock.
 static const CGFloat kLFClockReferenceFontSize = 84.0;
 
-// Drag-handle visual constants. iOS 16/26 uses a wide HORIZONTAL pill
-// that sits SQUARELY ON the bottom rounded border of the clock's
-// selection rectangle, not on the side. The pill is "liquid glass"
-// translucent with a thin rim so it's visible on any wallpaper but
-// doesn't dominate. Width 40pt / height 6pt is what Apple ships on
-// the 6.1" reference layout. The 44pt invisible touch zone around
-// it gives a fingertip-comfortable target without sticking out
-// visually.
-static const CGFloat kLFHandleVisibleW       = 40.0;
-static const CGFloat kLFHandleVisibleH       = 6.0;
+// Drag-handle visual constants. iOS 16/26 wraps the resize handle
+// AROUND the bottom-right rounded corner of the clock's selection
+// rectangle: it's a thick liquid-glass pill that hugs the curve,
+// sitting on the 45° tangent of the corner arc and rotated to lie
+// along that tangent. Width 32pt / height 10pt is the on-screen
+// reference; the visible pill is THICK (10pt) so it reads as a
+// substantial drag target -- the previous 6pt version was too
+// fine. The 44pt invisible touch zone around it keeps the
+// fingertip-friendly hit area.
+static const CGFloat kLFHandleVisibleW       = 32.0;
+static const CGFloat kLFHandleVisibleH       = 10.0;
 static const CGFloat kLFHandleTouchDiameter  = 44.0;
+
+// Side inset for the FULL-WIDTH selection rectangle. iOS 16/26's
+// lock-screen clock-area selection box spans almost the entire
+// screen (just the safe-area horizontal insets), not the natural
+// width of the digit text. We mirror that: the selection
+// rectangle has a small breathing room from the screen bezels
+// (8pt each side) and the time digits are placed inside it via
+// textAlignment + anchor (left/center/right), exactly the way
+// Apple's editor lays them out.
+static const CGFloat kLFFullWidthSideInset   = 8.0;
 
 // Date pill (iOS 16/26 floats the date in a small rounded rectangle
 // with a thin border above the time). Width follows the date text;
@@ -131,12 +142,16 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     [self buildResizeHandle];
 }
 
-// 44pt invisible touch view containing a centered 40x6 visible
-// HORIZONTAL pill. The pill is white-translucent (liquid-glass-ish)
-// with a subtle white rim and a soft drop-shadow so it reads on any
-// wallpaper. It is positioned to sit DIRECTLY ON the bottom rounded
-// border of the clock's selection rectangle -- exactly the iOS 16/26
-// resize handle visual.
+// 44pt invisible touch view containing a centered 32x10 visible
+// pill that gets rotated -45° to lie along the bottom-right
+// corner-arc tangent. The pill is white-translucent (liquid-
+// glass) with a bright rim and a soft drop-shadow so it reads on
+// any wallpaper. In recomputeMetrics we move the entire 44pt touch
+// view so its CENTER sits exactly on the corner-arc tangent point
+// (45° between the bottom and right edges). The pill, anchored at
+// its own center, rotates around that same tangent point and so
+// appears to "wrap" the rounded corner -- exactly the iOS 16/26
+// resize-handle visual.
 - (void)buildResizeHandle {
     _resizeHandle = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
         kLFHandleTouchDiameter, kLFHandleTouchDiameter)];
@@ -155,7 +170,7 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     // pill off the border so it doesn't visually merge with the
     // selection-rect outline.
     _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.55];
-    // Full-radius ends turn the rectangle into a horizontal pill.
+    // Full-radius ends turn the rectangle into a thick pill.
     _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleH / 2.0;
     _resizeHandleVisible.layer.borderWidth  = 0.5;
     _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:1.0 alpha:0.85] CGColor];
@@ -164,6 +179,15 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _resizeHandleVisible.layer.shadowRadius  = 3.0;
     _resizeHandleVisible.layer.shadowOffset  = CGSizeMake(0, 1);
     _resizeHandleVisible.userInteractionEnabled = NO;
+    // Rotate the visible pill -45° so it lies along the tangent of
+    // the bottom-right corner arc. Default anchorPoint (0.5, 0.5)
+    // means the rotation pivots around the pill's centre, which
+    // sits at the centre of the 44pt touch zone -- and that touch
+    // zone is positioned on the arc-tangent point in
+    // recomputeMetrics. The rotation is set ONCE at build time;
+    // recomputeMetrics only needs to update the touch view's
+    // origin.
+    _resizeHandleVisible.transform = CGAffineTransformMakeRotation(-M_PI_4);
     [_resizeHandle addSubview:_resizeHandleVisible];
 }
 
@@ -248,7 +272,6 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     //              (the handle simply doesn't react further up)
     CGFloat hStretch = 1.0;
     CGFloat vStretch = MAX(1.0, MIN(5.0, s.verticalStretch));
-    CGFloat stretchedTimeWidth  = timeSize.width  * hStretch;
     CGFloat stretchedTimeHeight = timeSize.height * vStretch;
 
     // Date pill geometry: text size + symmetric padding, rounded
@@ -256,11 +279,19 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     CGFloat datePillW = ceil(dateSize.width)  + 2 * kLFDatePillHPad;
     CGFloat datePillH = ceil(dateSize.height) + 2 * kLFDatePillVPad;
 
-    // Overall overlay bounds = max(pill, time) wide, pill + gap +
-    // time tall. We leave a couple of pt of padding on each side so
-    // the editing-mode border doesn't clip the time label edges.
-    CGFloat width  = MAX(stretchedTimeWidth, datePillW) + 24;
-    CGFloat height = datePillH + kLFDatePillToTimeGap + stretchedTimeHeight + 12;
+    // FULL-WIDTH iOS 16/26-style selection rectangle. The clock
+    // overlay's WIDTH is the screen width minus a small bezel inset
+    // -- NOT the natural width of the time text. Apple lays the
+    // clock area out edge-to-edge so the user can left- /
+    // center- / right-align the digits inside the same wide
+    // selection box. Using natural-text-width (the previous
+    // behaviour) made the box look "tiny and centered" on the 6s
+    // even when there was plenty of room left and right.
+    UIView *parentForWidth = self.superview;
+    CGFloat parentW = parentForWidth ? parentForWidth.bounds.size.width : 393.0;
+    CGFloat width   = MAX(parentW - kLFFullWidthSideInset * 2.0,
+                          datePillW + 24);  // never narrower than the date pill
+    CGFloat height  = datePillH + kLFDatePillToTimeGap + stretchedTimeHeight + 12;
     _naturalSize = CGSizeMake(width, height);
 
     // Apply alignment to the labels' textAlignment so date and time
@@ -310,16 +341,23 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
     _glassBackground.intensity = s.liquidGlassIntensity;
 
-    // Resize handle: 44x44 invisible touch view with the visible
-    // 40x6 horizontal pill centered inside it. Positioned so that
-    // the visible pill sits SQUARELY ON the bottom rounded border
-    // of the clock's selection rectangle, horizontally centered.
-    // This is the iOS 16/26 visual: a translucent glass pill resting
-    // on the curved bottom outline. The 44pt touch zone extends both
-    // above and below the visible pill so a fingertip can grab it
-    // generously without aiming.
-    CGFloat handleCx = width / 2.0;
-    CGFloat handleCy = height;
+    // Resize handle: 44x44 invisible touch view positioned so that
+    // its CENTRE sits exactly on the bottom-right corner-arc tangent
+    // point of the selection rectangle. The visible 32x10 pill
+    // inside is rotated -45° (in buildResizeHandle) so it lies
+    // along that tangent, hugging the curve. This is the iOS 16/26
+    // resize-handle visual: the pill "wraps" the rounded corner
+    // rather than sitting separately above or beside it.
+    //
+    // Math: for a rounded rectangle with corner radius R, the inset
+    // from the bounds-corner (width, height) to the nearest point
+    // on the corner-arc (the 45° tangent point, where the arc
+    // meets the inscribed circle of the bounds-square) is
+    //   R * (1 - cos 45°) = R * (1 - sqrt(2)/2) ≈ R * 0.2929
+    CGFloat cornerR    = MIN(28, height / 2.0);
+    CGFloat cornerInset = cornerR * (1.0 - 0.70710678);
+    CGFloat handleCx   = width  - cornerInset;
+    CGFloat handleCy   = height - cornerInset;
     _resizeHandle.frame = CGRectMake(handleCx - kLFHandleTouchDiameter / 2.0,
                                      handleCy - kLFHandleTouchDiameter / 2.0,
                                      kLFHandleTouchDiameter,
@@ -376,18 +414,25 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 #pragma mark - Layout
 
 // Slim layoutSubviews -- frames of children are set in recomputeMetrics
-// after font/scale changes. We only get called here on rotation /
-// when bounds change for unrelated reasons. No more constant fight
-// with the user's drag.
+// after font/scale changes. We DO call recomputeMetrics here as well
+// because layoutSubviews is the canonical signal that the parent's
+// bounds changed (rotation, sheet resize, etc.), and the clock's
+// own width is now derived from the parent's width. Without this
+// re-flow, the selection rectangle would stay at whatever width was
+// computed at -initWithFrame: time (using the 393pt fallback) and
+// not snap to the real screen width once the cover sheet attaches us.
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // intentionally empty -- recomputeMetrics handles our internal frames
+    [self recomputeMetrics];
 }
 
 - (void)didMoveToSuperview {
     [super didMoveToSuperview];
     if (self.superview) {
-        [self centerInParentApplyingSettings];
+        // Re-derive the full-screen width and recentre now that the
+        // parent's bounds are known. The init pass used a 393pt
+        // fallback because superview was still nil at that point.
+        [self recomputeMetrics];
     }
 }
 
