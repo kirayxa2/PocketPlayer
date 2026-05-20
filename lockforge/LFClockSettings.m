@@ -29,6 +29,7 @@ static NSString *const kLFSettingsPath =
     _customColorRGBA      = @[ @1.0, @1.0, @1.0, @1.0 ];
     _scale                = 1.0;
     _horizontalStretch    = 1.0;
+    _verticalStretch      = 1.0;
     _positionOffset       = CGPointZero;
     _liquidGlassIntensity = 0;
     _gyroEffectsEnabled   = YES;
@@ -133,6 +134,18 @@ static NSString *const kLFSettingsPath =
     if (d[@"customColorRGBA"])      _customColorRGBA      = d[@"customColorRGBA"];
     if (d[@"scale"])                _scale                = [d[@"scale"]                doubleValue];
     if (d[@"horizontalStretch"])    _horizontalStretch    = [d[@"horizontalStretch"]    doubleValue];
+    if (d[@"verticalStretch"]) {
+        _verticalStretch = [d[@"verticalStretch"] doubleValue];
+    } else if (d[@"scale"] && fabs(_scale - 1.0) > 0.01) {
+        // Legacy plist from a build where Y-axis drag wrote `scale`
+        // (uniform font-size multiplier). Now Y-axis writes
+        // `verticalStretch` (CGAffineTransform along Y, no width
+        // change). Migrate: copy the user's saved size onto the
+        // axis where it now lives, then reset scale so it doesn't
+        // double-multiply on top of the new transform-based stretch.
+        _verticalStretch = MAX(0.6, MIN(2.8, _scale));
+        _scale           = 1.0;
+    }
     if (d[@"positionOffsetX"] && d[@"positionOffsetY"]) {
         _positionOffset = CGPointMake([d[@"positionOffsetX"] doubleValue],
                                       [d[@"positionOffsetY"] doubleValue]);
@@ -154,6 +167,7 @@ static NSString *const kLFSettingsPath =
         @"customColorRGBA":      _customColorRGBA ?: @[ @1, @1, @1, @1 ],
         @"scale":                @(_scale),
         @"horizontalStretch":    @(_horizontalStretch),
+        @"verticalStretch":      @(_verticalStretch),
         @"positionOffsetX":      @(_positionOffset.x),
         @"positionOffsetY":      @(_positionOffset.y),
         @"liquidGlassIntensity": @(_liquidGlassIntensity),
