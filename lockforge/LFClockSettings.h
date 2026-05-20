@@ -57,10 +57,32 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 @property (nonatomic, assign) LFClockColorMode colorMode;
 @property (nonatomic, copy)   NSArray<NSNumber *> *customColorRGBA;
 
-// Scale factor, 1.0 == default Apple lock-screen size, 2.5 == about
-// half-screen. Driven by the iOS 26 drag-handle in the editor.
-// Clamped to [0.6, 2.8] when written.
+// Uniform scale factor. 1.0 == default Apple lock-screen size,
+// 2.5 == about half-screen. Driven by the iOS 26 drag-handle in the
+// editor when the user drags VERTICALLY (dominant Y axis). Clamped
+// to [0.6, 2.8] when written.
 @property (nonatomic, assign) CGFloat scale;
+
+// Horizontal stretch factor. 1.0 == natural width, >1.0 == wider
+// digits, <1.0 == narrower. iOS 26 separates this from uniform
+// scale: dragging the handle to the RIGHT stretches digits by X
+// only without changing the font's vertical size. Applied via a
+// CGAffineTransform on the time label after recomputeMetrics, so
+// it is independent of the font's intrinsic point size. Clamped
+// to [0.6, 1.6].
+@property (nonatomic, assign) CGFloat horizontalStretch;
+
+// Vertical stretch factor. 1.0 == natural height, >1.0 == taller
+// digits, <1.0 == shorter. Sister of horizontalStretch -- dragging
+// the handle DOWN stretches digits along Y only, without touching
+// width. The two stretches are independent: the user can have tall
+// thin digits, short wide digits, anything in between. Range
+// extends up to 2.8x so a vertical drag can grow digits to roughly
+// half-screen (matches what `scale` used to do, but cleanly per
+// axis instead of scaling both at once). Applied via the same
+// CGAffineTransform on the time label as horizontalStretch.
+// Clamped to [0.6, 2.8].
+@property (nonatomic, assign) CGFloat verticalStretch;
 
 // Explicit position offset for the clock, in points relative to the
 // default centered-top position. Editor lets user drag clock around;

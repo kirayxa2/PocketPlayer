@@ -13,6 +13,12 @@ static const CGFloat kLFClockReferenceFontSize = 84.0;
 static const CGFloat kLFHandleVisibleDiameter = 22.0;
 static const CGFloat kLFHandleTouchDiameter   = 44.0;
 
+// Distance the finger has to travel away from the touch-down point
+// before we lock to a single axis. 12pt matches the system's
+// UIPanGestureRecognizer default pan-detection slop, so the lock
+// happens just as the gesture is recognised "for real".
+static const CGFloat kLFAxisLockThreshold     = 12.0;
+
 @interface LFClockOverlay () <UIGestureRecognizerDelegate> {
     id _gyroSubscriberKey;
     // Cached natural size after font/scale resolve. The position-pan
@@ -22,6 +28,16 @@ static const CGFloat kLFHandleTouchDiameter   = 44.0;
     CGSize  _naturalSize;
     BOOL    _isUserDragging;     // bug-1 fix: pause auto-positioning
     CGFloat _resizeStartScale;   // captured on resize-pan Began
+    CGFloat _resizeStartStretch; // captured on resize-pan Began
+    CGFloat _resizeStartVStretch;// captured on resize-pan Began (Y axis)
+    // iOS 26-style axis lock. On gesture Began, `Unknown`. As soon as
+    // the finger has moved >= kLFAxisLockThreshold pt away from the
+    // start point in EITHER direction, we commit to that axis (Y or X)
+    // and ignore the other axis for the rest of the gesture. Each axis
+    // controls its OWN independent stretch, so the user can build a
+    // tall thin clock, a short wide clock, or any combo. Y dragging
+    // never changes width; X dragging never changes height.
+    NSInteger _resizeAxis;       // 0=unknown, 1=Y(verticalStretch), 2=X(horizontalStretch)
 }
 @property (nonatomic, strong) LFLiquidGlassView *glassBackground;
 @property (nonatomic, strong) UILabel           *timeLabel;
@@ -49,6 +65,9 @@ static const CGFloat kLFHandleTouchDiameter   = 44.0;
     self.backgroundColor        = [UIColor clearColor];
     _isUserDragging             = NO;
     _resizeStartScale           = 1.0;
+    _resizeStartStretch         = 1.0;
+    _resizeStartVStretch        = 1.0;
+    _resizeAxis                 = 0;
     _naturalSize                = CGSizeMake(200, 100); // sane initial
 
     [self buildSubviews];
@@ -185,13 +204,48 @@ static const CGFloat kLFHandleTouchDiameter   = 44.0;
     CGSize dateSize = [(_dateLabel.text ?: @" ")
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
 
-    CGFloat width  = MAX(timeSize.width,  dateSize.width)  + 24;
-    CGFloat height = timeSize.height + dateSize.height + 12;
+    // iOS 26-style independent axis stretches. Each axis is owned by
+    // its own setting and is changed independently by the resize
+    // handle's drag direction. The font's intrinsic point size is
+    // unchanged -- we render at natural size and then apply a
+    // CGAffineTransform with both axes' stretch factors. This is
+    // exactly how Apple does it: rasterise at native size, then
+    // bitmap-stretch in either direction.
+    //
+    // Drag DOWN  -> verticalStretch goes 1.0 -> 2.8  (digits get tall)
+    // Drag UP    -> verticalStretch goes 1.0 -> 0.6  (digits get short)
+    // Drag RIGHT -> horizontalStretch        1.0 -> 1.6  (digits get wide)
+    // Drag LEFT  -> horizontalStretch        1.0 -> 0.6  (digits get narrow)
+    CGFloat hStretch = MAX(0.6, MIN(1.6, s.horizontalStretch));
+    CGFloat vStretch = MAX(0.6, MIN(2.8, s.verticalStretch));
+    CGFloat stretchedTimeWidth  = timeSize.width  * hStretch;
+    CGFloat stretchedTimeHeight = timeSize.height * vStretch;
+
+    CGFloat width  = MAX(stretchedTimeWidth, dateSize.width) + 24;
+    CGFloat height = stretchedTimeHeight + dateSize.height + 12;
     _naturalSize = CGSizeMake(width, height);
 
     self.bounds = CGRectMake(0, 0, width, height);
     _dateLabel.frame = CGRectMake(0, 0, width, dateSize.height);
-    _timeLabel.frame = CGRectMake(0, dateSize.height + 4, width, timeSize.height);
+    // The time label keeps its NATURAL (unstretched) frame and we
+    // apply both axes' scale via a single CGAffineTransform. This
+    // lets UIKit size the glyphs at their true point size and then
+    // stretch the rasterised bitmap independently along X and Y --
+    // exactly how Apple does it on iOS 26 (cheap and looks correct).
+    _timeLabel.transform = CGAffineTransformIdentity;
+    _timeLabel.frame = CGRectMake((width - timeSize.width) / 2.0,
+                                  dateSize.height + 4,
+                                  timeSize.width,
+                                  timeSize.height);
+    if (fabs(hStretch - 1.0) > 0.001 || fabs(vStretch - 1.0) > 0.001) {
+        _timeLabel.transform = CGAffineTransformMakeScale(hStretch, vStretch);
+        // Re-center after transform: setting a transform doesn't
+        // move the layer's position, but our frame above assumed
+        // identity. Restore the correct centered position based on
+        // the stretched bitmap's footprint.
+        _timeLabel.center = CGPointMake(width / 2.0,
+                                        dateSize.height + 4 + stretchedTimeHeight / 2.0);
+    }
 
     _glassBackground.frame = self.bounds;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
@@ -413,8 +467,11 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     if (!_isEditing) return;
 
     if (pan.state == UIGestureRecognizerStateBegan) {
-        _isUserDragging   = YES;
-        _resizeStartScale = [LFClockSettings shared].scale;
+        _isUserDragging      = YES;
+        _resizeStartScale    = [LFClockSettings shared].scale;
+        _resizeStartStretch  = [LFClockSettings shared].horizontalStretch;
+        _resizeStartVStretch = [LFClockSettings shared].verticalStretch;
+        _resizeAxis          = 0;  // unknown; decided as soon as finger moves
     }
 
     // Use translation in PARENT coordinate space, not self -- since
@@ -424,39 +481,65 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     UIView *parent = self.superview ?: self;
     CGPoint t = [pan translationInView:parent];
 
-    // Combine axes; vertical dominates per iOS 26 behaviour.
-    // Sensitivity widened: 150pt covers full range, was 200pt -- our
-    // 6s screen is short, 200pt was too gentle.
-    CGFloat range = 2.8 - 0.6;
-    CGFloat delta = (t.y * 0.7 + t.x * 0.3) / 150.0 * range;
-    CGFloat newScale = MAX(0.6, MIN(2.8, _resizeStartScale + delta));
-
-    if (fabs(newScale - [LFClockSettings shared].scale) < 0.001) {
-        // No meaningful change -> skip layout and don't end early.
-        if (pan.state == UIGestureRecognizerStateEnded ||
-            pan.state == UIGestureRecognizerStateCancelled ||
-            pan.state == UIGestureRecognizerStateFailed) {
-            _isUserDragging = NO;
-            [[LFClockSettings shared] save];
+    // iOS 26 axis-lock decision. We commit to one axis as soon as
+    // the user has moved past the slop threshold in either
+    // direction. After that, the OTHER axis is ignored for the
+    // remainder of this gesture.
+    if (_resizeAxis == 0) {
+        CGFloat ax = fabs(t.x);
+        CGFloat ay = fabs(t.y);
+        if (ax >= kLFAxisLockThreshold || ay >= kLFAxisLockThreshold) {
+            _resizeAxis = (ay >= ax) ? 1 : 2;
         }
-        return;
+        // Until the threshold is crossed, don't move the clock --
+        // matches Apple's behaviour where a tiny finger jiggle
+        // doesn't immediately resize anything.
     }
 
-    [LFClockSettings shared].scale = newScale;
+    BOOL changed = NO;
 
-    // Disable implicit Core Animation so the resize is instantaneous
-    // and tracks the finger 1:1. Without this, every bounds change
-    // animates over 0.25s, which makes the gesture feel laggy and
-    // detached from the touch.
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [self recomputeMetrics];
-    [CATransaction commit];
+    if (_resizeAxis == 1) {
+        // Y dominant -> verticalStretch ONLY. Down = taller (up to
+        // 2.8x at the bottom of the range, which lands the digits at
+        // about half-screen on a 6s), up = shorter (down to 0.6x).
+        // Width is untouched -- the user explicitly asked for Y to
+        // not bleed into width on iOS 26 axis lock.
+        CGFloat range       = 2.8 - 0.6;
+        CGFloat delta       = t.y / 200.0 * range;
+        CGFloat newVStretch = MAX(0.6, MIN(2.8, _resizeStartVStretch + delta));
+        if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {
+            [LFClockSettings shared].verticalStretch = newVStretch;
+            changed = YES;
+        }
+    } else if (_resizeAxis == 2) {
+        // X dominant -> horizontalStretch ONLY. Right = wider
+        // (up to 1.6x), left = narrower (down to 0.6x). Vertical
+        // size of the digits is unchanged.
+        CGFloat range      = 1.6 - 0.6;
+        CGFloat delta      = t.x / 200.0 * range;
+        CGFloat newStretch = MAX(0.6, MIN(1.6, _resizeStartStretch + delta));
+        if (fabs(newStretch - [LFClockSettings shared].horizontalStretch) > 0.001) {
+            [LFClockSettings shared].horizontalStretch = newStretch;
+            changed = YES;
+        }
+    }
+
+    if (changed) {
+        // Disable implicit Core Animation so the resize is
+        // instantaneous and tracks the finger 1:1. Without this,
+        // every bounds change animates over 0.25s, which makes the
+        // gesture feel laggy and detached from the touch.
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [self recomputeMetrics];
+        [CATransaction commit];
+    }
 
     if (pan.state == UIGestureRecognizerStateEnded ||
         pan.state == UIGestureRecognizerStateCancelled ||
         pan.state == UIGestureRecognizerStateFailed) {
         _isUserDragging = NO;
+        _resizeAxis     = 0;
         [[LFClockSettings shared] save];
     }
 }
