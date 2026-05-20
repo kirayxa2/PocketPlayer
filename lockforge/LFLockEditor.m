@@ -2,6 +2,32 @@
 #import "LFClockOverlay.h"
 #import "LFClockSettings.h"
 
+// =====================================================================
+// LFPassthroughView -- transparent container for the editor.
+//
+// Why we need it: the editor's root view covers the whole window and
+// sits ABOVE the cover-sheet view (which contains the clock). UIKit
+// hit-tests top-down, so any touch that lands on the editor root
+// (anywhere except top bar / bottom panel) was being intercepted by
+// the root or the dimmer instead of reaching the clock underneath.
+// That's why drag-resize "didn't react" -- the gesture recognizer
+// on the resize handle was correct, but the touch never reached it.
+//
+// The passthrough trick: -hitTest: returns nil whenever the result
+// is self -- meaning "the touch landed in empty container space, not
+// on a real subview". UIKit then continues searching siblings of the
+// editor root in the window, finding the cover-sheet view, which in
+// turn finds the clock and handle.
+// =====================================================================
+@interface LFPassthroughView : UIView
+@end
+@implementation LFPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit;
+}
+@end
+
 // Layout constants for the editor's bottom panel. Picked to match iOS
 // 26's customize sheet density: 60pt-tall font row, 44pt color dot
 // row, 36pt slider row, 12pt vertical padding.
@@ -15,6 +41,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
 
 @interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate>
 @property (nonatomic, weak)   LFClockOverlay      *clockOverlay;
+@property (nonatomic, weak)   UIView              *clockOriginalParent;  // remember home for re-parenting on dismiss
 @property (nonatomic, strong) UIVisualEffectView  *dimmer;       // covers wallpaper
 @property (nonatomic, strong) UIView              *topBar;
 @property (nonatomic, strong) UIButton            *cancelButton;
@@ -37,6 +64,15 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     if (!self) return nil;
     _clockOverlay = clockOverlay;
     return self;
+}
+
+// Override loadView so the root view is our passthrough class instead
+// of a plain UIView. Without this, all touches to the empty middle
+// area get absorbed by the editor's root and never reach the clock.
+- (void)loadView {
+    LFPassthroughView *root = [[LFPassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    root.backgroundColor = [UIColor clearColor];
+    self.view = root;
 }
 
 - (void)viewDidLoad {
@@ -81,11 +117,12 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     _dimmer.frame = self.view.bounds;
     _dimmer.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                                UIViewAutoresizingFlexibleHeight;
-    // The dimmer should NOT cover the clock (it's supposed to look
-    // editable on top). UIView's hit-test naturally lets gestures
-    // pass to clock overlay above us; we just need to make sure we
-    // don't cover it visually -- handled by Z-ordering in the host
-    // window.
+    // CRITICAL: dimmer is just a visual treatment. We must not let it
+    // catch any touches, otherwise it eats every drag aimed at the
+    // clock under us. With this off, touches on the dimmer fall
+    // through to the passthrough root, which forwards them to the
+    // cover-sheet view containing the clock.
+    _dimmer.userInteractionEnabled = NO;
     [self.view addSubview:_dimmer];
 }
 
@@ -243,6 +280,20 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     } completion:^(BOOL ok) {
         __strong __typeof(weakSelf) self_ = weakSelf;
         if (!self_) return;
+
+        // Put the clock back in its original parent (cover-sheet view)
+        // so the lockscreen continues to display it after we're gone.
+        // Convert center first so it stays put visually.
+        if (self_.clockOverlay && self_.clockOriginalParent) {
+            UIWindow *win = self_.view.window;
+            CGPoint centerInWindow = [self_.view convertPoint:self_.clockOverlay.center
+                                                       toView:win];
+            CGPoint centerInOrig   = [self_.clockOriginalParent convertPoint:centerInWindow
+                                                                    fromView:win];
+            [self_.clockOriginalParent addSubview:self_.clockOverlay];
+            self_.clockOverlay.center = centerInOrig;
+        }
+
         [self_.view removeFromSuperview];
         // Tell the tweak's gesture handler we're gone so the next
         // long-press spawns a fresh editor (bug-1 fix).
@@ -266,6 +317,28 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     self.view.frame = window.bounds;
     self.view.alpha = 0;
     [window addSubview:self.view];
+
+    // Move the clock INTO our view, on top of the dimmer, so the user
+    // sees it crisp (not behind the dim) AND so its touches go through
+    // our editor view directly without competing for hit-tests with
+    // the cover-sheet underneath. Saved location remembered so we can
+    // put it back when the editor closes.
+    _clockOriginalParent = _clockOverlay.superview;
+    if (_clockOverlay && _clockOriginalParent) {
+        // Convert center to our view's coordinate space first so the
+        // clock doesn't visually jump on the reparent.
+        CGPoint centerInWindow = [_clockOriginalParent convertPoint:_clockOverlay.center
+                                                              toView:window];
+        CGPoint centerInUs     = [self.view convertPoint:centerInWindow fromView:window];
+        [self.view addSubview:_clockOverlay];     // also removes from old superview
+        _clockOverlay.center = centerInUs;
+        // The bottom panel and top bar can be in front of the clock
+        // for chrome, but the clock itself must be above the dimmer.
+        [self.view bringSubviewToFront:_clockOverlay];
+        [self.view bringSubviewToFront:_topBar];
+        [self.view bringSubviewToFront:_bottomPanel];
+    }
+
     _clockOverlay.isEditing = YES;
     [UIView animateWithDuration:0.25 animations:^{
         self.view.alpha = 1;

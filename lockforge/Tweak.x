@@ -202,8 +202,14 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
     // version did unconditional install + adaptive sample on each
     // call, which murdered scroll perf and (worse) competed with
     // the user's drag gesture.
-    if (!gInstalledForCurrentMount ||
-        gClockOverlay.superview != self) {
+    //
+    // Important: while the editor is presented, gClockOverlay's
+    // superview is the editor's view (we re-parent for hit-test
+    // reasons), NOT this CSCoverSheetView. We must NOT rebuild a new
+    // clock in that case -- the editor already owns the live one.
+    BOOL editorOwnsClock = (gEditor != nil);
+    if (!editorOwnsClock &&
+        (!gInstalledForCurrentMount || gClockOverlay.superview != self)) {
         LFHideSystemDateViewsIn(self);
         LFInstallClockIntoCoverSheet(self);
         gInstalledForCurrentMount = YES;
