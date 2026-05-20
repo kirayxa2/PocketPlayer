@@ -38,16 +38,17 @@ static const CGFloat kLFAlignmentRowHeight = 44;  // small icon row, centered
 static const CGFloat kLFEditorBottomPanelHeight =
     kLFFontRowHeight + kLFColorRowHeight + kLFSliderRowHeight +
     kLFAlignmentRowHeight + 24 + 80; // + safeArea
-// Top toolbar height (Cancel / Done).
-static const CGFloat kLFEditorTopBarHeight = 64;
+// (Top bar removed -- the editor now uses a small close-X on the
+// bottom panel instead, matching iOS 16/26's customize sheet.)
 
 @interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate>
 @property (nonatomic, weak)   LFClockOverlay      *clockOverlay;
 @property (nonatomic, weak)   UIView              *clockOriginalParent;  // remember home for re-parenting on dismiss
 @property (nonatomic, strong) UIVisualEffectView  *dimmer;       // covers wallpaper
-@property (nonatomic, strong) UIView              *topBar;
-@property (nonatomic, strong) UIButton            *cancelButton;
-@property (nonatomic, strong) UIButton            *doneButton;
+// Compact close button -- small "x" pill at the top-right of the
+// bottom panel. Replaces the old top bar with Cancel / Done; tapping
+// it saves and dismisses (no separate Cancel anymore).
+@property (nonatomic, strong) UIButton            *closeButton;
 @property (nonatomic, strong) UIView              *bottomPanel;
 @property (nonatomic, strong) UIVisualEffectView  *bottomPanelBlur;
 @property (nonatomic, strong) UICollectionView    *fontPickerRow;
@@ -60,9 +61,6 @@ static const CGFloat kLFEditorTopBarHeight = 64;
 @property (nonatomic, strong) UIButton            *alignLeftButton;
 @property (nonatomic, strong) UIButton            *alignCenterButton;
 @property (nonatomic, strong) UIButton            *alignRightButton;
-// Snapshot of settings at the moment the editor opened. Used to
-// revert if the user taps Cancel.
-@property (nonatomic, strong) NSDictionary        *initialSnapshot;
 @end
 
 @implementation LFLockEditor
@@ -86,44 +84,11 @@ static const CGFloat kLFEditorTopBarHeight = 64;
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
-    [self snapshotSettings];
     [self buildDimmer];
-    [self buildTopBar];
     [self buildBottomPanel];
 }
 
 #pragma mark - Setup
-
-- (void)snapshotSettings {
-    LFClockSettings *s = [LFClockSettings shared];
-    _initialSnapshot = @{
-        @"font":                 @(s.font),
-        @"colorMode":            @(s.colorMode),
-        @"customColorRGBA":      s.customColorRGBA ?: @[ @1, @1, @1, @1 ],
-        @"scale":                @(s.scale),
-        @"horizontalStretch":    @(s.horizontalStretch),
-        @"verticalStretch":      @(s.verticalStretch),
-        @"alignment":            @(s.alignment),
-        @"positionOffsetX":      @(s.positionOffset.x),
-        @"positionOffsetY":      @(s.positionOffset.y),
-        @"liquidGlassIntensity": @(s.liquidGlassIntensity),
-    };
-}
-
-- (void)restoreFromSnapshot {
-    LFClockSettings *s = [LFClockSettings shared];
-    s.font                 = (LFClockFont)[_initialSnapshot[@"font"] integerValue];
-    s.colorMode            = (LFClockColorMode)[_initialSnapshot[@"colorMode"] integerValue];
-    s.customColorRGBA      = _initialSnapshot[@"customColorRGBA"];
-    s.scale                = [_initialSnapshot[@"scale"] doubleValue];
-    s.horizontalStretch    = [_initialSnapshot[@"horizontalStretch"] doubleValue];
-    s.verticalStretch      = [_initialSnapshot[@"verticalStretch"] doubleValue];
-    s.alignment            = (LFClockAlignment)[_initialSnapshot[@"alignment"] integerValue];
-    s.positionOffset       = CGPointMake([_initialSnapshot[@"positionOffsetX"] doubleValue],
-                                         [_initialSnapshot[@"positionOffsetY"] doubleValue]);
-    s.liquidGlassIntensity = [_initialSnapshot[@"liquidGlassIntensity"] integerValue];
-    [_clockOverlay refreshFromSettings];
-}
 
 - (void)buildDimmer {
     UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
@@ -140,36 +105,30 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     [self.view addSubview:_dimmer];
 }
 
-- (void)buildTopBar {
-    _topBar = [UIView new];
-    _topBar.backgroundColor = [UIColor clearColor];
-    [self.view addSubview:_topBar];
-
-    UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
-    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:eff];
-    blur.alpha = 0.7;
-    [_topBar addSubview:blur];
-    blur.translatesAutoresizingMaskIntoConstraints = NO;
-    [NSLayoutConstraint activateConstraints:@[
-        [blur.topAnchor      constraintEqualToAnchor:_topBar.topAnchor],
-        [blur.bottomAnchor   constraintEqualToAnchor:_topBar.bottomAnchor],
-        [blur.leadingAnchor  constraintEqualToAnchor:_topBar.leadingAnchor],
-        [blur.trailingAnchor constraintEqualToAnchor:_topBar.trailingAnchor],
-    ]];
-
-    _cancelButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_cancelButton setTitle:@"Cancel" forState:UIControlStateNormal];
-    [_cancelButton.titleLabel setFont:[UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]];
-    [_cancelButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [_cancelButton addTarget:self action:@selector(onCancel) forControlEvents:UIControlEventTouchUpInside];
-    [_topBar addSubview:_cancelButton];
-
-    _doneButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_doneButton setTitle:@"Done" forState:UIControlStateNormal];
-    [_doneButton.titleLabel setFont:[UIFont systemFontOfSize:16 weight:UIFontWeightBold]];
-    [_doneButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [_doneButton addTarget:self action:@selector(onDone) forControlEvents:UIControlEventTouchUpInside];
-    [_topBar addSubview:_doneButton];
+// Small "x" close button -- replaces the old Cancel/Done top bar.
+// Anchored at the top-right corner of the bottom panel; tapping it
+// saves all current settings and dismisses the editor (no separate
+// Cancel anymore -- everything is live-saved on close).
+- (void)buildCloseButton {
+    _closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+            configurationWithPointSize:26 weight:UIImageSymbolWeightSemibold];
+        UIImage *xmark = [UIImage systemImageNamed:@"xmark.circle.fill"
+                                 withConfiguration:cfg];
+        [_closeButton setImage:xmark forState:UIControlStateNormal];
+    } else {
+        [_closeButton setTitle:@"Close" forState:UIControlStateNormal];
+        [_closeButton setTitleColor:[UIColor whiteColor]
+                           forState:UIControlStateNormal];
+    }
+    // Translucent grey circle, matches the iOS 16 sheet-close glyph
+    // (white-25% on the symbol's filled background).
+    _closeButton.tintColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    [_closeButton addTarget:self
+                     action:@selector(onClose)
+           forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_closeButton];
 }
 
 - (void)buildBottomPanel {
@@ -185,6 +144,7 @@ static const CGFloat kLFEditorTopBarHeight = 64;
     _bottomPanelBlur.layer.masksToBounds = YES;
     [_bottomPanel addSubview:_bottomPanelBlur];
 
+    [self buildCloseButton];
     [self buildFontRow];
     [self buildColorRow];
     [self buildGlassSlider];
@@ -323,12 +283,7 @@ forControlEvents:UIControlEventTouchUpInside];
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     UIEdgeInsets safe = self.view.safeAreaInsets;
-
-    _topBar.frame = CGRectMake(0, 0, self.view.bounds.size.width,
-                               kLFEditorTopBarHeight + safe.top);
-    _cancelButton.frame = CGRectMake(16, safe.top + 12, 80, 30);
-    _doneButton.frame   = CGRectMake(self.view.bounds.size.width - 80 - 16,
-                                     safe.top + 12, 80, 30);
+    (void)safe;
 
     CGFloat panelH = kLFEditorBottomPanelHeight;
     _bottomPanel.frame = CGRectMake(0,
@@ -336,6 +291,15 @@ forControlEvents:UIControlEventTouchUpInside];
                                     self.view.bounds.size.width,
                                     panelH);
     _bottomPanelBlur.frame = _bottomPanel.bounds;
+
+    // Close button -- 30x30 icon button at the top-right corner of
+    // the bottom panel, 12pt margin from the panel edges. Sits in
+    // self.view (not _bottomPanel) so its tap target isn't masked by
+    // the panel's rounded-corner clip.
+    const CGFloat closeSize = 30.0;
+    _closeButton.frame = CGRectMake(self.view.bounds.size.width - 12 - closeSize,
+                                    _bottomPanel.frame.origin.y + 12,
+                                    closeSize, closeSize);
 
     CGFloat y = 16;
     _fontPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFFontRowHeight);
@@ -361,16 +325,11 @@ forControlEvents:UIControlEventTouchUpInside];
 
 #pragma mark - Buttons
 
-- (void)onCancel {
-    [self restoreFromSnapshot];
-    [self refreshAlignmentSelection];
-    [_fontPickerRow reloadData];
-    [_colorPickerRow reloadData];
-    _glassSlider.value = (float)[LFClockSettings shared].liquidGlassIntensity;
-    [self dismissEditor];
-}
-
-- (void)onDone {
+// Single close button -- saves all changes and dismisses the editor.
+// (No separate Cancel: every settings change is written to memory
+// live as the user toys with the pickers, and persisted to disk on
+// dismiss. To revert the user re-edits.)
+- (void)onClose {
     [[LFClockSettings shared] save];
     [self dismissEditor];
 }
@@ -435,11 +394,11 @@ forControlEvents:UIControlEventTouchUpInside];
         CGPoint centerInUs     = [self.view convertPoint:centerInWindow fromView:window];
         [self.view addSubview:_clockOverlay];     // also removes from old superview
         _clockOverlay.center = centerInUs;
-        // The bottom panel and top bar can be in front of the clock
-        // for chrome, but the clock itself must be above the dimmer.
+        // The bottom panel + close button must be above the clock
+        // for chrome; the clock itself stays above the dimmer.
         [self.view bringSubviewToFront:_clockOverlay];
-        [self.view bringSubviewToFront:_topBar];
         [self.view bringSubviewToFront:_bottomPanel];
+        [self.view bringSubviewToFront:_closeButton];
     }
 
     _clockOverlay.isEditing = YES;

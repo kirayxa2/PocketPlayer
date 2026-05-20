@@ -7,11 +7,23 @@
 // 6.1" device (iPhone 14 etc.) for the default clock.
 static const CGFloat kLFClockReferenceFontSize = 84.0;
 
-// Drag-handle visual constants. Visible circle is 22pt (matching iOS 26),
-// but the touch target is the full 44pt minimum required by UIKit
-// guidelines so it doesn't feel "missy" under a fingertip.
-static const CGFloat kLFHandleVisibleDiameter = 22.0;
-static const CGFloat kLFHandleTouchDiameter   = 44.0;
+// Drag-handle visual constants. iOS 16/26 uses a small VERTICAL PILL
+// (rounded with full-radius ends), not a circle, sitting on the
+// right edge of the clock. The visible pill is 8pt wide x 14pt tall;
+// the touch target around it is the full 44pt minimum required by
+// UIKit guidelines so it doesn't feel "missy" under a fingertip.
+static const CGFloat kLFHandleVisibleW       = 8.0;
+static const CGFloat kLFHandleVisibleH       = 14.0;
+static const CGFloat kLFHandleTouchDiameter  = 44.0;
+
+// Date pill (iOS 16/26 floats the date in a small rounded rectangle
+// with a thin border above the time). Width follows the date text;
+// the constants below define padding inside the pill plus its visual
+// styling. Pill height is fixed at 22pt -- matches Apple's reference
+// frame on iPhone.
+static const CGFloat kLFDatePillVPad         = 4.0;
+static const CGFloat kLFDatePillHPad         = 14.0;
+static const CGFloat kLFDatePillToTimeGap    = 12.0;
 
 // Distance the finger has to travel away from the touch-down point
 // before we lock to a single axis. 12pt matches the system's
@@ -40,17 +52,21 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     NSInteger _resizeAxis;       // 0=unknown, 1=Y(verticalStretch), 2=X(horizontalStretch)
 }
 @property (nonatomic, strong) LFLiquidGlassView *glassBackground;
+// Date pill: small rounded rect with a thin white border that floats
+// just above the time label, exactly like iOS 16/26's editor preview.
+// Contains the dateLabel as its single subview.
+@property (nonatomic, strong) UIView            *datePillView;
 @property (nonatomic, strong) UILabel           *timeLabel;
 @property (nonatomic, strong) UILabel           *dateLabel;
 
-// Resize handle: visible 22pt dot, but the actual UIView is 44pt for a
-// generous touch area (and a centered 22pt subview for the visible
-// circle). Standard iOS pattern, used by Apple in Photos / Numbers etc.
+// Resize handle: visible 8x14pt VERTICAL PILL on the right edge of
+// the clock, but the actual UIView is 44pt for a generous touch
+// area. Standard iOS pattern, used by Apple in the iOS 16/26 lock
+// screen editor.
 @property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible
-@property (nonatomic, strong) UIView            *resizeHandleVisible; // 22x22 dot inside
+@property (nonatomic, strong) UIView            *resizeHandleVisible; // 8x14 vertical pill inside
 
 @property (nonatomic, strong) NSTimer           *tickTimer;
-@property (nonatomic, strong) UIPanGestureRecognizer *positionPan;
 @property (nonatomic, strong) UIPanGestureRecognizer *resizePan;
 @property (nonatomic, strong, nullable) NSNumber *cachedLuminance;
 @end
@@ -92,10 +108,23 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     _glassBackground.glassCornerRadius = 28;
     [self addSubview:_glassBackground];
 
+    // Date pill: floats above the time. iOS 16/26 styling -- thin
+    // semi-transparent border around date text. Translucent fill is
+    // very subtle so it reads as a delineated container without
+    // dominating the wallpaper. Border thickness 1pt; corner radius
+    // is half the pill's height so the ends are perfectly round.
+    _datePillView                       = [UIView new];
+    _datePillView.userInteractionEnabled = NO;
+    _datePillView.layer.borderWidth     = 1.0;
+    _datePillView.layer.borderColor     =
+        [[UIColor colorWithWhite:1.0 alpha:0.25] CGColor];
+    _datePillView.layer.masksToBounds   = YES;
+    [self addSubview:_datePillView];
+
     _dateLabel               = [UILabel new];
     _dateLabel.textAlignment = NSTextAlignmentCenter;
     _dateLabel.userInteractionEnabled = NO;
-    [self addSubview:_dateLabel];
+    [_datePillView addSubview:_dateLabel];
 
     _timeLabel               = [UILabel new];
     _timeLabel.textAlignment = NSTextAlignmentCenter;
@@ -107,9 +136,10 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     [self buildResizeHandle];
 }
 
-// 44pt invisible touch view containing a centered 22pt visible dot.
-// The invisible parent gets the gesture recognizer; the dot is just
-// for show.
+// 44pt invisible touch view containing a centered 8x14 visible
+// vertical PILL. Pill is white-translucent with a thin dark border
+// and a tiny shadow, exactly the style Apple uses on iOS 16/26's
+// drag-resize handle.
 - (void)buildResizeHandle {
     _resizeHandle = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
         kLFHandleTouchDiameter, kLFHandleTouchDiameter)];
@@ -118,36 +148,33 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     _resizeHandle.hidden             = YES;
     [self addSubview:_resizeHandle];
 
-    CGFloat off = (kLFHandleTouchDiameter - kLFHandleVisibleDiameter) / 2.0;
+    CGFloat offX = (kLFHandleTouchDiameter - kLFHandleVisibleW) / 2.0;
+    CGFloat offY = (kLFHandleTouchDiameter - kLFHandleVisibleH) / 2.0;
     _resizeHandleVisible = [[UIView alloc] initWithFrame:CGRectMake(
-        off, off, kLFHandleVisibleDiameter, kLFHandleVisibleDiameter)];
-    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.92];
-    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleDiameter / 2.0;
-    _resizeHandleVisible.layer.borderWidth  = 1.0;
-    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:0.0 alpha:0.18] CGColor];
+        offX, offY, kLFHandleVisibleW, kLFHandleVisibleH)];
+    _resizeHandleVisible.backgroundColor    = [UIColor colorWithWhite:1.0 alpha:0.85];
+    // Full-radius ends so the rectangle becomes a vertical pill.
+    _resizeHandleVisible.layer.cornerRadius = kLFHandleVisibleW / 2.0;
+    _resizeHandleVisible.layer.borderWidth  = 0.5;
+    _resizeHandleVisible.layer.borderColor  = [[UIColor colorWithWhite:0.0 alpha:0.20] CGColor];
     _resizeHandleVisible.layer.shadowColor  = [[UIColor blackColor] CGColor];
-    _resizeHandleVisible.layer.shadowOpacity = 0.20;
-    _resizeHandleVisible.layer.shadowRadius  = 3;
+    _resizeHandleVisible.layer.shadowOpacity = 0.18;
+    _resizeHandleVisible.layer.shadowRadius  = 2.5;
     _resizeHandleVisible.layer.shadowOffset  = CGSizeMake(0, 1);
     _resizeHandleVisible.userInteractionEnabled = NO;
     [_resizeHandle addSubview:_resizeHandleVisible];
 }
 
 - (void)installGestures {
-    _positionPan = [[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(handlePositionPan:)];
-    _positionPan.delegate = self;          // bug-2 fix: simultaneous gestures
-    _positionPan.maximumNumberOfTouches = 1;
-    [self addGestureRecognizer:_positionPan];
-
+    // iOS 16/26 lock screen clocks CANNOT be moved -- they're glued
+    // to a fixed default position. The user can only resize them
+    // via the handle. So we install ONLY the resize-pan recognizer
+    // here; the position-drag gesture from earlier builds is gone.
     _resizePan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(handleResizePan:)];
     _resizePan.delegate = self;
     _resizePan.maximumNumberOfTouches = 1;
     [_resizeHandle addGestureRecognizer:_resizePan];
-
-    // Position pan should defer to resize pan on the handle.
-    [_positionPan requireGestureRecognizerToFail:_resizePan];
 }
 
 - (void)startTicker {
@@ -197,7 +224,7 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
 
     UIColor *color = [s resolvedColorForBackgroundLuminance:_cachedLuminance];
     _timeLabel.textColor = color;
-    _dateLabel.textColor = [color colorWithAlphaComponent:0.8];
+    _dateLabel.textColor = [color colorWithAlphaComponent:0.85];
 
     CGSize timeSize = [(_timeLabel.text ?: @"00:00")
         sizeWithAttributes:@{ NSFontAttributeName: _timeLabel.font }];
@@ -221,8 +248,16 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     CGFloat stretchedTimeWidth  = timeSize.width  * hStretch;
     CGFloat stretchedTimeHeight = timeSize.height * vStretch;
 
-    CGFloat width  = MAX(stretchedTimeWidth, dateSize.width) + 24;
-    CGFloat height = stretchedTimeHeight + dateSize.height + 12;
+    // Date pill geometry: text size + symmetric padding, rounded
+    // ends. Pill is wider than the date text by 2 * kLFDatePillHPad.
+    CGFloat datePillW = ceil(dateSize.width)  + 2 * kLFDatePillHPad;
+    CGFloat datePillH = ceil(dateSize.height) + 2 * kLFDatePillVPad;
+
+    // Overall overlay bounds = max(pill, time) wide, pill + gap +
+    // time tall. We leave a couple of pt of padding on each side so
+    // the editing-mode border doesn't clip the time label edges.
+    CGFloat width  = MAX(stretchedTimeWidth, datePillW) + 24;
+    CGFloat height = datePillH + kLFDatePillToTimeGap + stretchedTimeHeight + 12;
     _naturalSize = CGSizeMake(width, height);
 
     // Apply alignment to the labels' textAlignment so date and time
@@ -236,10 +271,16 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     if (s.alignment == LFClockAlignmentLeft)  { ta = NSTextAlignmentLeft;  ax = 0.0; }
     if (s.alignment == LFClockAlignmentRight) { ta = NSTextAlignmentRight; ax = 1.0; }
     _timeLabel.textAlignment = ta;
-    _dateLabel.textAlignment = ta;
+    _dateLabel.textAlignment = NSTextAlignmentCenter;   // date pill always centered
 
     self.bounds = CGRectMake(0, 0, width, height);
-    _dateLabel.frame = CGRectMake(0, 0, width, dateSize.height);
+
+    // Date pill -- rounded rectangle with thin border, centered
+    // horizontally, sitting at the top of our overlay.
+    _datePillView.frame = CGRectMake((width - datePillW) / 2.0, 0,
+                                     datePillW, datePillH);
+    _datePillView.layer.cornerRadius = datePillH / 2.0;
+    _dateLabel.frame = CGRectMake(0, 0, datePillW, datePillH);
 
     // The time label spans the full overlay width and uses
     // textAlignment to glue glyphs to the chosen edge. We then apply
@@ -247,14 +288,12 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     // matching anchor point so the stretch pivots on that edge.
     _timeLabel.transform = CGAffineTransformIdentity;
     _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.5);
-    _timeLabel.frame = CGRectMake(0,
-                                  dateSize.height + 4,
-                                  width,
-                                  timeSize.height);
+    CGFloat timeY = datePillH + kLFDatePillToTimeGap;
+    _timeLabel.frame = CGRectMake(0, timeY, width, timeSize.height);
     // Reposition layer so anchor sits at the matching X edge of the
     // label's frame -- (0, mid), (width/2, mid) or (width, mid).
     CGFloat px = ax * width;
-    _timeLabel.layer.position = CGPointMake(px, dateSize.height + 4 + timeSize.height / 2.0);
+    _timeLabel.layer.position = CGPointMake(px, timeY + timeSize.height / 2.0);
     if (fabs(hStretch - 1.0) > 0.001 || fabs(vStretch - 1.0) > 0.001) {
         _timeLabel.transform = CGAffineTransformMakeScale(hStretch, vStretch);
     }
@@ -263,18 +302,24 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
     _glassBackground.intensity = s.liquidGlassIntensity;
 
-    // Handle is 44x44 invisible, positioned bottom-right with its
-    // CENTER at the bottom-right corner of the clock frame. Visible
-    // dot inside is centered, so it appears half-outside the clock,
-    // matching iOS 26 visually.
-    _resizeHandle.frame = CGRectMake(width  - kLFHandleTouchDiameter / 2.0,
-                                     height - kLFHandleTouchDiameter / 2.0,
+    // Resize handle: 44x44 invisible touch view positioned so that
+    // its center sits on the right edge of the time label, vertically
+    // aligned with the time's vertical center. The visible 8x14 pill
+    // sits inside the touch zone, so it appears half-outside the
+    // clock content -- exactly the iOS 16/26 visual.
+    CGFloat handleCx = width;
+    CGFloat handleCy = timeY + (stretchedTimeHeight / 2.0);
+    _resizeHandle.frame = CGRectMake(handleCx - kLFHandleTouchDiameter / 2.0,
+                                     handleCy - kLFHandleTouchDiameter / 2.0,
                                      kLFHandleTouchDiameter,
                                      kLFHandleTouchDiameter);
     _resizeHandle.hidden = !_isEditing;
 
+    // Editing-mode chrome: thin border around the entire clock area
+    // (matches Apple's "selected" indicator) plus the date pill keeps
+    // its border whether or not editing is active.
     if (_isEditing) {
-        self.layer.borderColor   = [[UIColor colorWithWhite:1.0 alpha:0.35] CGColor];
+        self.layer.borderColor   = [[UIColor colorWithWhite:1.0 alpha:0.30] CGColor];
         self.layer.borderWidth   = 1.0;
         self.layer.cornerRadius  = _glassBackground.glassCornerRadius;
     } else {
@@ -283,19 +328,22 @@ static const CGFloat kLFAxisLockThreshold     = 12.0;
     }
 }
 
-// Apply the saved position offset to self.center. Called only when
-// (a) the overlay gets attached to a parent, (b) settings change
-// non-positionally, (c) editor opens/closes. Never during a drag.
+// Apply the clock's DEFAULT iOS 16/26 position. The clock is locked to
+// this position -- there is no per-user position offset anymore (the
+// resize handle is the only way to customize it, like Apple).
+//
+// Default vertical placement: just below the safe-area top, with the
+// date pill ~24pt down so it doesn't kiss the status bar / dynamic
+// island. Centered horizontally.
 - (void)centerInParentApplyingSettings {
-    if (_isUserDragging) return;        // bug-1 fix
+    if (_isUserDragging) return;        // resize-pan drag in progress
     UIView *parent = self.superview;
     if (!parent) return;
 
-    LFClockSettings *s = [LFClockSettings shared];
-    CGPoint base = CGPointMake(parent.bounds.size.width / 2.0,
-                               parent.safeAreaInsets.top + _naturalSize.height / 2.0 + 60);
-    self.center = CGPointMake(base.x + s.positionOffset.x,
-                              base.y + s.positionOffset.y);
+    CGFloat topPadding = parent.safeAreaInsets.top + 24.0;
+    CGPoint center = CGPointMake(parent.bounds.size.width / 2.0,
+                                 topPadding + _naturalSize.height / 2.0);
+    self.center = center;
 }
 
 #pragma mark - Layout
@@ -442,35 +490,6 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         if (CGRectContainsPoint(_resizeHandle.frame, point)) return YES;
     }
     return [super pointInside:point withEvent:event];
-}
-
-#pragma mark - Position pan
-
-- (void)handlePositionPan:(UIPanGestureRecognizer *)pan {
-    if (!_isEditing) return;
-    UIView *parent = self.superview;
-    if (!parent) return;
-
-    if (pan.state == UIGestureRecognizerStateBegan) {
-        _isUserDragging = YES;
-    }
-
-    CGPoint t = [pan translationInView:parent];
-    [pan setTranslation:CGPointZero inView:parent];
-    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-
-    if (pan.state == UIGestureRecognizerStateEnded ||
-        pan.state == UIGestureRecognizerStateCancelled ||
-        pan.state == UIGestureRecognizerStateFailed) {
-        _isUserDragging = NO;
-        CGPoint base = CGPointMake(parent.bounds.size.width / 2.0,
-                                   parent.safeAreaInsets.top +
-                                   _naturalSize.height / 2.0 + 60);
-        CGPoint offset = CGPointMake(self.center.x - base.x,
-                                     self.center.y - base.y);
-        [LFClockSettings shared].positionOffset = offset;
-        [[LFClockSettings shared] save];
-    }
 }
 
 #pragma mark - Resize pan
