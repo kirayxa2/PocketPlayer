@@ -257,49 +257,52 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     CGFloat width   = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);  // never narrower than the date pill
 
-    // === Auto-fit digit width to the selection rectangle ===
+    // === Vertical-stretch as direct font-size multiplier ===
     //
     // iOS 16/26 lock screen clock resize is VERTICAL ONLY: the user
     // drags the resize handle DOWN to grow the digits, and dragging
     // up never compresses below the minimum (clamped at 1.0).
     //
-    // Earlier builds rendered the digits at a fixed reference font
-    // size and then applied a CGAffineTransform along Y to "stretch"
-    // them taller. That produced two visual bugs the user pointed
-    // out: (1) the digit cluster was always narrow inside a wide
-    // selection rect, leaving big empty bands left and right; and
-    // (2) stretched glyphs looked anti-aliased / smeared because
-    // the rasteriser ran at the small reference size and then the
-    // bitmap was scaled up.
+    // Mapping is a STRAIGHT LERP from reference to "fills the screen":
     //
-    // New approach: change the FONT POINT SIZE itself based on
-    // `verticalStretch`. We pick a target digit-cluster width that
-    // is `width - 2*sidePad`, where `sidePad` LERPs between a
-    // comfortable inset at the minimum and an almost-flush fit at
-    // the maximum. Then we compute the font size that makes
-    // "00:00" naturally render at exactly that target width. Width
-    // AND height grow uniformly because the font itself is bigger,
-    // and the rasteriser draws crisp pixels at every size.
+    //   verticalStretch = 1.0      -> font = referenceSize (84pt natural)
+    //                                 digit cluster sits at its own
+    //                                 natural width, ~210pt on a 6s,
+    //                                 leaving comfortable side margin.
+    //   verticalStretch = vMax     -> font = the size that makes
+    //                                 "00:00" naturally render at
+    //                                 (width - 16pt), i.e. 8pt margin
+    //                                 per side.
     //
-    //   verticalStretch = 1.0  -> digit cluster fills (width - 32pt)
-    //   verticalStretch = 3.5  -> digit cluster fills (width -  8pt)
-    CGFloat vStretch    = MAX(1.0, MIN(3.5, s.verticalStretch));
-    CGFloat normStretch = (vStretch - 1.0) / (3.5 - 1.0);   // 0..1
-    if (normStretch < 0.0) normStretch = 0.0;
-    if (normStretch > 1.0) normStretch = 1.0;
-    CGFloat sidePadAtMin = 16.0;
-    CGFloat sidePadAtMax =  4.0;
-    CGFloat sidePad      = sidePadAtMin + (sidePadAtMax - sidePadAtMin) * normStretch;
-    CGFloat targetTextW  = MAX(80.0, width - 2.0 * sidePad);
-
-    // SF Pro / SF Rounded glyphs at the same weight advance linearly
-    // with point size, so one measurement at the reference size is
-    // enough -- multiply by the width ratio and that's our target.
+    // Width AND height grow uniformly because the FONT SIZE itself
+    // changes -- no CGAffineTransform stretch any more, so glyphs
+    // stay crisp at every step. The earlier auto-fit-by-padding
+    // approach kept the digits *always* near the screen edge and
+    // only varied padding by 12pt total, which made the resize
+    // gesture feel like nothing was happening.
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
     UIFont   *refFont   = [s resolvedFontForReferenceSize:kLFClockReferenceFontSize];
     CGFloat   refTextW  = [probeText sizeWithAttributes:@{ NSFontAttributeName: refFont }].width;
     if (refTextW < 1.0) refTextW = 1.0;
-    CGFloat   fontPoints = MAX(20.0, kLFClockReferenceFontSize * (targetTextW / refTextW));
+
+    // The dynamic max font size: digits fill (width - 16pt). On a 6s
+    // (375pt wide screen, 359pt overlay width, ~200pt natural digit
+    // width) this lands around 144pt -- nearly 2x the reference size.
+    CGFloat maxAllowedTextW = MAX(refTextW, width - 16.0);
+    CGFloat maxFontPoints   = kLFClockReferenceFontSize * (maxAllowedTextW / refTextW);
+
+    // LERP font size linearly across the user-facing vStretch range
+    // [1.0, 3.5]. The full range maps to [referenceSize,
+    // maxFontPoints], so dragging the handle through its full
+    // travel takes the digits from "compact natural size" to "fills
+    // the screen". This is the difference the user sees.
+    CGFloat vStretch    = MAX(1.0, MIN(3.5, s.verticalStretch));
+    CGFloat normStretch = (vStretch - 1.0) / (3.5 - 1.0);   // 0..1
+    if (normStretch < 0.0) normStretch = 0.0;
+    if (normStretch > 1.0) normStretch = 1.0;
+    CGFloat fontPoints  = kLFClockReferenceFontSize +
+                          (maxFontPoints - kLFClockReferenceFontSize) * normStretch;
+    fontPoints          = MAX(20.0, fontPoints);
 
     UIFont *timeFont = [s resolvedFontForReferenceSize:fontPoints];
     _timeLabel.font  = timeFont;

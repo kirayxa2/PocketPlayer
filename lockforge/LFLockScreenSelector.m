@@ -27,17 +27,42 @@ static const CGFloat kLFCardBorderWidth    = 0.5;
 static const CGFloat kLFCardWidthRatio     = 0.70;     // 70% of screen width
 static const CGFloat kLFCardInterSpacing   = 16.0;     // gap between adjacent cards
 
+// How much of the source cover-sheet's BOTTOM we hide in the card
+// preview. iOS 16/26 customize-sheet thumbnails show the wallpaper +
+// clock + (optional) widgets ONLY -- they don't show the camera /
+// flashlight shortcut buttons or the home indicator that live in
+// the bottom strip of the live lock screen. We mimic that by
+// growing the snapshot view past the bottom edge of the card by this
+// many points (in source coordinates), then relying on the card's
+// existing clipsToBounds to hide the overflow.
+//
+// 120pt covers:
+//   - camera/flashlight affordance buttons (~70-110pt from bottom)
+//   - "swipe up" / "press home" hint (~30-50pt from bottom)
+//   - home indicator on devices that have one (~30pt from bottom)
+static const CGFloat kLFSnapshotBottomCrop = 120.0;
+
 // Top label "PHOTOS" position
 static const CGFloat kLFTopLabelTopMargin  = 8.0;
 static const CGFloat kLFTopLabelHeight     = 18.0;
 static const CGFloat kLFTopLabelKerning    = 1.2;
 static const CGFloat kLFTopLabelToCardGap  = 14.0;
 
-// Bottom buttons
+// Bottom buttons.
+//
+// iOS 26 wallpaper picker layout is: small wallpaper-thumbnail icon
+// in the bottom-LEFT, "Customize" pill CENTERED, "+" circle in the
+// bottom-RIGHT. We don't have a wallpaper thumbnail (PR-A keeps
+// PocketPlayer's wallpaper system separate), so the bar is just
+// Customize centered + "+" on the right.
+//
+// kLFBottomBarSideInset is how far the "+" button sits from the
+// right screen edge. Customize is purely centered horizontally and
+// doesn't need an inset constant.
 static const CGFloat kLFBottomBarMargin    = 16.0;     // distance from safeArea bottom
+static const CGFloat kLFBottomBarSideInset = 22.0;     // inset for "+" only
 static const CGFloat kLFCustomizeBtnH      = 50.0;
 static const CGFloat kLFCustomizeBtnW      = 124.0;
-static const CGFloat kLFCustomizeBtnInset  = 22.0;
 static const CGFloat kLFPlusBtnSize        = 50.0;
 
 // Page dots (above the action bar)
@@ -291,13 +316,15 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
                                       b.size.width,
                                       kLFTopLabelHeight);
 
-    // 2) Bottom action bar (we anchor this first so the card area
-    //    knows how much room it has between the label and the bar).
+    // 2) Bottom action bar. iOS 26 layout: Customize pill CENTERED,
+    //    "+" circle on the right. The Customize button is the visual
+    //    anchor of the bar; "+" is auxiliary and inset from the right.
     CGFloat bottomY = b.size.height - safe.bottom -
                       kLFBottomBarMargin - kLFCustomizeBtnH;
-    _customizeButton.frame = CGRectMake(kLFCustomizeBtnInset, bottomY,
+    _customizeButton.frame = CGRectMake((b.size.width - kLFCustomizeBtnW) / 2.0,
+                                        bottomY,
                                         kLFCustomizeBtnW, kLFCustomizeBtnH);
-    _plusButton.frame      = CGRectMake(b.size.width - kLFCustomizeBtnInset - kLFPlusBtnSize,
+    _plusButton.frame      = CGRectMake(b.size.width - kLFBottomBarSideInset - kLFPlusBtnSize,
                                         bottomY,
                                         kLFPlusBtnSize, kLFPlusBtnSize);
 
@@ -316,18 +343,27 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
                              kLFPageDotSize, kLFPageDotSize);
     }
 
-    // 4) Card geometry. The card matches the DEVICE aspect ratio so
-    //    the carousel reads as "a row of mini phones" exactly like
-    //    iOS 16/26's wallpaper picker. Width is a fixed 70% of the
-    //    viewport; height follows from aspect.
+    // 4) Card geometry. The card matches the DEVICE aspect ratio MINUS
+    //    the bottom-crop strip so what the user sees inside the card
+    //    is just wallpaper + clock, no home bar / camera / flashlight.
+    //    The snapshot view itself is FULL device aspect (so its
+    //    contents render at the same scale as the live lock screen),
+    //    but it overflows the card's bottom by kLFSnapshotBottomCrop *
+    //    scale, and the card's clipsToBounds hides that overflow.
     //
     //    If the aspect-correct height would overflow the available
     //    vertical area, we shrink the card width down so the height
-    //    fits -- the carousel still looks correct because aspect
-    //    is preserved.
-    CGFloat phoneAspect = b.size.height / b.size.width;
-    CGFloat cardW       = floor(b.size.width * kLFCardWidthRatio);
-    CGFloat cardH       = floor(cardW * phoneAspect);
+    //    fits -- the carousel still looks correct because aspect is
+    //    preserved.
+    CGFloat sourceW       = _sourceCoverSheet ? _sourceCoverSheet.bounds.size.width  : b.size.width;
+    CGFloat sourceH       = _sourceCoverSheet ? _sourceCoverSheet.bounds.size.height : b.size.height;
+    if (sourceW < 1.0) sourceW = b.size.width;
+    if (sourceH < 1.0) sourceH = b.size.height;
+
+    CGFloat usableSourceH = MAX(sourceH - kLFSnapshotBottomCrop, sourceH * 0.5);
+    CGFloat cardAspect    = usableSourceH / sourceW;
+    CGFloat cardW         = floor(b.size.width * kLFCardWidthRatio);
+    CGFloat cardH         = floor(cardW * cardAspect);
 
     CGFloat areaTop    = CGRectGetMaxY(_categoryLabel.frame) + kLFTopLabelToCardGap;
     CGFloat areaBottom = _pageDotsContainer.frame.origin.y - kLFCardToDotsGap;
@@ -336,7 +372,7 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     if (cardH > areaH) {
         // Aspect-preserving shrink so the card stays a mini-phone.
         cardH = areaH;
-        cardW = floor(cardH / phoneAspect);
+        cardW = floor(cardH / cardAspect);
     }
 
     CGFloat cardY = areaTop + (areaH - cardH) / 2.0;
@@ -351,19 +387,28 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     _cardsScroll.contentInset = UIEdgeInsetsMake(0, sideInset, 0, sideInset);
 
     // 6) Lay out the actual cards inside the scroll view.
+    //
+    //    Snap height = full device aspect at cardW (i.e. it represents
+    //    the WHOLE lock screen, including the bottom strip we want to
+    //    hide). Card height < snap height by exactly the crop, so the
+    //    bottom strip falls outside card.bounds and gets clipped.
+    CGFloat snapScale = cardW / sourceW;
+    CGFloat snapH     = sourceH * snapScale;
     CGFloat x = 0;
     for (NSInteger i = 0; i < _cards.count; i++) {
         UIView *card = _cards[i];
         card.frame = CGRectMake(x, 0, cardW, cardH);
         x += cardW + kLFCardInterSpacing;
 
-        // Card subviews: snapshot fills, focus pill at the bottom.
+        // Card subviews: snapshot fills width (full device aspect),
+        // overflows bottom; focus pill anchored above the (visible)
+        // card bottom.
         UIView *snap   = [card viewWithTag:kLFTagSnapshot];
         UIView *pill   = [card viewWithTag:kLFTagFocusPill];
         UIImageView *moon = (UIImageView *)[card viewWithTag:kLFTagFocusIcon];
         UILabel *flbl  = (UILabel *)[card viewWithTag:kLFTagFocusLabel];
 
-        snap.frame = card.bounds;
+        snap.frame = CGRectMake(0, 0, cardW, snapH);
 
         pill.frame = CGRectMake((cardW - kLFFocusPillW) / 2.0,
                                 cardH - kLFFocusPillH - kLFFocusPillBottomGap,
