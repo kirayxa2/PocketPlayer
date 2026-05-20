@@ -345,6 +345,39 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     return YES;
 }
 
+#pragma mark - Hit testing (bug-3 fix: handle is half-outside bounds)
+
+// The resize handle is positioned with its center at the bottom-right
+// CORNER of our bounds, which means half of its 44x44 touch area sits
+// OUTSIDE our bounds. By default UIKit's -hitTest:withEvent: clips at
+// self.bounds and returns nil for any point outside, so touches on the
+// outer half of the handle were silently dropped -- which is exactly
+// what "as if the trigger isn't being read" looks like from the user
+// side.
+//
+// Override hit-testing so we ALSO check the handle's frame directly
+// (in our own coordinate space) before falling back to the default
+// behaviour.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (_isEditing && !_resizeHandle.hidden) {
+        // Handle frame is in our coordinate space already.
+        if (CGRectContainsPoint(_resizeHandle.frame, point)) {
+            return _resizeHandle;
+        }
+    }
+    return [super hitTest:point withEvent:event];
+}
+
+// Mirror so events delivered to the parent's hit-test can route here
+// even when our parent thinks the touch is just outside its child
+// list.
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (_isEditing && !_resizeHandle.hidden) {
+        if (CGRectContainsPoint(_resizeHandle.frame, point)) return YES;
+    }
+    return [super pointInside:point withEvent:event];
+}
+
 #pragma mark - Position pan
 
 - (void)handlePositionPan:(UIPanGestureRecognizer *)pan {
@@ -384,13 +417,41 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
         _resizeStartScale = [LFClockSettings shared].scale;
     }
 
-    CGPoint t = [pan translationInView:self];
+    // Use translation in PARENT coordinate space, not self -- since
+    // we resize, our own coordinate space changes mid-gesture and
+    // pan translation in `self` returns inconsistent values that
+    // make the gesture feel non-responsive.
+    UIView *parent = self.superview ?: self;
+    CGPoint t = [pan translationInView:parent];
+
     // Combine axes; vertical dominates per iOS 26 behaviour.
-    CGFloat delta = (t.y * 0.7 + t.x * 0.3) / 200.0 * (2.8 - 0.6);
+    // Sensitivity widened: 150pt covers full range, was 200pt -- our
+    // 6s screen is short, 200pt was too gentle.
+    CGFloat range = 2.8 - 0.6;
+    CGFloat delta = (t.y * 0.7 + t.x * 0.3) / 150.0 * range;
     CGFloat newScale = MAX(0.6, MIN(2.8, _resizeStartScale + delta));
+
+    if (fabs(newScale - [LFClockSettings shared].scale) < 0.001) {
+        // No meaningful change -> skip layout and don't end early.
+        if (pan.state == UIGestureRecognizerStateEnded ||
+            pan.state == UIGestureRecognizerStateCancelled ||
+            pan.state == UIGestureRecognizerStateFailed) {
+            _isUserDragging = NO;
+            [[LFClockSettings shared] save];
+        }
+        return;
+    }
+
     [LFClockSettings shared].scale = newScale;
 
+    // Disable implicit Core Animation so the resize is instantaneous
+    // and tracks the finger 1:1. Without this, every bounds change
+    // animates over 0.25s, which makes the gesture feel laggy and
+    // detached from the touch.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     [self recomputeMetrics];
+    [CATransaction commit];
 
     if (pan.state == UIGestureRecognizerStateEnded ||
         pan.state == UIGestureRecognizerStateCancelled ||
