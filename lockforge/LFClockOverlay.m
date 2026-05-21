@@ -408,23 +408,43 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     CGFloat fontWeight = 100.0;                          // Thin, constant
     CGFloat fontWidth  = 100.0;                          // Standard, constant
 
+    // Use the ACTUAL displayed text for probing (not a hardcoded
+    // "00:00") so that the rendered "9:10" / "23:59" / etc. exactly
+    // fits the screen. .SFAdaptiveNumeric is mostly tabular but the
+    // colon advance differs from digit advance, and locale-specific
+    // forms can change the string length.
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
 
-    // First, derive a fontSize that makes "00:00" naturally render at
-    // boxW - 2*kLFTimePad when HGHT is at its 100 default. Width
-    // doesn't change with HGHT, so this fontSize is correct for the
-    // entire resize range -- we only need to compute it once.
     CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
-    CGFloat fontSize    = 144.0;     // sane default if probe fails
 
-    UIFont *probe100 = lf_makeAdaptiveNumericFont(100.0, fontWeight,
-                                                  fontWidth, 100.0);
-    if (probe100) {
+    // === Re-probe at CURRENT HGHT ===
+    //
+    // First-pass fontSize derivation. We probe at fontSize=100 with
+    // ALL THE SAME axis values we'll render with (most importantly,
+    // the current HGHT) so that any cross-axis effect HGHT has on
+    // advance widths in this font's HVAR / gvar tables is fully
+    // compensated. If HGHT happens to widen advance widths at high
+    // values (which inspection of Apple's Adaptive Numeric font
+    // suggests it does -- the digits are designed to grow taller AND
+    // a touch wider together so they remain visually balanced), the
+    // fontSize we derive will be SMALLER at higher HGHT, and the
+    // rendered "00:00" still fills exactly targetTextW.
+    //
+    // Net effect from the user's perspective: as the resize handle
+    // is dragged, the digits grow taller with no horizontal change.
+    // Width stays glued to the screen edge -- only the cap-height
+    // increases.
+    CGFloat fontSize = 144.0;     // sane default if probe fails
+
+    UIFont *probe = lf_makeAdaptiveNumericFont(100.0, fontWeight,
+                                               fontWidth, hght);
+    if (probe) {
         CGSize probeSize = [probeText sizeWithAttributes:
-            @{ NSFontAttributeName: probe100 }];
+            @{ NSFontAttributeName: probe }];
         if (probeSize.width > 1.0) {
-            // Width scales linearly with fontSize, so the size that
-            // hits targetTextW is targetTextW * 100 / probeSize.width.
+            // Width scales linearly with fontSize at fixed axes,
+            // so the size that hits targetTextW is exactly
+            // targetTextW * 100 / probeSize.width.
             fontSize = targetTextW * 100.0 / probeSize.width;
         }
     }
@@ -433,12 +453,13 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
                                                   fontWidth, hght);
     if (!timeFont) {
         // Bundled ADTNumeric.ttc is missing or didn't register
-        // (descriptor resolver substituted a non-Adaptive font). Fall
-        // back to the legacy static-font path: scale the user's chosen
-        // font preset by vStretch so resize at least changes SOMETHING
-        // visually -- but without HGHT support this fallback also
-        // grows the digit width, so the clock won't behave perfectly.
-        timeFont = [s resolvedFontForReferenceSize:fontSize * vStretch];
+        // (descriptor resolver substituted a non-Adaptive font).
+        // Fall back to the legacy static-font path: scale the user's
+        // chosen font preset by the height ratio so resize at least
+        // changes height visually -- but without HGHT support this
+        // fallback also grows the digit width, so the clock won't
+        // behave perfectly.
+        timeFont = [s resolvedFontForReferenceSize:fontSize * (hght / 100.0)];
     }
     _timeLabel.font = timeFont;
 
@@ -446,6 +467,30 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
         @{ NSFontAttributeName: timeFont }];
     if (timeSize.width  < 1.0) timeSize.width  = 1.0;
     if (timeSize.height < 1.0) timeSize.height = 1.0;
+
+    // === Safety-net shrink ===
+    //
+    // If the natural rendered width somehow STILL exceeds targetTextW
+    // (e.g. the linear-scaling assumption breaks for this font, or
+    // glyph ink overshoots advance width on a particular HGHT value),
+    // shrink fontSize in one shot to fit. Preserves the chosen axes.
+    // This is what keeps the digits from poking past the selection-
+    // box border at any vStretch value.
+    if (timeSize.width > targetTextW + 1.0) {
+        CGFloat shrink = targetTextW / timeSize.width;
+        fontSize *= shrink;
+        UIFont *retried = lf_makeAdaptiveNumericFont(fontSize, fontWeight,
+                                                     fontWidth, hght);
+        if (!retried) {
+            retried = [s resolvedFontForReferenceSize:fontSize * (hght / 100.0)];
+        }
+        timeFont = retried;
+        _timeLabel.font = timeFont;
+        timeSize = [probeText sizeWithAttributes:
+            @{ NSFontAttributeName: timeFont }];
+        if (timeSize.width  < 1.0) timeSize.width  = 1.0;
+        if (timeSize.height < 1.0) timeSize.height = 1.0;
+    }
 
     // Cap height + ascender headroom for the chosen variation. The
     // Adaptive Numeric font's MVAR table makes UIFont.capHeight and
