@@ -56,8 +56,9 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 @property (nonatomic, strong) UIVisualEffectView  *bottomPanelBlur;
 @property (nonatomic, strong) UICollectionView    *fontPickerRow;
 @property (nonatomic, strong) UICollectionView    *colorPickerRow;
-@property (nonatomic, strong) UISlider            *glassSlider;
-@property (nonatomic, strong) UILabel             *glassLabel;
+@property (nonatomic, strong) UIButton            *glassToggleButton;
+@property (nonatomic, strong) UIButton            *solidToggleButton;
+@property (nonatomic, strong) UIView              *modeToggleContainer;
 // iOS 16/26 customize-sheet behaviour: the bottom panel is HIDDEN
 // when the editor first appears (just selection rect + handle on
 // the clock). Tapping the clock toggles the panel up/down. Tapping
@@ -161,7 +162,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [self buildCloseButton];
     [self buildFontRow];
     [self buildColorRow];
-    [self buildGlassSlider];
+    [self buildModeToggle];
 }
 
 - (void)buildFontRow {
@@ -202,22 +203,71 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [_bottomPanel addSubview:_colorPickerRow];
 }
 
-- (void)buildGlassSlider {
-    _glassLabel              = [UILabel new];
-    _glassLabel.text         = @"Glass";
-    _glassLabel.textColor    = [UIColor whiteColor];
-    _glassLabel.font         = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    [_bottomPanel addSubview:_glassLabel];
+// iOS 26 segmented Glass/Solid toggle. Replaces the previous 0..3
+// liquidGlassIntensity slider, which the user found ugly and which
+// wasn't really matching iOS 26's mode-style switching anyway.
+//
+// Two modes:
+//   Glass: liquidGlassIntensity = 2 (medium-strength Liquid Glass
+//          backdrop on the time digits -- translucent blurred panel
+//          with subtle rim and specular highlight, the iOS 26 look)
+//   Solid: liquidGlassIntensity = 0 (no glass, digits render flat
+//          in their picked color; clearest most-readable mode)
+//
+// Visually it's a single dark pill with two segments inside; the
+// active segment gets a brighter "selected" pill, the inactive one
+// stays subtly dimmed. Same dimensions as a row of pickers above
+// (~40pt tall, full bar width minus side margin).
+- (void)buildModeToggle {
+    _modeToggleContainer                       = [UIView new];
+    _modeToggleContainer.backgroundColor       = [UIColor colorWithWhite:0.0 alpha:0.30];
+    _modeToggleContainer.layer.cornerRadius    = 14;
+    _modeToggleContainer.layer.masksToBounds   = YES;
+    [_bottomPanel addSubview:_modeToggleContainer];
 
-    _glassSlider                  = [UISlider new];
-    _glassSlider.minimumValue     = 0;
-    _glassSlider.maximumValue     = 3;
-    _glassSlider.value            = (float)[LFClockSettings shared].liquidGlassIntensity;
-    _glassSlider.tintColor        = [UIColor whiteColor];
-    _glassSlider.continuous       = YES;
-    [_glassSlider addTarget:self action:@selector(onGlassSliderChanged:)
-           forControlEvents:UIControlEventValueChanged];
-    [_bottomPanel addSubview:_glassSlider];
+    _glassToggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_glassToggleButton setTitle:@"Glass" forState:UIControlStateNormal];
+    _glassToggleButton.titleLabel.font =
+        [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    [_glassToggleButton addTarget:self action:@selector(onGlassMode)
+                 forControlEvents:UIControlEventTouchUpInside];
+    [_modeToggleContainer addSubview:_glassToggleButton];
+
+    _solidToggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_solidToggleButton setTitle:@"Solid" forState:UIControlStateNormal];
+    _solidToggleButton.titleLabel.font =
+        [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    [_solidToggleButton addTarget:self action:@selector(onSolidMode)
+                 forControlEvents:UIControlEventTouchUpInside];
+    [_modeToggleContainer addSubview:_solidToggleButton];
+
+    [self refreshModeToggleSelection];
+}
+
+- (void)refreshModeToggleSelection {
+    BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
+    UIColor *active   = [UIColor colorWithWhite:1.0 alpha:0.90];
+    UIColor *inactive = [UIColor colorWithWhite:1.0 alpha:0.45];
+    [_glassToggleButton setTitleColor:(isGlass ? active : inactive)
+                             forState:UIControlStateNormal];
+    [_solidToggleButton setTitleColor:(isGlass ? inactive : active)
+                             forState:UIControlStateNormal];
+    // Selected-segment background pill that highlights the active
+    // mode. We layer it as a sibling backdrop INSIDE the toggle
+    // container, frame-animated by viewDidLayoutSubviews on each
+    // refresh.
+    static const NSInteger kModeBackdropTag = 0xB10B;
+    UIView *backdrop = [_modeToggleContainer viewWithTag:kModeBackdropTag];
+    if (!backdrop) {
+        backdrop                       = [UIView new];
+        backdrop.tag                   = kModeBackdropTag;
+        backdrop.backgroundColor       = [UIColor colorWithWhite:1.0 alpha:0.18];
+        backdrop.layer.cornerRadius    = 11;
+        backdrop.layer.masksToBounds   = YES;
+        backdrop.userInteractionEnabled = NO;
+        [_modeToggleContainer insertSubview:backdrop atIndex:0];
+    }
+    [self.view setNeedsLayout];
 }
 
 #pragma mark - Layout
@@ -261,8 +311,33 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     y += kLFFontRowHeight;
     _colorPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFColorRowHeight);
     y += kLFColorRowHeight;
-    _glassLabel.frame  = CGRectMake(16, y + 6, 60, 24);
-    _glassSlider.frame = CGRectMake(76, y + 4, self.view.bounds.size.width - 92, 28);
+    // Mode toggle (Glass / Solid) -- replaces the old liquidGlass
+    // slider. Centered horizontally inside the panel with comfortable
+    // side margins, ~40pt tall. The selected-segment backdrop pill
+    // animates between the two halves so taps feel instant.
+    const CGFloat kToggleSideMargin = 32.0;
+    const CGFloat kToggleH          = 36.0;
+    CGFloat toggleW = self.view.bounds.size.width - 2 * kToggleSideMargin;
+    if (toggleW < 120) toggleW = 120;
+    _modeToggleContainer.frame = CGRectMake(kToggleSideMargin,
+                                            y + (kLFSliderRowHeight - kToggleH) / 2.0,
+                                            toggleW, kToggleH);
+    CGFloat halfW = toggleW / 2.0;
+    _glassToggleButton.frame = CGRectMake(0,        0, halfW, kToggleH);
+    _solidToggleButton.frame = CGRectMake(halfW,    0, halfW, kToggleH);
+
+    // Selected-segment backdrop pill: 4pt inset on all sides, slides
+    // to the active half. We update its frame inline with the layout
+    // pass so the panel slide-up animation carries the backdrop
+    // smoothly with it.
+    UIView *backdrop = [_modeToggleContainer viewWithTag:0xB10B];
+    if (backdrop) {
+        const CGFloat inset = 4.0;
+        BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
+        CGFloat bx = isGlass ? inset : (halfW + inset);
+        backdrop.frame = CGRectMake(bx, inset,
+                                    halfW - 2 * inset, kToggleH - 2 * inset);
+    }
 }
 
 #pragma mark - Bottom panel show / hide
@@ -409,10 +484,23 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     }];
 }
 
-- (void)onGlassSliderChanged:(UISlider *)slider {
-    NSInteger v = (NSInteger)roundf(slider.value);
-    if (v == [LFClockSettings shared].liquidGlassIntensity) return;
-    [LFClockSettings shared].liquidGlassIntensity = v;
+- (void)onGlassMode {
+    if ([LFClockSettings shared].liquidGlassIntensity > 0) return;
+    // Glass on: pick intensity 2 (medium) -- this matches the iOS 26
+    // default Liquid Glass strength on the lock-screen clock face,
+    // visible blur with a subtle rim and specular highlight without
+    // being heavy. The user can tweak the underlying intensity int
+    // through the plist if they really want intensity 1 or 3, but
+    // the editor only exposes the binary on/off via the toggle.
+    [LFClockSettings shared].liquidGlassIntensity = 2;
+    [self refreshModeToggleSelection];
+    [_clockOverlay refreshFromSettings];
+}
+
+- (void)onSolidMode {
+    if ([LFClockSettings shared].liquidGlassIntensity == 0) return;
+    [LFClockSettings shared].liquidGlassIntensity = 0;
+    [self refreshModeToggleSelection];
     [_clockOverlay refreshFromSettings];
 }
 

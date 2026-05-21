@@ -235,36 +235,67 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     }
 
     UIGraphicsBeginImageContextWithOptions(screenRect.size, NO, 0.0);
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) {
+    if (!UIGraphicsGetCurrentContext()) {
         UIGraphicsEndImageContext();
         return nil;
     }
 
-    // Step 1: render the cover-sheet's parent window. This single
-    // call composites the wallpaper + cover-sheet content + our
-    // LFClockOverlay because they're all sublayers of this window.
-    CGContextSaveGState(ctx);
-    CGContextTranslateCTM(ctx, coverWindow.frame.origin.x,
-                               coverWindow.frame.origin.y);
-    [coverWindow.layer renderInContext:ctx];
-    CGContextRestoreGState(ctx);
+    // Iteration history of capture approaches, all of which have failed
+    // in different ways:
+    //
+    //   1) [coverSheet snapshotViewAfterScreenUpdates:NO]
+    //      -- missed wallpaper (it's not a subview of cover sheet on
+    //         iOS 15, lives in a separate window).
+    //   2) [UIScreen mainScreen snapshotViewAfterScreenUpdates:YES]
+    //      -- returns iOS-private view that goes blank on reparent.
+    //   3) Iterate UIApplication.windows + CALayer renderInContext:
+    //      -- captured wallpaper but missed our LFClockOverlay because
+    //         CSCoverSheetWindow doesn't always show up in
+    //         UIApplication.windows on jailbroken SpringBoard.
+    //   4) coverWindow.layer renderInContext: + sibling windows
+    //      -- still missed clock+date for reasons that are likely
+    //         related to renderInContext: not handling
+    //         hardware-composited / backing-store layers (CABackdrop,
+    //         visual effects, etc.) correctly on iOS 15.
+    //
+    // Attempt 5 (this one): use -drawViewHierarchyInRect:afterScreen-
+    // Updates:YES on the cover sheet's window.
+    //
+    // Why this should work where renderInContext: didn't:
+    //
+    //   - drawViewHierarchyInRect:afterScreenUpdates:YES is documented
+    //     to render the view hierarchy "as it appears on screen" --
+    //     i.e. it forces the system to perform a full off-screen
+    //     render pass that includes ALL hardware-composited content
+    //     (wallpaper layers, blur effects, backdrop layers,
+    //     UIVisualEffectViews etc.). renderInContext: only walks the
+    //     CALayer tree by software and skips anything backed by the
+    //     window server / hardware compositor.
+    //
+    //   - afterScreenUpdates:YES forces a fresh layout pass before
+    //     the snapshot, so we can never get a half-rendered or
+    //     pre-clock-attached state.
+    //
+    //   - The function is called once per long-press, so the
+    //     additional cost (one layout pass + one off-screen render)
+    //     is invisible to the user.
+    //
+    // Render order:
+    //   1) cover sheet window (wallpaper + cover-sheet content +
+    //      LFClockOverlay -- everything below the status bar)
+    //   2) any sibling window with HIGHER windowLevel (status bar,
+    //      system alerts) so it composites on top
+    BOOL ok = [coverWindow drawViewHierarchyInRect:screenRect
+                                afterScreenUpdates:YES];
+    (void)ok;
 
-    // Step 2: render any sibling windows that sit ABOVE the cover-
-    // sheet window (status bar, system alerts, etc.). UIApplication.
-    // windows is in z-order from earliest to latest, so we render
-    // every window whose windowLevel is HIGHER than the cover sheet
-    // window's.
     NSArray<UIWindow *> *windows = [[UIApplication sharedApplication] windows];
     for (UIWindow *win in windows) {
         if (win == coverWindow) continue;
         if (win.hidden || win.alpha < 0.01) continue;
         if (win.windowLevel <= coverWindow.windowLevel) continue;
 
-        CGContextSaveGState(ctx);
-        CGContextTranslateCTM(ctx, win.frame.origin.x, win.frame.origin.y);
-        [win.layer renderInContext:ctx];
-        CGContextRestoreGState(ctx);
+        [win drawViewHierarchyInRect:win.frame afterScreenUpdates:YES];
     }
 
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
