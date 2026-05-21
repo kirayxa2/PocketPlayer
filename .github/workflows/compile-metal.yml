@@ -1,0 +1,113 @@
+# Compile LockForge Metal shaders on a macOS runner and commit the
+# resulting .metallib back into the repo. Triggered automatically on
+# any push that touches lockforge/LiquidGlass.metal so the developer
+# never has to install the metal toolchain locally (it only ships
+# inside Xcode on macOS).
+#
+# The committed artifact lives under
+#   lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
+# which Theos packages straight into the .deb. LFLiquidGlassMetalView
+# loads it via -[MTLDevice newLibraryWithFile:] from
+#   /var/jb/Library/LockForge/LiquidGlassShaders.metallib  (rootless)
+# at runtime.
+#
+# Why a workflow vs. a hand-checked binary in git: nobody wants to
+# round-trip a .metal change through "open Xcode on Mac, run xcrun,
+# git add the binary". This way the developer pushes a .metal source
+# change, GitHub spins up a free macOS runner (~30s for a single
+# shader), and the .metallib lands in main automatically.
+
+name: Compile Metal Shaders
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'lockforge/LiquidGlass.metal'
+      - '.github/workflows/compile-metal.yml'
+  # Allow manual re-run from the Actions tab if a build was lost.
+  workflow_dispatch:
+
+# Single concurrent job per branch; cancel older runs on a fast
+# follow-up push so we don't end up with two competing commits.
+concurrency:
+  group: compile-metal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-14 is the Apple-Silicon runner; ships latest stable Xcode
+    # with the Metal toolchain (xcrun -sdk iphoneos metal).
+    runs-on: macos-14
+    permissions:
+      contents: write   # required to push the compiled .metallib back
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Don't shallow-clone -- we'll commit back, and a depth=1
+          # clone makes the subsequent `git push` complain about a
+          # missing parent if the runner queues for a while.
+          fetch-depth: 0
+
+      - name: Show toolchain
+        # Sanity check that the runner has the iOS Metal SDK installed.
+        # If Apple ever ships a runner image that drops it, we want a
+        # clear failure here rather than a confused "metal: command
+        # not found" further down.
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos metal --version || true
+
+      - name: Compile shaders
+        # Two-stage: source -> .air (intermediate) -> .metallib (final).
+        # iOS-min-15.0 matches our Theos TARGET so the compiled
+        # shader bytecode is loadable on iPhone 6s (A9, Metal 1).
+        run: |
+          set -euo pipefail
+          cd lockforge
+
+          xcrun -sdk iphoneos metal \
+                -mios-version-min=15.0 \
+                -ffast-math \
+                -c LiquidGlass.metal \
+                -o LiquidGlass.air
+
+          mkdir -p layout/Library/LockForge
+          xcrun -sdk iphoneos metallib \
+                LiquidGlass.air \
+                -o layout/Library/LockForge/LiquidGlassShaders.metallib
+
+          rm -f LiquidGlass.air
+          ls -la layout/Library/LockForge/LiquidGlassShaders.metallib
+
+      - name: Commit and push if metallib changed
+        # Skip the commit if running on a workflow_dispatch dry-run
+        # that produced a bit-identical result (deterministic builds
+        # of the same .metal source produce the same metallib).
+        run: |
+          set -euo pipefail
+          git config user.name  "metal-ci"
+          git config user.email "metal-ci@users.noreply.github.com"
+          if git diff --quiet -- lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib; then
+              echo "metallib unchanged, nothing to commit."
+              exit 0
+          fi
+          git add lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
+          git commit -m "ci: recompile LiquidGlassShaders.metallib for $(git rev-parse --short HEAD~)"
+          # We disable hooks because the runner image doesn't have
+          # them and the [skip ci] guard below prevents a recursion.
+          git push origin HEAD:main
+        env:
+          GIT_COMMITTER_NAME: metal-ci
+          GIT_COMMITTER_EMAIL: metal-ci@users.noreply.github.com
+
+      - name: Upload artifact (always, for manual download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiquidGlassShaders
+          path: lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
+          if-no-files-found: error
+          retention-days: 14

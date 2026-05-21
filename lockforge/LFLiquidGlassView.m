@@ -1,6 +1,30 @@
 #import "LFLiquidGlassView.h"
+#import "LFLiquidGlassMetalView.h"
+
+// =====================================================================
+// LFLiquidGlassView is now a thin shell that prefers the Metal-driven
+// LFLiquidGlassMetalView (when LiquidGlassShaders.metallib was bundled
+// AND the device has a Metal device, which is every iOS 15 iPhone),
+// and falls back to the original UIVisualEffectView + tint + rim +
+// specular setup when Metal isn't usable. The Metal path runs the
+// LiquidGlassFragment.metal shader (refraction + chromatic dispersion
+// + Fresnel rim) so the visible result is the iOS 26 Liquid Glass
+// look on the digit shapes themselves -- which the masked-blur path
+// never quite hit.
+//
+// All public setters (intensity / tintColor / glassCornerRadius /
+// shimmer offset) are forwarded to whichever backend is active; the
+// rest of the tweak (LFClockOverlay) doesn't know or care which one
+// is running.
+// =====================================================================
 
 @interface LFLiquidGlassView ()
+// Metal-driven backend (preferred). When non-nil, the legacy fields
+// below stay at their initial nil values and aren't installed in the
+// view hierarchy.
+@property (nonatomic, strong) LFLiquidGlassMetalView *metalBackend;
+
+// ----- Legacy fallback path (used when metalBackend is nil) -----
 // The blur layer underneath. Style swapped between thin/regular based
 // on intensity. Frame matches our bounds.
 @property (nonatomic, strong) UIVisualEffectView  *blur;
@@ -33,8 +57,20 @@
     self.userInteractionEnabled = NO;
     self.backgroundColor        = [UIColor clearColor];
 
-    [self buildSubviews];
-    [self applyIntensity];
+    // Prefer Metal. If it's not available the legacy subviews are
+    // built and the rest of the file behaves as before.
+    if ([LFLiquidGlassMetalView isAvailable]) {
+        _metalBackend                       = [[LFLiquidGlassMetalView alloc] initWithFrame:self.bounds];
+        _metalBackend.autoresizingMask      = UIViewAutoresizingFlexibleWidth |
+                                              UIViewAutoresizingFlexibleHeight;
+        _metalBackend.intensity             = _intensity;
+        _metalBackend.tintColor             = _tintColor;
+        _metalBackend.glassCornerRadius     = _glassCornerRadius;
+        [self addSubview:_metalBackend];
+    } else {
+        [self buildSubviews];
+        [self applyIntensity];
+    }
 
     return self;
 }
@@ -62,6 +98,15 @@
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+    if (_metalBackend) {
+        // Metal backend uses its own MTKView that resizes via
+        // autoresizingMask; nothing else to lay out here. We must
+        // NOT touch self.layer.cornerRadius / shadow because the
+        // Metal view paints the rounded shape from the SDF inside
+        // its fragment shader -- adding a cornerRadius here would
+        // double-clip and lose the soft pixel-feathered edge.
+        return;
+    }
     _blur.frame                  = self.bounds;
     _tintOverlay.frame           = self.bounds;
     _rimLayer.frame              = self.bounds;
@@ -83,16 +128,33 @@
 
 - (void)setIntensity:(NSInteger)v {
     _intensity = MAX(0, MIN(3, v));
+    if (_metalBackend) {
+        _metalBackend.intensity = _intensity;
+        // Surface-hide LFLiquidGlassView itself when off so callers
+        // that toggled .hidden via LFLiquidGlassView still see the
+        // expected visibility -- LFClockOverlay reads self.hidden
+        // implicitly through the layer's mask side-effects.
+        self.hidden = (_intensity == 0);
+        return;
+    }
     [self applyIntensity];
 }
 
 - (void)setTintColor:(UIColor *)t {
     _tintColor = t ?: [UIColor whiteColor];
+    if (_metalBackend) {
+        _metalBackend.tintColor = _tintColor;
+        return;
+    }
     [self applyIntensity];
 }
 
 - (void)setGlassCornerRadius:(CGFloat)r {
     _glassCornerRadius = MAX(0, r);
+    if (_metalBackend) {
+        _metalBackend.glassCornerRadius = _glassCornerRadius;
+        return;
+    }
     [self setNeedsLayout];
 }
 
@@ -135,6 +197,10 @@
 }
 
 - (void)setShimmerOffset:(CGPoint)offset {
+    if (_metalBackend) {
+        [_metalBackend setShimmerOffset:offset];
+        return;
+    }
     if (!_gyroEffectsEnabled()) return;
     if (_intensity == 0) return;
 

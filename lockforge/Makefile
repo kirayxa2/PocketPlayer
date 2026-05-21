@@ -21,6 +21,7 @@ LockForge_FILES = \
     Tweak.x \
     LFClockSettings.m \
     LFLiquidGlassView.m \
+    LFLiquidGlassMetalView.m \
     LFGyroscopeManager.m \
     LFClockOverlay.m \
     LFLockEditor.m \
@@ -34,7 +35,14 @@ LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-vari
 # with custom HGHT (height) axis values to match Apple's iOS 26
 # lock-screen-clock resize behaviour: digits grow taller without
 # changing width or stroke thickness.
-LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText
+#
+# Metal + MetalKit drive the Liquid Glass shader pipeline in
+# LFLiquidGlassMetalView. The shader binary itself
+# (LiquidGlassShaders.metallib) is compiled by .github/workflows/
+# compile-metal.yml on a macOS runner whenever LiquidGlass.metal
+# changes -- it lives under layout/Library/LockForge/ and is bundled
+# into the .deb automatically by Theos.
+LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText Metal MetalKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
