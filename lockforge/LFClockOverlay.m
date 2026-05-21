@@ -36,13 +36,24 @@ static const CGFloat kLFHandleTouchDiameter  = 44.0;
 static const CGFloat kLFFullWidthSideInset   = 8.0;
 
 // Date pill (iOS 16/26 floats the date in a small rounded rectangle
-// with a thin border above the time). Width follows the date text;
+// above the clock's selection box). Width follows the date text;
 // the constants below define padding inside the pill plus its visual
-// styling. Pill height is fixed at 22pt -- matches Apple's reference
-// frame on iPhone.
+// styling. The pill is OUTSIDE the selection box and its rounded
+// border only appears in edit mode -- exactly the same chrome as
+// the selection box itself.
 static const CGFloat kLFDatePillVPad         = 4.0;
 static const CGFloat kLFDatePillHPad         = 14.0;
-static const CGFloat kLFDatePillToTimeGap    = 12.0;
+static const CGFloat kLFDatePillToBoxGap     = 8.0;
+
+// Padding INSIDE the clock's selection box: equal breathing room
+// between the rounded outline and the time digits on all four
+// sides. iOS 16/26 keeps the digits floating slightly off the
+// outline; before this constant we had ~30pt above (left over from
+// the date pill being inside the box) and only ~8pt on each side,
+// which looked unbalanced. With kLFTimePad applied symmetrically
+// the digits sit centred in the box with the same small gap on
+// every edge.
+static const CGFloat kLFTimePad              = 8.0;
 
 @interface LFClockOverlay () <UIGestureRecognizerDelegate> {
     id _gyroSubscriberKey;
@@ -66,9 +77,18 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 }
 @property (nonatomic, strong) LFLiquidGlassView *glassBackground;
 // Date pill: small rounded rect with a thin white border that floats
-// just above the time label, exactly like iOS 16/26's editor preview.
-// Contains the dateLabel as its single subview.
+// ABOVE the clock's selection box, exactly like iOS 16/26's editor
+// preview. Contains the dateLabel as its single subview. The border
+// is only set when -isEditing -- otherwise the pill is just a
+// transparent label container, just like Apple shows the date as
+// plain text outside the editor.
 @property (nonatomic, strong) UIView            *datePillView;
+// Selection box: rounded-rect chrome that wraps the time digits.
+// Always present as a layout container (so the time has a stable
+// local coord system), but the visible border only appears in edit
+// mode. Owns the resize-handle arc layer so the arc is visually a
+// piece of the box's bottom-right corner curve.
+@property (nonatomic, strong) UIView            *selectionBoxView;
 @property (nonatomic, strong) UILabel           *timeLabel;
 @property (nonatomic, strong) UILabel           *dateLabel;
 
@@ -121,16 +141,14 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _glassBackground.glassCornerRadius = 28;
     [self addSubview:_glassBackground];
 
-    // Date pill: floats above the time. iOS 16/26 styling -- thin
-    // semi-transparent border around date text. Translucent fill is
-    // very subtle so it reads as a delineated container without
-    // dominating the wallpaper. Border thickness 1pt; corner radius
-    // is half the pill's height so the ends are perfectly round.
+    // Date pill: floats above the selection box. The border colour
+    // and width are now driven by recomputeMetrics depending on
+    // _isEditing -- in non-editing mode the pill is just a label
+    // container with no visible chrome, matching what iOS shows on
+    // the live lock screen. In editing mode it gets the same thin
+    // rounded outline as the selection box.
     _datePillView                       = [UIView new];
     _datePillView.userInteractionEnabled = NO;
-    _datePillView.layer.borderWidth     = 1.0;
-    _datePillView.layer.borderColor     =
-        [[UIColor colorWithWhite:1.0 alpha:0.25] CGColor];
     _datePillView.layer.masksToBounds   = YES;
     [self addSubview:_datePillView];
 
@@ -139,12 +157,25 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _dateLabel.userInteractionEnabled = NO;
     [_datePillView addSubview:_dateLabel];
 
+    // Selection box: rounded-rect chrome that wraps the time digits.
+    // Always present as a layout container so the time label has a
+    // stable local coordinate system; the visible border itself is
+    // toggled in recomputeMetrics depending on _isEditing.
+    // masksToBounds=NO so the resize-handle arc, which sits on this
+    // view's layer and naturally extends a little past the corner
+    // due to its half-stroke width, doesn't get clipped.
+    _selectionBoxView                        = [UIView new];
+    _selectionBoxView.userInteractionEnabled = NO;
+    _selectionBoxView.backgroundColor        = [UIColor clearColor];
+    _selectionBoxView.layer.masksToBounds    = NO;
+    [self addSubview:_selectionBoxView];
+
     _timeLabel               = [UILabel new];
     _timeLabel.textAlignment = NSTextAlignmentCenter;
     _timeLabel.userInteractionEnabled = NO;
     _timeLabel.numberOfLines = 1;
     _timeLabel.adjustsFontSizeToFitWidth = NO;
-    [self addSubview:_timeLabel];
+    [_selectionBoxView addSubview:_timeLabel];
 
     [self buildResizeHandle];
 }
@@ -176,7 +207,7 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _resizeHandleArc.shadowRadius  = 3.0;
     _resizeHandleArc.shadowOffset  = CGSizeMake(0, 1);
     _resizeHandleArc.hidden       = YES;
-    [self.layer addSublayer:_resizeHandleArc];
+    [_selectionBoxView.layer addSublayer:_resizeHandleArc];
 }
 
 - (void)installGestures {
@@ -225,9 +256,10 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
 - (void)recomputeMetrics {
     LFClockSettings *s = [LFClockSettings shared];
 
-    // (Time font is computed below by auto-fit-to-width, after we know
-    // the parent's bounds and the current verticalStretch. We don't
-    // assign a placeholder here -- it would just be overwritten.)
+    // (Time font is computed below by the iOS 26 non-uniform stretch
+    // algorithm, after we know the parent's bounds and the current
+    // verticalStretch. Don't pre-assign anything to _timeLabel.font
+    // here -- it'd just be overwritten.)
 
     UIFont *dateFont = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     if (@available(iOS 13.0, *)) {
@@ -245,48 +277,40 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
 
     // Date pill geometry: text size + symmetric padding, rounded
-    // ends. Pill is wider than the date text by 2 * kLFDatePillHPad.
+    // ends.
     CGFloat datePillW = ceil(dateSize.width)  + 2 * kLFDatePillHPad;
     CGFloat datePillH = ceil(dateSize.height) + 2 * kLFDatePillVPad;
 
-    // FULL-WIDTH iOS 16/26-style selection rectangle. The clock
-    // overlay's WIDTH is the screen width minus a small bezel inset
-    // -- NOT the natural width of the time text.
+    // FULL-WIDTH iOS 16/26-style selection box. Spans the screen
+    // width minus a small bezel inset -- not the natural width of
+    // the digit text.
     UIView *parentForWidth = self.superview;
     CGFloat parentW = parentForWidth ? parentForWidth.bounds.size.width : 393.0;
-    CGFloat width   = MAX(parentW - kLFFullWidthSideInset * 2.0,
-                          datePillW + 24);  // never narrower than the date pill
+    CGFloat boxW    = MAX(parentW - kLFFullWidthSideInset * 2.0,
+                          datePillW + 24);
 
     // === iOS 26-style non-uniform stretch with HUGE max height ===
     //
-    // Apple's iOS 26 resize:
-    //   - Digits ALWAYS fill the screen width (minus small padding)
-    //   - Drag handle ONLY changes HEIGHT (non-uniform Y scale)
-    //   - Width stays constant regardless of vStretch
-    //   - At max the clock takes well over half the screen height
-    //
-    // Implementation rationale: we render the time at a FIXED HUGE
-    // font size (kLFLargeFontPoints), which means natural text size
-    // is much larger than any device screen. We then apply a
-    // CGAffineTransform with TWO compressions:
+    // We render the time at a FIXED HUGE font size and let a
+    // CGAffineTransform compress the natural text on both axes:
     //
     //   - scaleX (constant for given screen width): always compresses
-    //     the natural width down to the screen width, so digits look
-    //     like they fill the screen edge-to-edge
-    //   - scaleY (depends on vStretch): compresses the natural height
-    //     more or less, so the digits look short or tall
+    //     the natural width down to the screen width so the digits
+    //     look like they fill the screen edge-to-edge with only a
+    //     small breathing-room padding (kLFTimePad on each side).
+    //   - scaleY (depends on vStretch): compresses the natural
+    //     height more or less, so the digits look short or tall.
     //
     // Both transforms ALWAYS compress (scale < 1.0) -- never expand.
-    // Compression is crisper than expansion because it discards pixels
-    // rather than interpolating new ones. So at every vStretch from
-    // 1.0 to kLFVStretchMax, the digits stay sharp.
+    // Compression is crisper than expansion because it discards
+    // pixels rather than interpolating them.
     //
-    // vStretch=1.0           → scaleY = 1.0/kLFVStretchMax (~0.4),
-    //                          digits compact (~170pt tall on 6s)
-    // vStretch=kLFVStretchMax → scaleY = 1.0 (identity along Y),
-    //                          digits at full rendered height
-    //                          (~430pt tall on 6s -- over 60% of
-    //                          the 6s screen, way more than half)
+    // vStretch=1.0           -> scaleY = 1.0/kLFVStretchMax (~0.4),
+    //                           digits compact (~170pt tall on 6s)
+    // vStretch=kLFVStretchMax -> scaleY = 1.0 (identity along Y),
+    //                           digits at full rendered height
+    //                           (~430pt tall on 6s, well over half
+    //                           the screen).
     static const CGFloat kLFVStretchMax     = 2.5;
     static const CGFloat kLFLargeFontPoints = 380.0;
 
@@ -295,93 +319,84 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     UIFont *timeFont = [s resolvedFontForReferenceSize:kLFLargeFontPoints];
     _timeLabel.font  = timeFont;
 
-    // Measure at the HUGE rendered font size. timeSize is much larger
-    // than the screen on every supported device.
     CGSize timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
-    if (timeSize.width < 1.0)  timeSize.width  = 1.0;
+    if (timeSize.width  < 1.0) timeSize.width  = 1.0;
     if (timeSize.height < 1.0) timeSize.height = 1.0;
 
-    // scaleX always compresses width to fit (overlay width - 16pt).
-    // It's effectively constant for a given screen.
-    CGFloat targetTextW = MAX(80.0, width - 16.0);
+    // Time digits live INSIDE the selection box with kLFTimePad of
+    // breathing room on every side, so their target visible width
+    // is boxW minus padding on both sides.
+    CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
     CGFloat scaleX      = targetTextW / timeSize.width;
-    if (scaleX > 1.0) scaleX = 1.0;   // never expand
+    if (scaleX > 1.0) scaleX = 1.0;
 
-    // scaleY varies with vStretch.
     CGFloat vStretch = MAX(1.0, MIN(kLFVStretchMax, s.verticalStretch));
     CGFloat scaleY   = vStretch / kLFVStretchMax;
 
-    // Visual sizes after transform.
-    CGFloat visualTimeW = timeSize.width  * scaleX;   // = targetTextW (constant)
     CGFloat visualTimeH = timeSize.height * scaleY;
 
-    CGFloat height = datePillH + kLFDatePillToTimeGap + ceil(visualTimeH) + 12;
+    // Selection box height = digits + EQUAL padding on top and
+    // bottom. Same kLFTimePad value as on the sides, so all four
+    // edges share the same gap.
+    CGFloat boxH   = ceil(visualTimeH) + 2 * kLFTimePad;
+
+    // Self bounds: date pill stacked above the selection box, with
+    // a small fixed gap between them.
+    CGFloat width  = boxW;
+    CGFloat height = datePillH + kLFDatePillToBoxGap + boxH;
     _naturalSize   = CGSizeMake(width, height);
 
-    // Apply alignment to the labels' textAlignment so date and time
-    // glue to the same edge. Then anchor the time label's layer at
-    // that edge so the CGAffineTransform stretch grows OUT of the
-    // anchored side instead of from the centre. This is exactly
-    // what iOS 26 does -- the digit cluster's edge stays put while
-    // the rest of the digits expand outward.
     NSTextAlignment ta = NSTextAlignmentCenter;
     CGFloat        ax = 0.5;
     if (s.alignment == LFClockAlignmentLeft)  { ta = NSTextAlignmentLeft;  ax = 0.0; }
     if (s.alignment == LFClockAlignmentRight) { ta = NSTextAlignmentRight; ax = 1.0; }
     _timeLabel.textAlignment = ta;
-    _dateLabel.textAlignment = NSTextAlignmentCenter;   // date pill always centered
+    _dateLabel.textAlignment = NSTextAlignmentCenter;
 
     self.bounds = CGRectMake(0, 0, width, height);
 
-    // Date pill -- rounded rectangle with thin border, centered
-    // horizontally, sitting at the top of our overlay.
-    _datePillView.frame = CGRectMake((width - datePillW) / 2.0, 0,
-                                     datePillW, datePillH);
+    // Date pill at the top of self, horizontally centred.
+    _datePillView.frame              = CGRectMake((width - datePillW) / 2.0, 0,
+                                                  datePillW, datePillH);
     _datePillView.layer.cornerRadius = datePillH / 2.0;
-    _dateLabel.frame = CGRectMake(0, 0, datePillW, datePillH);
+    _dateLabel.frame                 = CGRectMake(0, 0, datePillW, datePillH);
 
-    // The time label is rendered at HUGE natural size; transform
-    // compresses to fit screen width (scaleX) and current vStretch
-    // (scaleY). Both compressions stay crisp because we never expand.
-    //
-    // We use bounds + position + anchorPoint (NOT frame) so the
-    // layer's intrinsic rendering canvas stays huge while the visual
-    // result on screen is compressed cleanly.
-    _timeLabel.transform = CGAffineTransformIdentity;   // reset before bounds change
+    // Selection box below the pill, full overlay width.
+    CGFloat boxY = datePillH + kLFDatePillToBoxGap;
+    _selectionBoxView.frame = CGRectMake(0, boxY, boxW, boxH);
+
+    // Time label inside the selection box. The label's bounds stay
+    // huge (natural font size) and a transform compresses the visible
+    // result into the targetTextW / visualTimeH rectangle, vertically
+    // centred in the box so kLFTimePad of breathing room is visible
+    // above and below.
+    _timeLabel.transform = CGAffineTransformIdentity;
     _timeLabel.bounds    = CGRectMake(0, 0, timeSize.width, timeSize.height);
 
-    CGFloat timeY = datePillH + kLFDatePillToTimeGap;
-    CGFloat anchorScreenX;
-    if (s.alignment == LFClockAlignmentLeft)        anchorScreenX = 0;
-    else if (s.alignment == LFClockAlignmentRight)  anchorScreenX = width;
-    else                                            anchorScreenX = width / 2.0;
+    CGFloat anchorBoxX;
+    if (s.alignment == LFClockAlignmentLeft)        anchorBoxX = kLFTimePad;
+    else if (s.alignment == LFClockAlignmentRight)  anchorBoxX = boxW - kLFTimePad;
+    else                                            anchorBoxX = boxW / 2.0;
 
-    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
-    _timeLabel.layer.position    = CGPointMake(anchorScreenX, timeY);
-    // Combined non-uniform compression.
-    _timeLabel.transform = CGAffineTransformMakeScale(scaleX, scaleY);
+    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.5);
+    _timeLabel.layer.position    = CGPointMake(anchorBoxX, boxH / 2.0);
+    _timeLabel.transform         = CGAffineTransformMakeScale(scaleX, scaleY);
 
-    _glassBackground.frame = self.bounds;
-    _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
-    _glassBackground.intensity = s.liquidGlassIntensity;
+    // Liquid-glass backdrop sits BEHIND the time digits, occupying
+    // exactly the selection box. We position it in self's coords
+    // (it's a sibling of _selectionBoxView) so the box's chrome
+    // stays in front and the glass corner radius matches the box.
+    _glassBackground.frame             = _selectionBoxView.frame;
+    _glassBackground.glassCornerRadius = MIN(28, boxH / 2.0);
+    _glassBackground.intensity         = s.liquidGlassIntensity;
 
-    // Resize handle: a CAShapeLayer arc whose radius matches the
-    // editing-mode border's corner radius, so the handle reads as a
-    // FATTER PIECE OF THE BORDER itself rather than a separate pill
-    // floating near the corner. Plus a 44pt invisible touch view
-    // centered on the arc's midpoint for fingertip comfort.
-    //
-    // Math: the bottom-right corner-radius circle is centered at
-    // (width - R, height - R). The arc sweeps from `mid - sweep/2`
-    // to `mid + sweep/2` around 45° (i.e. the diagonal toward the
-    // corner). All angles in radians; UIBezierPath uses standard
-    // math convention (0 = +X axis, 90° = +Y axis in UIKit's
-    // y-down coords, so 45° points down-and-right toward the
-    // corner).
-    CGFloat cornerR     = MIN(28, height / 2.0);
-    CGFloat sweep       = kLFHandleArcSweepDeg * M_PI / 180.0;
-    CGFloat midAngle    = M_PI_4;                    // 45° = toward bottom-right corner
-    CGPoint cornerCircleC = CGPointMake(width - cornerR, height - cornerR);
+    // Resize-handle arc: traces the bottom-right corner curve of
+    // the SELECTION BOX, drawn in the box's local coord space (the
+    // arc layer is on _selectionBoxView.layer).
+    CGFloat cornerR       = MIN(28, boxH / 2.0);
+    CGFloat sweep         = kLFHandleArcSweepDeg * M_PI / 180.0;
+    CGFloat midAngle      = M_PI_4;   // 45 deg = toward bottom-right
+    CGPoint cornerCircleC = CGPointMake(boxW - cornerR, boxH - cornerR);
 
     UIBezierPath *arcPath =
         [UIBezierPath bezierPathWithArcCenter:cornerCircleC
@@ -390,38 +405,51 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
                                      endAngle:midAngle + sweep / 2.0
                                     clockwise:YES];
     _resizeHandleArc.path   = arcPath.CGPath;
-    _resizeHandleArc.frame  = self.bounds;
+    _resizeHandleArc.frame  = _selectionBoxView.bounds;
     _resizeHandleArc.hidden = !_isEditing;
 
-    // Touch zone: 44x44 centered on the midpoint of the arc (the 45°
-    // tangent point). Since the arc passes through this point,
-    // dragging the touch zone is dragging the visible handle.
-    CGFloat midX = cornerCircleC.x + cornerR * cos(midAngle);
-    CGFloat midY = cornerCircleC.y + cornerR * sin(midAngle);
-    _resizeHandle.frame = CGRectMake(midX - kLFHandleTouchDiameter / 2.0,
-                                     midY - kLFHandleTouchDiameter / 2.0,
+    // Touch zone in self's coord space: convert from box-local to
+    // self by adding the selection box's origin offset. Half the
+    // 44x44 sits OUTSIDE the box (since its centre is on the corner)
+    // -- self's hitTest override catches that outer half too.
+    CGFloat midX        = cornerCircleC.x + cornerR * cos(midAngle);
+    CGFloat midY        = cornerCircleC.y + cornerR * sin(midAngle);
+    CGFloat midInSelfX  = midX + _selectionBoxView.frame.origin.x;
+    CGFloat midInSelfY  = midY + _selectionBoxView.frame.origin.y;
+    _resizeHandle.frame = CGRectMake(midInSelfX - kLFHandleTouchDiameter / 2.0,
+                                     midInSelfY - kLFHandleTouchDiameter / 2.0,
                                      kLFHandleTouchDiameter,
                                      kLFHandleTouchDiameter);
     _resizeHandle.hidden = !_isEditing;
 
-    // Editing-mode chrome: thin border around the entire clock area
-    // (matches Apple's "selected" indicator) plus the date pill keeps
-    // its border whether or not editing is active.
+    // Editing-mode chrome: thin rounded outline on BOTH the date
+    // pill AND the selection box, identical style. Outside edit
+    // mode neither view shows a border, so the live lock screen
+    // displays the date as plain text above plain digits.
     if (_isEditing) {
-        self.layer.borderColor   = [[UIColor colorWithWhite:1.0 alpha:0.30] CGColor];
-        self.layer.borderWidth   = 1.0;
-        self.layer.cornerRadius  = _glassBackground.glassCornerRadius;
+        CGColorRef chrome = [[UIColor colorWithWhite:1.0 alpha:0.30] CGColor];
+        _selectionBoxView.layer.borderColor  = chrome;
+        _selectionBoxView.layer.borderWidth  = 1.0;
+        _selectionBoxView.layer.cornerRadius = MIN(28, boxH / 2.0);
+        _datePillView.layer.borderColor      = chrome;
+        _datePillView.layer.borderWidth      = 1.0;
     } else {
-        self.layer.borderColor = nil;
-        self.layer.borderWidth = 0.0;
+        _selectionBoxView.layer.borderColor = nil;
+        _selectionBoxView.layer.borderWidth = 0.0;
+        _datePillView.layer.borderColor     = nil;
+        _datePillView.layer.borderWidth     = 0.0;
     }
 
+    // self.layer never has its own border now -- the selection box
+    // owns the editing-mode outline.
+    self.layer.borderWidth = 0.0;
+    self.layer.borderColor = nil;
+
     // Anchor the top edge in superview coordinates so vertical growth
-    // never pushes the date pill upward off-screen and never tugs
-    // the clock above its iOS 16/26 default position. This is the
-    // single owner of self.center.y; every recomputeMetrics call
-    // ends here so resize, font swaps, and minute-text-changes all
-    // converge to the same fixed top.
+    // never tugs the date pill upward off-screen. centerInParent... is
+    // the single owner of self.center.y; calling it at the end of
+    // every recomputeMetrics ensures resize, font swaps, and minute
+    // changes all converge to the same fixed top.
     [self centerInParentApplyingSettings];
 }
 
