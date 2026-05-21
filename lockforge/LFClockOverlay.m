@@ -34,7 +34,14 @@ static const CGFloat kLFHandleTouchDiameter  = 44.0;
 // (8pt each side) and the time digits are placed inside it via
 // textAlignment + anchor (left/center/right), exactly the way
 // Apple's editor lays them out.
-static const CGFloat kLFFullWidthSideInset   = 8.0;
+// Reduced from 8pt to 4pt -- the bigger digits at full vStretch
+// already eat most of the horizontal space, so giving the box an
+// extra 8pt of width per side lets fontSize grow further before
+// the post-measure shrink kicks in. Visual impact at default size
+// is negligible (4pt padding looks identical to 8pt at this scale)
+// while at full stretch it lets cap-height push closer to half the
+// screen height.
+static const CGFloat kLFFullWidthSideInset   = 4.0;
 
 // Date pill (iOS 16/26 floats the date in a small rounded rectangle
 // above the clock's selection box). Width follows the date text;
@@ -54,7 +61,12 @@ static const CGFloat kLFDatePillToBoxGap     = 8.0;
 // which looked unbalanced. With kLFTimePad applied symmetrically
 // the digits sit centred in the box with the same small gap on
 // every edge.
-static const CGFloat kLFTimePad              = 8.0;
+// Reduced from 8pt to 6pt for the same reason as kLFFullWidthSideInset
+// -- giving the digits more horizontal headroom inside the box lets
+// fontSize grow ~10pt further before the shrink loop limits it,
+// translating to ~7pt of extra cap-height. The remaining 6pt padding
+// still reads as a clear visible gap on every side of the digits.
+static const CGFloat kLFTimePad              = 6.0;
 
 // === Variable-axis SF Pro helper ===
 //
@@ -415,7 +427,15 @@ static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat wi
     // natural rendered width of ~310pt -- comfortably under 359pt.
     // The post-measure shrink step below catches any overflow on
     // smaller-than-6s devices.
-    CGFloat fontSize   = 100.0 + (400.0 - 100.0) * t;     // 100..400 pt
+    // fontSize cap raised from 400 to 520. The post-measure shrink
+    // step below will dynamically clamp it to whatever the screen
+    // can fit -- at full vStretch on a 6s the rendered "00:00" at
+    // Semibold + wdth=30 + 520pt is ~405pt, which the shrink scales
+    // back to ~455pt to fit the 360pt-wide target text region. Net
+    // cap-height at max ~328pt = 49% of a 6s's 667pt screen, just
+    // shy of the literal half but as close as constant-Semibold +
+    // public-axes can get without re-introducing the weight change.
+    CGFloat fontSize   = 100.0 + (520.0 - 100.0) * t;     // 100..520 pt
     CGFloat fontWeight = 600.0;                            // Semibold, CONSTANT
     CGFloat fontWidth  = 100.0 + ( 30.0 - 100.0) * t;     // wdth: 100..30
 
