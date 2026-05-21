@@ -66,8 +66,15 @@ static const CGFloat kLFBottomBarSideInset = 22.0;     // inset for "+" only
 // primary action. iOS 26 dimensions on a 6s-class screen: ~180pt
 // wide x 52pt tall, 17pt Semibold label. Earlier 124x50pt was too
 // small relative to the card and got lost on the bar.
-static const CGFloat kLFCustomizeBtnH      = 52.0;
-static const CGFloat kLFCustomizeBtnW      = 180.0;
+// User reported the previous 180x52 / 17pt Semibold size still
+// looked small relative to the card. Bumped further to match Apple's
+// iOS 26 visual weight where Customize is a substantial primary
+// action -- 240pt wide x 56pt tall, 18pt Semibold label. At this
+// width the button is ~91% of the card width on a 6s, which reads as
+// the visual anchor of the bar. The auxiliary "+" button stays at
+// 50pt diameter so the size contrast keeps it clearly secondary.
+static const CGFloat kLFCustomizeBtnH      = 56.0;
+static const CGFloat kLFCustomizeBtnW      = 240.0;
 static const CGFloat kLFPlusBtnSize        = 50.0;
 
 // Page dots (above the action bar)
@@ -172,6 +179,85 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     }
 }
 
+// Capture the live lock screen as a STATIC UIImage by rendering every
+// visible window's CALayer into one bitmap context in z-order.
+//
+// Why not -[UIScreen snapshotViewAfterScreenUpdates:] any more?
+//
+//   The previous build relied on UIScreen's snapshot view, which
+//   returns a UIView whose contents are an iOS-private representation
+//   of the captured screen. That view works fine when displayed in
+//   the same hierarchy it was captured from -- but reparenting it
+//   into a completely different container (our card view inside a
+//   horizontal UIScrollView) and resizing it via .frame can leave it
+//   blank on iOS 15. The user reported "не видно обоев", which is
+//   exactly the failure mode of that approach.
+//
+//   Honest bitmap rendering avoids the issue entirely. We walk every
+//   visible UIWindow on UIApplication, render its layer with
+//   -renderInContext: into a fresh CGBitmapContext, and end up with
+//   a UIImage that's just an array of pixels -- no iOS-private
+//   contents, no source-view dependency, no surprise blank frames
+//   when displayed in a foreign hierarchy. UIImageView then displays
+//   the UIImage at any size we want with a known scale mode.
+//
+// On SpringBoard the windows array contains (in z-order, lowest to
+// highest):
+//
+//   - SBWallpaperWindow              <- the wallpaper (THIS is what
+//                                       was missing from the previous
+//                                       cover-sheet-only snapshot)
+//   - SBHomeScreenWindow             <- icons (mostly hidden on
+//                                       lock screen)
+//   - SBCoverSheetWindow             <- the lock-screen UI
+//                                       (notifications, time, our
+//                                       installed clock overlay)
+//   - SBStatusBarWindow              <- status bar
+//
+// Iterating in z-order with -renderInContext: composites them
+// correctly: wallpaper at the bottom, cover sheet (mostly transparent)
+// on top showing through to the wallpaper, our clock on top of that.
+// Result is exactly what the user sees on screen the moment they
+// long-press.
+static UIImage *LFCaptureLockScreenImage(void) {
+    CGRect screenRect = [UIScreen mainScreen].bounds;
+    if (screenRect.size.width < 1.0 || screenRect.size.height < 1.0) {
+        return nil;
+    }
+
+    UIGraphicsBeginImageContextWithOptions(screenRect.size, NO, 0.0);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
+
+    NSArray<UIWindow *> *windows = [[UIApplication sharedApplication] windows];
+    for (UIWindow *win in windows) {
+        if (win.hidden || win.alpha < 0.01) continue;
+
+        // Apply each window's transform & frame so it lands at the
+        // right place in screen space. Most SB windows have an
+        // identity transform & full-screen frame, but be defensive --
+        // some of them (e.g. status bar in landscape) may have
+        // rotation transforms.
+        CGContextSaveGState(ctx);
+        CGContextTranslateCTM(ctx,
+                              CGRectGetMidX(win.frame),
+                              CGRectGetMidY(win.frame));
+        CGContextConcatCTM(ctx, win.transform);
+        CGContextTranslateCTM(ctx,
+                              -win.bounds.size.width / 2.0,
+                              -win.bounds.size.height / 2.0);
+        [win.layer renderInContext:ctx];
+        CGContextRestoreGState(ctx);
+    }
+
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return img;
+}
+
 // One preview card. Filled with a snapshot of the cover-sheet view,
 // rounded with the iOS 26 card radius, and decorated with a Focus
 // pill at the bottom. Tapping the card has no action in PR-A but
@@ -185,38 +271,32 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     card.layer.borderColor     =
         [[UIColor colorWithWhite:1.0 alpha:0.08] CGColor];
 
-    // Snapshot of the live lock screen. We snapshot the WHOLE SCREEN,
-    // not just _sourceCoverSheet, because on iOS 15 the wallpaper
-    // doesn't live inside the cover-sheet view -- it's rendered by a
-    // separate window underneath (SBWallpaperWindow / SBHomeScreen-
-    // Window), and the cover sheet itself is mostly transparent so the
-    // wallpaper shows through compositing. Snapshotting just the cover
-    // sheet would only capture our installed clock overlay on a black
-    // background -- which is exactly what the user reported as "пустая
-    // карточка, не видно ни обоев ни часов".
-    //
-    // [UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES walks
-    // ALL the windows in the screen's z-order and produces a single
-    // composited UIView -- so wallpaper + cover-sheet content + our
-    // clock overlay all show up in the snapshot, exactly as the user
-    // saw them just before long-pressing.
-    //
-    // afterScreenUpdates:YES forces a full re-layout pass, which is
-    // slower than :NO but reliable: the carousel only spawns once per
-    // long-press, so the perf cost is invisible. With :NO some layers
-    // (e.g. the wallpaper, which is hardware-composited) come back as
-    // empty bitmaps because their cached layer state isn't populated
-    // for offscreen rendering.
-    UIView *snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES];
-    if (!snap) {
-        // Fallback: try the cover sheet only. Won't have wallpaper,
-        // but at least won't be a totally black card.
-        snap = [_sourceCoverSheet snapshotViewAfterScreenUpdates:YES];
-    }
-    if (snap) {
-        snap.tag                = kLFTagSnapshot;
-        snap.userInteractionEnabled = NO;
+    // Render the live lock screen to a static UIImage covering ALL
+    // visible windows (wallpaper + cover sheet + clock overlay), then
+    // display via UIImageView. See LFCaptureLockScreenImage() doc-
+    // comment for why we don't use snapshotViewAfterScreenUpdates:
+    // any more (it returns a special iOS-private view that goes blank
+    // when reparented into a foreign hierarchy on iOS 15).
+    UIImage *snapImage = LFCaptureLockScreenImage();
+    if (snapImage) {
+        UIImageView *snap = [[UIImageView alloc] initWithImage:snapImage];
+        snap.tag                     = kLFTagSnapshot;
+        snap.userInteractionEnabled  = NO;
+        snap.contentMode             = UIViewContentModeScaleAspectFill;
+        snap.clipsToBounds           = YES;
         [card addSubview:snap];
+    } else {
+        // Last-ditch fallback: try the legacy snapshot path. Better
+        // to show a degraded card than a totally black one.
+        UIView *snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES];
+        if (!snap) {
+            snap = [_sourceCoverSheet snapshotViewAfterScreenUpdates:YES];
+        }
+        if (snap) {
+            snap.tag                = kLFTagSnapshot;
+            snap.userInteractionEnabled = NO;
+            [card addSubview:snap];
+        }
     }
 
     // Focus pill -- visually 1:1 with iOS 26 (rounded translucent pill,
@@ -286,7 +366,7 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     _customizeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_customizeButton setTitle:@"Customize" forState:UIControlStateNormal];
     _customizeButton.titleLabel.font =
-        [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     [_customizeButton setTitleColor:[UIColor whiteColor]
                            forState:UIControlStateNormal];
     _customizeButton.backgroundColor =
