@@ -333,12 +333,28 @@ static const CGFloat kLFTimePad              = 8.0;
     CGFloat vStretch = MAX(1.0, MIN(kLFVStretchMax, s.verticalStretch));
     CGFloat scaleY   = vStretch / kLFVStretchMax;
 
-    CGFloat visualTimeH = timeSize.height * scaleY;
-
-    // Selection box height = digits + EQUAL padding on top and
-    // bottom. Same kLFTimePad value as on the sides, so all four
-    // edges share the same gap.
-    CGFloat boxH   = ceil(visualTimeH) + 2 * kLFTimePad;
+    // Use the font's CAP HEIGHT -- not its full line-height -- to
+    // size the selection box vertically. timeSize.height returned
+    // by -sizeWithAttributes: is the FULL line-height
+    // (ascender + |descender|), which for SF Pro is ~120% of the
+    // font size. The visible cap height of digits like "9", "0"
+    // and ":" is only ~72% of the font size. So a line-height
+    // sized box has ~24% empty space above the visible cap-top
+    // and ~25% below the baseline INSIDE the box, on top of
+    // kLFTimePad. Visually that reads as huge top/bottom padding
+    // even when the side padding is small. Sizing the box from
+    // cap height instead -- and positioning the label so its
+    // visible cap-top sits exactly at kLFTimePad from the box's
+    // top edge -- collapses that empty ascender/descender region
+    // outside the box. The label's bounds still extend above and
+    // below the box (selectionBoxView has masksToBounds=NO, the
+    // empty regions render harmlessly off-box), but the user
+    // sees kLFTimePad of breathing room equally on every side
+    // of the actual digits.
+    CGFloat capHeight  = timeFont.capHeight;
+    CGFloat capTopGap  = timeFont.ascender - capHeight;  // empty above cap
+    CGFloat visualCapH = capHeight * scaleY;
+    CGFloat boxH       = ceil(visualCapH) + 2 * kLFTimePad;
 
     // Self bounds: date pill stacked above the selection box, with
     // a small fixed gap between them.
@@ -366,10 +382,13 @@ static const CGFloat kLFTimePad              = 8.0;
     _selectionBoxView.frame = CGRectMake(0, boxY, boxW, boxH);
 
     // Time label inside the selection box. The label's bounds stay
-    // huge (natural font size) and a transform compresses the visible
-    // result into the targetTextW / visualTimeH rectangle, vertically
-    // centred in the box so kLFTimePad of breathing room is visible
-    // above and below.
+    // huge (natural font line-height for the kLFLargeFontPoints
+    // size) and a transform compresses the visible result into the
+    // (targetTextW, visualCapH) rectangle. The label's bounds end
+    // up taller than the box because the cap-height-sized box
+    // doesn't include ascender/descender headroom -- but selectionBox
+    // has masksToBounds=NO so the empty headroom regions render
+    // off-box without clipping anything visible.
     _timeLabel.transform = CGAffineTransformIdentity;
     _timeLabel.bounds    = CGRectMake(0, 0, timeSize.width, timeSize.height);
 
@@ -378,8 +397,28 @@ static const CGFloat kLFTimePad              = 8.0;
     else if (s.alignment == LFClockAlignmentRight)  anchorBoxX = boxW - kLFTimePad;
     else                                            anchorBoxX = boxW / 2.0;
 
-    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.5);
-    _timeLabel.layer.position    = CGPointMake(anchorBoxX, boxH / 2.0);
+    // Anchor the label at its top edge (Y=0.0) so the visible
+    // cap-top stays glued to a fixed Y in box-local coords as
+    // scaleY changes. Untransformed, the cap-top sits capTopGap
+    // pixels below the bounds-top; after the Y scale that
+    // distance becomes capTopGap*scaleY. To put the visible
+    // cap-top exactly at y=kLFTimePad we offset the layer's
+    // position upward by capTopGap*scaleY -- the label's own
+    // top edge ends up ABOVE the box's top edge (negative y
+    // in box-local coords), but the visible cap-top lands at
+    // kLFTimePad and STAYS THERE for any vStretch.
+    //
+    // Combined with the selection-box's fixed top in screen
+    // space (centerInParentApplyingSettings glues self.frame.
+    // origin.y to topPadding, and the box sits at a constant
+    // offset from that), this makes the digits' cap-top stay
+    // at one fixed Y on the screen during resize. Only the
+    // bottom of the digits moves down as the user drags the
+    // handle -- which is exactly the "glued top, grows down"
+    // behaviour Apple ships on iOS 26.
+    _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
+    _timeLabel.layer.position    = CGPointMake(anchorBoxX,
+                                               kLFTimePad - capTopGap * scaleY);
     _timeLabel.transform         = CGAffineTransformMakeScale(scaleX, scaleY);
 
     // Liquid-glass backdrop sits BEHIND the time digits, occupying
