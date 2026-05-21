@@ -2,6 +2,7 @@
 #import "LFClockSettings.h"
 #import "LFLiquidGlassView.h"
 #import "LFGyroscopeManager.h"
+#import <CoreText/CoreText.h>
 
 // Reference digit size at scale=1.0. Matches the size Apple uses on a
 // 6.1" device (iPhone 14 etc.) for the default clock.
@@ -54,6 +55,70 @@ static const CGFloat kLFDatePillToBoxGap     = 8.0;
 // the digits sit centred in the box with the same small gap on
 // every edge.
 static const CGFloat kLFTimePad              = 8.0;
+
+// === Variable-axis SF Pro helper ===
+//
+// SF-Pro.ttf is the Apple-distributed variable font shipped inside our
+// .deb at /var/jb/Library/LockForge/SF-Pro.ttf and registered into
+// SpringBoard at %ctor time (see Tweak.x). It exposes three OpenType
+// variation axes via its `fvar` table:
+//
+//   - 'wght' (weight):  1 .. 1000  (default 400 / Regular)
+//   - 'wdth' (width):  30 .. 150   (default 100 / Standard)
+//   - 'opsz' (optical size, automatic): 17 .. 28
+//
+// Apple's iOS 26 lock-screen-clock resize is implemented by sweeping a
+// PRIVATE Height axis on the SpringBoard system font, which doesn't
+// exist in the publicly-shipped SF Pro variable font. We approximate
+// the same visual effect using the public axes the font DOES have:
+// at higher vStretch values we crank the weight axis toward Black
+// (digits get visibly bolder, just like the iOS 26 effect) and the
+// width axis toward Compressed (digits stay inside the screen even
+// at huge font sizes). Combined with a continuous font-size growth
+// from ~100pt to ~400pt, the digits look like they're "growing"
+// taller without distorting their proportions -- which is the whole
+// point of doing it via the variable font instead of CGAffineTransform.
+//
+// Returns nil if the font isn't registered or the descriptor falls
+// back to a non-SF font (some iOS versions silently substitute when
+// the requested PostScript name isn't found). Callers fall back to
+// the static system-font path in that case.
+//
+// Axis tag bytes in C: 'wght' = (0x77,0x67,0x68,0x74) = 0x77676874 etc.
+// The TrueType `fvar` table stores these tags as 4 bytes
+// big-endian; on Apple platforms the multi-character literal
+// 'wght' resolves to an int with the same byte layout, but
+// embedding the literal directly here is non-portable, so use
+// explicit hex.
+static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat width) {
+    NSDictionary *axes = @{
+        @(0x77676874): @(weight),  // 'wght'
+        @(0x77647468): @(width),   // 'wdth'
+    };
+    NSDictionary *attrs = @{
+        (id)kCTFontNameAttribute:      @"SFPro-Regular",
+        (id)kCTFontVariationAttribute: axes,
+    };
+    CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(
+        (__bridge CFDictionaryRef)attrs);
+    if (!desc) return nil;
+    CTFontRef ctFont = CTFontCreateWithFontDescriptor(desc, size, NULL);
+    CFRelease(desc);
+    if (!ctFont) return nil;
+
+    // Sanity-check we got back a real SF Pro and not a system fallback
+    // -- if the font registration failed silently the descriptor
+    // resolver may quietly substitute Helvetica / system, which
+    // accepts the size but ignores our axis values. Detect that and
+    // tell the caller to fall back to the static-font path.
+    NSString *gotName = (__bridge_transfer NSString *)
+        CTFontCopyPostScriptName(ctFont);
+    if (![gotName hasPrefix:@"SFPro"]) {
+        CFRelease(ctFont);
+        return nil;
+    }
+    return (__bridge_transfer UIFont *)ctFont;
+}
 
 @interface LFClockOverlay () <UIGestureRecognizerDelegate> {
     id _gyroSubscriberKey;
@@ -289,35 +354,66 @@ static const CGFloat kLFTimePad              = 8.0;
     CGFloat boxW    = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);
 
-    // === iOS 26-style non-uniform stretch with HUGE max height ===
+    // === iOS 26 lock-screen-clock resize via SF Pro's variable axes ===
     //
-    // We render the time at a FIXED HUGE font size and let a
-    // CGAffineTransform compress the natural text on both axes:
+    // Replaces the older CGAffineTransform.scaleY pseudo-stretch (which
+    // produced thin/elongated digits at the top of the range -- macaroni-
+    // looking glyphs because horizontal stroke widths stayed constant
+    // while the layer was just visually scaled in Y).
     //
-    //   - scaleX (constant for given screen width): always compresses
-    //     the natural width down to the screen width so the digits
-    //     look like they fill the screen edge-to-edge with only a
-    //     small breathing-room padding (kLFTimePad on each side).
-    //   - scaleY (depends on vStretch): compresses the natural
-    //     height more or less, so the digits look short or tall.
+    // The new path drives the variable SF Pro axes directly: as vStretch
+    // climbs from 1.0 to 2.5,
     //
-    // Both transforms ALWAYS compress (scale < 1.0) -- never expand.
-    // Compression is crisper than expansion because it discards
-    // pixels rather than interpolating them.
+    //   - fontSize grows from ~100pt to ~400pt (real font rendered at
+    //     each size, no upscaling, crisp glyphs at any value)
+    //   - 'wght' axis grows from 400 (Regular) to 1000 (Black) so the
+    //     digits get visibly bolder along the way -- closest public-axis
+    //     approximation of the iOS 26 private Height axis effect
+    //   - 'wdth' axis SHRINKS from 100 (Standard) toward 30 (ultra-
+    //     compressed) so even at fontSize=400pt the natural rendered
+    //     width of "00:00" stays within the iPhone's screen width with
+    //     a small kLFTimePad on each side. Without the wdth axis we'd
+    //     hit the right bezel well before reaching the desired cap-
+    //     height.
     //
-    // vStretch=1.0           -> scaleY = 1.0/kLFVStretchMax (~0.4),
-    //                           digits compact (~170pt tall on 6s)
-    // vStretch=kLFVStretchMax -> scaleY = 1.0 (identity along Y),
-    //                           digits at full rendered height
-    //                           (~430pt tall on 6s, well over half
-    //                           the screen).
-    static const CGFloat kLFVStretchMax     = 2.5;
-    static const CGFloat kLFLargeFontPoints = 380.0;
+    // Result: glyphs render at proper proportions on every vStretch,
+    // even at full-stretch they look "tall and bold" rather than
+    // "tall and thin". And there's no transform involved at all -- the
+    // selection box's height is exactly the natural cap-height plus
+    // 2*kLFTimePad, so the box never has hidden empty ascender/descender
+    // headroom.
+    static const CGFloat kLFVStretchMin = 1.0;
+    static const CGFloat kLFVStretchMax = 2.5;
+
+    CGFloat vStretch = MAX(kLFVStretchMin,
+                           MIN(kLFVStretchMax, s.verticalStretch));
+    CGFloat t = (vStretch - kLFVStretchMin) /
+                (kLFVStretchMax - kLFVStretchMin);  // 0 .. 1
+
+    // Linear interpolation across the three axes. Coefficients tuned
+    // for iPhone 6s width (375pt screen, 359pt available after the
+    // kLFFullWidthSideInset on each side): at t=1 the natural width
+    // of "00:00" with weight=1000, width=30, fontSize=400 is roughly
+    // 340pt -- comfortably under the 359pt limit. Smaller-screen or
+    // larger-screen devices fall back to the post-measure shrink
+    // step below if the natural width still overshoots.
+    CGFloat fontSize   = 100.0 + ( 400.0 -  100.0) * t;   // 100..400 pt
+    CGFloat fontWeight = 400.0 + (1000.0 -  400.0) * t;   // wght: 400..1000
+    CGFloat fontWidth  = 100.0 + (  30.0 -  100.0) * t;   // wdth: 100..30
 
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
 
-    UIFont *timeFont = [s resolvedFontForReferenceSize:kLFLargeFontPoints];
-    _timeLabel.font  = timeFont;
+    UIFont *timeFont = lf_makeVariableSFProFont(fontSize, fontWeight, fontWidth);
+    if (!timeFont) {
+        // Bundled SF-Pro.ttf is missing, didn't register, or the
+        // descriptor resolver substituted a non-SF font. Fall back
+        // to the legacy static-font resolver so the clock at least
+        // renders SOMETHING -- with no axis support, the resize
+        // handle still affects fontSize but weight/width stay at
+        // whatever the system-font preset gives us.
+        timeFont = [s resolvedFontForReferenceSize:fontSize];
+    }
+    _timeLabel.font = timeFont;
 
     CGSize timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
     if (timeSize.width  < 1.0) timeSize.width  = 1.0;
@@ -325,36 +421,32 @@ static const CGFloat kLFTimePad              = 8.0;
 
     // Time digits live INSIDE the selection box with kLFTimePad of
     // breathing room on every side, so their target visible width
-    // is boxW minus padding on both sides.
+    // is boxW minus padding on both sides. If the natural rendered
+    // width still exceeds the target (e.g. running on a screen
+    // smaller than 6s, or the linear ramp's coefficients overshoot
+    // for some reason), shrink the font size in one shot to fit.
+    // We preserve the chosen weight + width axes -- they're more
+    // visually important than getting the absolute max font size.
     CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
-    CGFloat scaleX      = targetTextW / timeSize.width;
-    if (scaleX > 1.0) scaleX = 1.0;
+    if (timeSize.width > targetTextW) {
+        CGFloat shrink = targetTextW / timeSize.width;
+        fontSize *= shrink;
+        UIFont *retried = lf_makeVariableSFProFont(fontSize, fontWeight, fontWidth);
+        if (!retried) retried = [s resolvedFontForReferenceSize:fontSize];
+        timeFont = retried;
+        _timeLabel.font = timeFont;
+        timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
+    }
 
-    CGFloat vStretch = MAX(1.0, MIN(kLFVStretchMax, s.verticalStretch));
-    CGFloat scaleY   = vStretch / kLFVStretchMax;
-
-    // Use the font's CAP HEIGHT -- not its full line-height -- to
-    // size the selection box vertically. timeSize.height returned
-    // by -sizeWithAttributes: is the FULL line-height
-    // (ascender + |descender|), which for SF Pro is ~120% of the
-    // font size. The visible cap height of digits like "9", "0"
-    // and ":" is only ~72% of the font size. So a line-height
-    // sized box has ~24% empty space above the visible cap-top
-    // and ~25% below the baseline INSIDE the box, on top of
-    // kLFTimePad. Visually that reads as huge top/bottom padding
-    // even when the side padding is small. Sizing the box from
-    // cap height instead -- and positioning the label so its
-    // visible cap-top sits exactly at kLFTimePad from the box's
-    // top edge -- collapses that empty ascender/descender region
-    // outside the box. The label's bounds still extend above and
-    // below the box (selectionBoxView has masksToBounds=NO, the
-    // empty regions render harmlessly off-box), but the user
-    // sees kLFTimePad of breathing room equally on every side
-    // of the actual digits.
-    CGFloat capHeight  = timeFont.capHeight;
-    CGFloat capTopGap  = timeFont.ascender - capHeight;  // empty above cap
-    CGFloat visualCapH = capHeight * scaleY;
-    CGFloat boxH       = ceil(visualCapH) + 2 * kLFTimePad;
+    // Cap height + ascender headroom for the chosen variable font.
+    // Same idea as the previous build: size the box from the visible
+    // cap height (not the full line-height) so kLFTimePad really
+    // shows up as kLFTimePad to the user, on every side. With the
+    // natural-rendering path there's no scaleY multiplier any more,
+    // so capHeight here is the exact visible cap height in points.
+    CGFloat capHeight = timeFont.capHeight;
+    CGFloat capTopGap = timeFont.ascender - capHeight;  // empty above caps in label
+    CGFloat boxH      = ceil(capHeight) + 2 * kLFTimePad;
 
     // Self bounds: date pill stacked above the selection box, with
     // a small fixed gap between them.
@@ -381,14 +473,10 @@ static const CGFloat kLFTimePad              = 8.0;
     CGFloat boxY = datePillH + kLFDatePillToBoxGap;
     _selectionBoxView.frame = CGRectMake(0, boxY, boxW, boxH);
 
-    // Time label inside the selection box. The label's bounds stay
-    // huge (natural font line-height for the kLFLargeFontPoints
-    // size) and a transform compresses the visible result into the
-    // (targetTextW, visualCapH) rectangle. The label's bounds end
-    // up taller than the box because the cap-height-sized box
-    // doesn't include ascender/descender headroom -- but selectionBox
-    // has masksToBounds=NO so the empty headroom regions render
-    // off-box without clipping anything visible.
+    // Time label inside the selection box. With the variable-axis
+    // path the label renders NATURALLY at the chosen font size + axes
+    // -- no CGAffineTransform stretching. Bounds are exactly the
+    // measured natural rendered size, transform stays identity.
     _timeLabel.transform = CGAffineTransformIdentity;
     _timeLabel.bounds    = CGRectMake(0, 0, timeSize.width, timeSize.height);
 
@@ -397,29 +485,26 @@ static const CGFloat kLFTimePad              = 8.0;
     else if (s.alignment == LFClockAlignmentRight)  anchorBoxX = boxW - kLFTimePad;
     else                                            anchorBoxX = boxW / 2.0;
 
-    // Anchor the label at its top edge (Y=0.0) so the visible
-    // cap-top stays glued to a fixed Y in box-local coords as
-    // scaleY changes. Untransformed, the cap-top sits capTopGap
-    // pixels below the bounds-top; after the Y scale that
-    // distance becomes capTopGap*scaleY. To put the visible
-    // cap-top exactly at y=kLFTimePad we offset the layer's
-    // position upward by capTopGap*scaleY -- the label's own
-    // top edge ends up ABOVE the box's top edge (negative y
-    // in box-local coords), but the visible cap-top lands at
-    // kLFTimePad and STAYS THERE for any vStretch.
+    // Anchor the label at its top edge (Y=0.0) so the visible cap-
+    // top stays glued to a fixed Y in box-local coords as the font
+    // size changes with vStretch. The cap-top sits capTopGap pixels
+    // below the bounds-top in label-local coords (untransformed,
+    // and there's no transform now so this is exact). To put the
+    // visible cap-top at y=kLFTimePad we offset the layer position
+    // upward by capTopGap pixels -- the label's own top edge sits
+    // at negative Y inside the box, but the visible cap-top lands
+    // at kLFTimePad exactly.
     //
-    // Combined with the selection-box's fixed top in screen
-    // space (centerInParentApplyingSettings glues self.frame.
-    // origin.y to topPadding, and the box sits at a constant
-    // offset from that), this makes the digits' cap-top stay
-    // at one fixed Y on the screen during resize. Only the
-    // bottom of the digits moves down as the user drags the
-    // handle -- which is exactly the "glued top, grows down"
+    // Combined with the selection-box's fixed top in screen space
+    // (centerInParentApplyingSettings glues self.frame.origin.y to
+    // topPadding, and the box sits at a constant offset from that),
+    // this gives the digits a constant cap-top Y on the screen
+    // during resize. Only the bottom edge moves down as the user
+    // drags the handle -- exactly the "glued top, grows down"
     // behaviour Apple ships on iOS 26.
     _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
     _timeLabel.layer.position    = CGPointMake(anchorBoxX,
-                                               kLFTimePad - capTopGap * scaleY);
-    _timeLabel.transform         = CGAffineTransformMakeScale(scaleX, scaleY);
+                                               kLFTimePad - capTopGap);
 
     // Liquid-glass backdrop sits BEHIND the time digits, occupying
     // exactly the selection box. We position it in self's coords

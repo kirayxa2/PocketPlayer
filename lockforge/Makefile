@@ -27,7 +27,12 @@ LockForge_FILES = \
     LFLockScreenSelector.m
 
 LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
-LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion
+# CoreText is for CTFontManagerRegisterFontsForURL + variable-axis CTFont
+# creation. We register the bundled SF-Pro.ttf (variable font with
+# wght/wdth/opsz axes) into the SpringBoard process at %ctor time, then
+# LFClockOverlay creates per-frame CTFonts with custom (wght, wdth)
+# values to match Apple's iOS 26 lock-screen-clock resize behaviour.
+LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

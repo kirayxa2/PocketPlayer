@@ -19,10 +19,63 @@
 // so they coexist cleanly.
 
 #import <UIKit/UIKit.h>
+#import <CoreText/CoreText.h>
 #import "LFClockSettings.h"
 #import "LFClockOverlay.h"
 #import "LFLockEditor.h"
 #import "LFLockScreenSelector.h"
+
+// =====================================================================
+// Bundled variable SF Pro
+// =====================================================================
+//
+// SF-Pro.ttf ships in the LockForge .deb at /var/jb/Library/LockForge/
+// (rootless) or /Library/LockForge/ (rootful fallback). It's the
+// Apple-distributed variable font with three axes -- wght (1..1000),
+// wdth (30..150), opsz (17..28) -- which we drive per-frame from
+// LFClockOverlay to make the resize handle behave exactly like iOS 26:
+// digits grow taller and bolder along a single continuous axis, while
+// width compresses to fit the screen, all without distorting the
+// glyph proportions (no CGAffineTransform.scaleY needed any more).
+//
+// Registering once at %ctor time into the SpringBoard process is
+// enough -- subsequent CTFontDescriptor lookups by PostScript name
+// "SFPro-Regular" find our font and use its variation axes.
+
+static void LFRegisterBundledVariableFont(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Try rootless path first (matches THEOS_PACKAGE_SCHEME = rootless),
+        // fall back to rootful if for any reason the install layout is
+        // different.
+        NSArray<NSString *> *candidates = @[
+            @"/var/jb/Library/LockForge/SF-Pro.ttf",
+            @"/Library/LockForge/SF-Pro.ttf",
+        ];
+        for (NSString *path in candidates) {
+            if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
+            NSURL *url = [NSURL fileURLWithPath:path];
+            CFErrorRef err = NULL;
+            BOOL ok = CTFontManagerRegisterFontsForURL(
+                (__bridge CFURLRef)url,
+                kCTFontManagerScopeProcess,
+                &err);
+            if (ok) {
+                NSLog(@"[LockForge] Registered variable SF Pro from %@", path);
+            } else {
+                NSError *nsErr = (__bridge_transfer NSError *)err;
+                // 105 == kCTFontManagerErrorAlreadyRegistered, harmless.
+                if (nsErr.code != 105) {
+                    NSLog(@"[LockForge] Variable font register FAILED for %@: %@",
+                          path, nsErr);
+                }
+            }
+            return;  // first existing candidate wins
+        }
+        NSLog(@"[LockForge] Variable SF Pro NOT FOUND -- clock will fall back "
+              @"to system font. Expected at /var/jb/Library/LockForge/SF-Pro.ttf");
+    });
+}
 
 // =====================================================================
 // Globals
@@ -266,6 +319,11 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
     @autoreleasepool {
         NSString *exe = [[[NSBundle mainBundle] executablePath] lastPathComponent];
         if (![exe isEqualToString:@"SpringBoard"]) return;
+
+        // Register the bundled variable SF Pro into this process before
+        // anyone tries to render a clock label -- LFClockOverlay reads
+        // it by PostScript name during its very first recomputeMetrics.
+        LFRegisterBundledVariableFont();
 
         // Touch the singleton so settings load early. Defaults are
         // applied if no plist exists yet.
