@@ -366,62 +366,47 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     CGFloat boxW    = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);
 
-    // === iOS 26 Adaptive-Time clock resize via HGHT axis + scaleX ===
+    // === iOS 26 Adaptive-Time clock resize via HGHT + wdth axes ===
     //
     // On iOS 26 Apple's lock-screen clock uses .SFAdaptiveNumeric-
     // Regular (font #5 inside ADTNumeric.ttc) and drives the resize
-    // handle by sweeping the font's private 'HGHT' (height) axis from
-    // 100 (default) up to 500 (5x).
+    // handle by sweeping the font's private 'HGHT' (height) axis
+    // from 100 to 500.
     //
-    // CRITICAL FACT verified by inspecting this font's HVAR table:
-    // HGHT axis IS keyed in 20 of 29 variation regions there. So
-    // contrary to the obvious assumption, HGHT does NOT only scale
-    // glyph height in this font -- it also widens the advance
-    // widths. Apple designed it that way intentionally: the glyphs
-    // are meant to grow taller AND a touch wider together so the
-    // strokes stay visually balanced at every height value. On the
-    // iOS 26 lock-screen pipeline that's compensated downstream
-    // (PosterKit applies a horizontal squeeze before display).
+    // Inspecting this font's HVAR table revealed HGHT is keyed in
+    // 20 of 29 variation regions there -- HGHT does NOT just scale
+    // glyph height, it also widens the advance widths by Apple's
+    // intentional design. Apple's iOS 26 PosterKit pipeline
+    // compensates the width post-render.
     //
-    // On iOS 15 we don't have access to that pipeline, but we can
-    // get the same visual outcome with a simple CGAffineTransform.
+    // On iOS 15 we approximate that compensation using TWO mechanisms
+    // working together:
     //
-    // Algorithm:
-    //   1. Pick fontSize ONCE so that HGHT=100 (un-stretched) fills
-    //      boxW with kLFTimePad on each side. This is constant for
-    //      the whole resize range -- it never changes as the user
-    //      drags. (It's only re-derived when text content or the
-    //      parent's bounds change.)
+    //   1. The font's OWN 'wdth' (width) axis -- 60..100. As we sweep
+    //      HGHT up, we sweep wdth DOWN (100->60), so the font itself
+    //      narrows the digits at the OpenType level. This is the
+    //      preferred path because it's the font designer's intended
+    //      compensation: stroke weights are interpolated correctly,
+    //      no geometric distortion of glyph shape, no thinning of
+    //      vertical strokes. Exactly what Apple does on iOS 26.
     //
-    //   2. Linearly interpolate HGHT from 100 to 500 as vStretch
-    //      goes 1.0 to 2.5. Glyphs render TALLER and WIDER as a
-    //      result.
+    //   2. CGAffineTransform.scaleX as a SAFETY NET only. After the
+    //      font is built with the chosen HGHT/wdth pair, we measure
+    //      its natural rendered width. If the wdth axis (range
+    //      100..60 = 40% compression max) wasn't enough to keep
+    //      digits inside boxW, we apply a small additional
+    //      horizontal squeeze. At typical HGHT values the wdth axis
+    //      is enough on its own and scaleX is exactly 1.0.
     //
-    //   3. Measure the natural rendered width at the chosen HGHT.
-    //      Apply CGAffineTransformMakeScale(targetW/naturalW, 1.0)
-    //      to the time label so its visual width is forced to exact
-    //      targetW. The transform doesn't touch Y at all -- height
-    //      grows naturally with HGHT.
-    //
-    // Net visible behaviour:
-    //   - vStretch=1.0: digits at natural width, natural HGHT=100
-    //     height. scaleX is ~1.0, so no visible distortion.
-    //   - vStretch=2.5: digits 5x taller (HGHT=500), but width
-    //     is squeezed back to fit screen via scaleX. Stroke weights
-    //     are unchanged on the height axis (HGHT doesn't sweep
-    //     wght), and the horizontal-stroke compression is the
-    //     visual price of doing the squeeze on iOS 15. .SFAdaptive-
-    //     Numeric at thick strokes (Thin / wght=100) tolerates this
-    //     squeeze far better than SF Pro does because Apple
-    //     designed the digit shapes specifically for this stretched
-    //     display.
+    //   - vStretch=1.0  -> HGHT=100, wdth=100. Digits at natural
+    //                      proportions. No distortion.
+    //   - vStretch=2.5  -> HGHT=500, wdth=60. Digits ~3x cap-height,
+    //                      narrowed via the font's own width axis.
+    //                      scaleX is close to 1.0; if needed it
+    //                      adds a tiny squeeze on top.
     //
     // wght stays at 100 (Thin) -- matches the stock iOS lock-screen
-    // visual weight Apple ships out of the box on the Adaptive Time
-    // clock face.
-    //
-    // wdth stays at 100 (default Standard) -- HGHT + scaleX do all
-    // the layout work; we don't sweep wdth.
+    // visual weight Apple ships on the Adaptive Time clock face.
     static const CGFloat kLFVStretchMin = 1.0;
     static const CGFloat kLFVStretchMax = 2.5;
 
@@ -432,7 +417,7 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
 
     CGFloat hght       = 100.0 + (500.0 - 100.0) * t;   // 100..500
     CGFloat fontWeight = 100.0;                          // Thin, constant
-    CGFloat fontWidth  = 100.0;                          // Standard, constant
+    CGFloat fontWidth  = 100.0 + ( 60.0 - 100.0) * t;   // 100..60 (compresses)
 
     // Use the ACTUAL displayed text for probing (not a hardcoded
     // "00:00") so that the rendered "9:10" / "23:59" / etc. exactly
@@ -441,27 +426,28 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
     CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
 
-    // === Step 1: pick fontSize ONCE, at HGHT=100 (un-stretched) ===
+    // === Step 1: pick fontSize ONCE, at the un-stretched baseline ===
     //
     // fontSize is the MINIMUM-state baseline -- the size at which
-    // digits naturally fill the screen with no axis stretching.
-    // Constant across all vStretch values. Probing at HGHT=100
-    // (not the current HGHT) is what makes the resize visible:
-    // when HGHT then grows toward 500, glyphs grow naturally,
-    // fontSize doesn't shrink to cancel that growth.
+    // digits naturally fill the screen at vStretch=1.0 (HGHT=100,
+    // wdth=100). Constant across all vStretch values. Probing at
+    // the BASELINE axes (not the current ones) is what makes the
+    // resize visible: as HGHT grows, the natural rendered cap-
+    // height grows along with it and we DON'T cancel that growth
+    // by shrinking fontSize.
     CGFloat fontSize = 144.0;     // sane default if probe fails
 
-    UIFont *probe100 = lf_makeAdaptiveNumericFont(100.0, fontWeight,
-                                                  fontWidth, 100.0);
-    if (probe100) {
+    UIFont *probeBaseline = lf_makeAdaptiveNumericFont(100.0, fontWeight,
+                                                      100.0, 100.0);
+    if (probeBaseline) {
         CGSize probeSize = [probeText sizeWithAttributes:
-            @{ NSFontAttributeName: probe100 }];
+            @{ NSFontAttributeName: probeBaseline }];
         if (probeSize.width > 1.0) {
             fontSize = targetTextW * 100.0 / probeSize.width;
         }
     }
 
-    // === Step 2: build the actual font with the current HGHT ===
+    // === Step 2: build the actual font with the current axes ===
     UIFont *timeFont = lf_makeAdaptiveNumericFont(fontSize, fontWeight,
                                                   fontWidth, hght);
     if (!timeFont) {
@@ -480,30 +466,36 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     if (timeSize.width  < 1.0) timeSize.width  = 1.0;
     if (timeSize.height < 1.0) timeSize.height = 1.0;
 
-    // === Step 3: derive scaleX width-compensation ===
+    // === Step 3: scaleX safety net for residual width overflow ===
     //
-    // HGHT widens the digits in this font (verified via HVAR table
-    // inspection above). Apply scaleX <= 1.0 on the layer transform
-    // so visual width is forced to exactly targetTextW. Height is
-    // untouched -- it grows naturally with HGHT.
+    // The font's wdth axis (100->60) handles ~40% of the width
+    // compensation natively at the OpenType level. If HGHT widens
+    // the digits more than 40% at high values, the rendered width
+    // still exceeds targetTextW. Apply a pure horizontal CGAffine-
+    // Transform squeeze for the residual. Visual stroke distortion
+    // from this squeeze is minimal because the wdth axis already
+    // did most of the work at the font level. At typical vStretch
+    // values scaleX is close to 1.0.
     CGFloat scaleX = (timeSize.width > targetTextW)
                         ? (targetTextW / timeSize.width)
                         : 1.0;
 
-    // Cap height: prefer the font's MVAR-aware capHeight property,
-    // which DOES interpolate with HGHT on iOS 14+ for fonts with
-    // proper MVAR tables (this one has MVAR -- verified). If MVAR
-    // somehow isn't being applied (older iOS or descriptor
-    // resolver weirdness), fall back to an analytical estimate.
+    // Cap height + ascender headroom -- read from the font's MVAR-
+    // aware properties. UIFont.capHeight and UIFont.ascender on
+    // iOS 14+ DO interpolate with the variation axes for fonts with
+    // an MVAR table (this one has it -- verified).
+    //
+    // No analytical fallback any more: with the wdth axis doing
+    // most of the width compensation, fontSize stays at the BASELINE
+    // value across the whole vStretch range, so capHeight grows
+    // smoothly with HGHT through MVAR. The previous fallback
+    // introduced a step-discontinuity at the threshold where the
+    // sanity check tripped, which the user perceived as the clock
+    // "jumping below the finger" mid-resize.
     CGFloat capHeight = timeFont.capHeight;
     CGFloat capTopGap = timeFont.ascender - capHeight;
-
-    CGFloat heightRatio = hght / 100.0;
-    CGFloat analyticalCap = fontSize * 0.72 * heightRatio;
-    if (capHeight < analyticalCap * 0.6) {
-        capHeight = analyticalCap;
-        capTopGap = fontSize * 0.05 * heightRatio;
-    }
+    if (capHeight < 1.0) capHeight = fontSize * 0.72;
+    if (capTopGap < 0.0) capTopGap = 0.0;
 
     CGFloat boxH = ceil(capHeight) + 2 * kLFTimePad;
 
@@ -532,47 +524,38 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     CGFloat boxY = datePillH + kLFDatePillToBoxGap;
     _selectionBoxView.frame = CGRectMake(0, boxY, boxW, boxH);
 
-    // Time label inside the selection box. We render at natural
-    // font + axes (so HGHT can grow glyphs taller via gvar Y deltas
-    // without going through any pixel-stretching path), then apply
-    // a horizontal-only scaleX transform to force the rendered
-    // width to exactly targetTextW. The transform is applied AROUND
-    // the layer's anchor point, so we set anchorPoint to (ax, 0.0)
-    // first (top-of-label), making the transform a pure horizontal
-    // squeeze that does not move the label vertically OR drift the
-    // visible cap-top during resize.
+    // Time label inside the selection box. Layer ops are ordered
+    // carefully to avoid the "clock jumps below the finger" glitch
+    // the user observed mid-resize:
     //
-    // Bounds stay at the natural measured size -- the transform is
-    // visual-only. boxH was derived from capHeight (not bounds.h),
-    // so the box wraps the visible cap-rectangle correctly.
-    _timeLabel.transform = CGAffineTransformMakeScale(scaleX, 1.0);
-    _timeLabel.bounds    = CGRectMake(0, 0, timeSize.width, timeSize.height);
+    //   1. Reset transform to identity FIRST. UIView.frame is
+    //      "undefined" while transform != identity (per Apple docs);
+    //      changing bounds/anchor/position with a stale non-identity
+    //      transform applied makes UIKit recompute frame in
+    //      unpredictable ways, which manifests as a vertical jump
+    //      somewhere mid-drag.
+    //   2. Set bounds to the natural rendered size.
+    //   3. Set anchor to (ax, 0.0) -- top edge of the label is the
+    //      fixed point. With anchor at top, scaleX squeezes around
+    //      a horizontal line at Y=0 and never moves the cap-top
+    //      vertically.
+    //   4. Set position so the visible cap-top lands at box-local
+    //      Y = kLFTimePad. (The label has capTopGap pixels of
+    //      ascender headroom above its caps.)
+    //   5. Apply the new scaleX transform LAST, after geometry is
+    //      stable. Y is untouched -- height grows naturally with HGHT.
+    _timeLabel.transform        = CGAffineTransformIdentity;
+    _timeLabel.bounds           = CGRectMake(0, 0, timeSize.width, timeSize.height);
 
     CGFloat anchorBoxX;
     if (s.alignment == LFClockAlignmentLeft)        anchorBoxX = kLFTimePad;
     else if (s.alignment == LFClockAlignmentRight)  anchorBoxX = boxW - kLFTimePad;
     else                                            anchorBoxX = boxW / 2.0;
 
-    // Anchor the label at its top edge (Y=0.0) so the visible cap-
-    // top stays glued to a fixed Y in box-local coords as the font
-    // size changes with vStretch. The cap-top sits capTopGap pixels
-    // below the bounds-top in label-local coords (untransformed,
-    // and there's no transform now so this is exact). To put the
-    // visible cap-top at y=kLFTimePad we offset the layer position
-    // upward by capTopGap pixels -- the label's own top edge sits
-    // at negative Y inside the box, but the visible cap-top lands
-    // at kLFTimePad exactly.
-    //
-    // Combined with the selection-box's fixed top in screen space
-    // (centerInParentApplyingSettings glues self.frame.origin.y to
-    // topPadding, and the box sits at a constant offset from that),
-    // this gives the digits a constant cap-top Y on the screen
-    // during resize. Only the bottom edge moves down as the user
-    // drags the handle -- exactly the "glued top, grows down"
-    // behaviour Apple ships on iOS 26.
     _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
     _timeLabel.layer.position    = CGPointMake(anchorBoxX,
                                                kLFTimePad - capTopGap);
+    _timeLabel.transform         = CGAffineTransformMakeScale(scaleX, 1.0);
 
     // Liquid-glass backdrop sits BEHIND the time digits, occupying
     // exactly the selection box. We position it in self's coords
