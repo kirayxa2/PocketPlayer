@@ -66,15 +66,21 @@ static const CGFloat kLFBottomBarSideInset = 22.0;     // inset for "+" only
 // primary action. iOS 26 dimensions on a 6s-class screen: ~180pt
 // wide x 52pt tall, 17pt Semibold label. Earlier 124x50pt was too
 // small relative to the card and got lost on the bar.
-// User reported the previous 180x52 / 17pt Semibold size still
-// looked small relative to the card. Bumped further to match Apple's
-// iOS 26 visual weight where Customize is a substantial primary
-// action -- 240pt wide x 56pt tall, 18pt Semibold label. At this
-// width the button is ~91% of the card width on a 6s, which reads as
-// the visual anchor of the bar. The auxiliary "+" button stays at
-// 50pt diameter so the size contrast keeps it clearly secondary.
-static const CGFloat kLFCustomizeBtnH      = 56.0;
-static const CGFloat kLFCustomizeBtnW      = 240.0;
+// Iteration history:
+//   124x50 / 15pt Medium    -- too small, lost on the bar
+//   180x52 / 17pt Semibold  -- still too small per user
+//   240x56 / 18pt Semibold  -- TOO big AND taller than "+", which
+//                              broke the visual hierarchy (Customize
+//                              should not tower over its sibling
+//                              auxiliary button)
+//   200x50 / 17pt Semibold  -- current. Same HEIGHT as the "+"
+//                              button (50pt) so they sit on the same
+//                              baseline; visibly wider so it reads as
+//                              the primary action; 17pt Semibold
+//                              label is bold enough to anchor the bar
+//                              without overpowering it.
+static const CGFloat kLFCustomizeBtnH      = 50.0;
+static const CGFloat kLFCustomizeBtnW      = 200.0;
 static const CGFloat kLFPlusBtnSize        = 50.0;
 
 // Page dots (above the action bar)
@@ -179,47 +185,50 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     }
 }
 
-// Capture the live lock screen as a STATIC UIImage by rendering every
-// visible window's CALayer into one bitmap context in z-order.
+// Capture the live lock screen as a STATIC UIImage by rendering the
+// cover sheet's PARENT WINDOW directly.
 //
-// Why not -[UIScreen snapshotViewAfterScreenUpdates:] any more?
+// Why this approach (after two failed earlier ones)?
 //
-//   The previous build relied on UIScreen's snapshot view, which
-//   returns a UIView whose contents are an iOS-private representation
-//   of the captured screen. That view works fine when displayed in
-//   the same hierarchy it was captured from -- but reparenting it
-//   into a completely different container (our card view inside a
-//   horizontal UIScrollView) and resizing it via .frame can leave it
-//   blank on iOS 15. The user reported "не видно обоев", which is
-//   exactly the failure mode of that approach.
+//   Attempt 1: -[CSCoverSheetView snapshotViewAfterScreenUpdates:NO]
+//   - failed because the wallpaper isn't a SUBVIEW of the cover
+//     sheet on iOS 15 -- it's composited from a separate layer
+//     underneath, so the snapshot was just the clock on black.
 //
-//   Honest bitmap rendering avoids the issue entirely. We walk every
-//   visible UIWindow on UIApplication, render its layer with
-//   -renderInContext: into a fresh CGBitmapContext, and end up with
-//   a UIImage that's just an array of pixels -- no iOS-private
-//   contents, no source-view dependency, no surprise blank frames
-//   when displayed in a foreign hierarchy. UIImageView then displays
-//   the UIImage at any size we want with a known scale mode.
+//   Attempt 2: -[UIScreen mainScreen snapshotViewAfterScreenUpdates:]
+//   - returned an iOS-private snapshot view that goes BLANK when
+//     reparented into a foreign hierarchy on iOS 15. User saw an
+//     empty card.
 //
-// On SpringBoard the windows array contains (in z-order, lowest to
-// highest):
+//   Attempt 3: iterate UIApplication.windows + renderInContext: each
+//   - captured the wallpaper window correctly but the SBLockScreen-
+//     Window with our LFClockOverlay inside it didn't always show up
+//     in [UIApplication windows] on jailbroken SpringBoard, so the
+//     clock was missing from the bitmap.
 //
-//   - SBWallpaperWindow              <- the wallpaper (THIS is what
-//                                       was missing from the previous
-//                                       cover-sheet-only snapshot)
-//   - SBHomeScreenWindow             <- icons (mostly hidden on
-//                                       lock screen)
-//   - SBCoverSheetWindow             <- the lock-screen UI
-//                                       (notifications, time, our
-//                                       installed clock overlay)
-//   - SBStatusBarWindow              <- status bar
+//   Attempt 4 (this one):
+//   Render _sourceCoverSheet.window.layer directly -- the cover-sheet
+//   view's PARENT WINDOW. On iOS 15 SpringBoard this single window is
+//   SBCoverSheetWindow / SBHomeScreenWindow, which is the deepest
+//   shared ancestor of:
+//     - the wallpaper view (SBLockScreenWallpaperView is a subview
+//       of the lock-screen window's content view)
+//     - the cover sheet view (SBCoverSheetView, also a subview)
+//     - our installed LFClockOverlay (a subview of SBCoverSheetView)
 //
-// Iterating in z-order with -renderInContext: composites them
-// correctly: wallpaper at the bottom, cover sheet (mostly transparent)
-// on top showing through to the wallpaper, our clock on top of that.
-// Result is exactly what the user sees on screen the moment they
-// long-press.
-static UIImage *LFCaptureLockScreenImage(void) {
+//   Rendering this single window's CALayer recursively renders ALL
+//   its sublayers -- wallpaper, cover sheet, our clock -- in their
+//   correct z-order, into a flat UIImage. No snapshot-view magic, no
+//   uncertain window enumeration, no missing layers.
+//
+//   We also iterate UIApplication.windows for any windows ABOVE the
+//   cover-sheet window (e.g. SBStatusBarWindow on top of
+//   SBCoverSheetWindow on iOS 15) to capture the status bar too.
+static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
+    if (!coverSheet) return nil;
+    UIWindow *coverWindow = coverSheet.window;
+    if (!coverWindow) return nil;
+
     CGRect screenRect = [UIScreen mainScreen].bounds;
     if (screenRect.size.width < 1.0 || screenRect.size.height < 1.0) {
         return nil;
@@ -232,23 +241,28 @@ static UIImage *LFCaptureLockScreenImage(void) {
         return nil;
     }
 
+    // Step 1: render the cover-sheet's parent window. This single
+    // call composites the wallpaper + cover-sheet content + our
+    // LFClockOverlay because they're all sublayers of this window.
+    CGContextSaveGState(ctx);
+    CGContextTranslateCTM(ctx, coverWindow.frame.origin.x,
+                               coverWindow.frame.origin.y);
+    [coverWindow.layer renderInContext:ctx];
+    CGContextRestoreGState(ctx);
+
+    // Step 2: render any sibling windows that sit ABOVE the cover-
+    // sheet window (status bar, system alerts, etc.). UIApplication.
+    // windows is in z-order from earliest to latest, so we render
+    // every window whose windowLevel is HIGHER than the cover sheet
+    // window's.
     NSArray<UIWindow *> *windows = [[UIApplication sharedApplication] windows];
     for (UIWindow *win in windows) {
+        if (win == coverWindow) continue;
         if (win.hidden || win.alpha < 0.01) continue;
+        if (win.windowLevel <= coverWindow.windowLevel) continue;
 
-        // Apply each window's transform & frame so it lands at the
-        // right place in screen space. Most SB windows have an
-        // identity transform & full-screen frame, but be defensive --
-        // some of them (e.g. status bar in landscape) may have
-        // rotation transforms.
         CGContextSaveGState(ctx);
-        CGContextTranslateCTM(ctx,
-                              CGRectGetMidX(win.frame),
-                              CGRectGetMidY(win.frame));
-        CGContextConcatCTM(ctx, win.transform);
-        CGContextTranslateCTM(ctx,
-                              -win.bounds.size.width / 2.0,
-                              -win.bounds.size.height / 2.0);
+        CGContextTranslateCTM(ctx, win.frame.origin.x, win.frame.origin.y);
         [win.layer renderInContext:ctx];
         CGContextRestoreGState(ctx);
     }
@@ -277,7 +291,7 @@ static UIImage *LFCaptureLockScreenImage(void) {
     // comment for why we don't use snapshotViewAfterScreenUpdates:
     // any more (it returns a special iOS-private view that goes blank
     // when reparented into a foreign hierarchy on iOS 15).
-    UIImage *snapImage = LFCaptureLockScreenImage();
+    UIImage *snapImage = LFCaptureLockScreenImage(_sourceCoverSheet);
     if (snapImage) {
         UIImageView *snap = [[UIImageView alloc] initWithImage:snapImage];
         snap.tag                     = kLFTagSnapshot;
@@ -366,7 +380,7 @@ static UIImage *LFCaptureLockScreenImage(void) {
     _customizeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_customizeButton setTitle:@"Customize" forState:UIControlStateNormal];
     _customizeButton.titleLabel.font =
-        [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
+        [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     [_customizeButton setTitleColor:[UIColor whiteColor]
                            forState:UIControlStateNormal];
     _customizeButton.backgroundColor =
