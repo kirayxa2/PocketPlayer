@@ -68,47 +68,47 @@ static const CGFloat kLFDatePillToBoxGap     = 8.0;
 // still reads as a clear visible gap on every side of the digits.
 static const CGFloat kLFTimePad              = 6.0;
 
-// === Variable-axis SF Pro helper ===
+// === iOS 26 Adaptive-Time numeric font helper ===
 //
-// SF-Pro.ttf is the Apple-distributed variable font shipped inside our
-// .deb at /var/jb/Library/LockForge/SF-Pro.ttf and registered into
-// SpringBoard at %ctor time (see Tweak.x). It exposes three OpenType
-// variation axes via its `fvar` table:
+// .SFAdaptiveNumeric-Regular ships inside ADTNumeric.ttc which is
+// registered for our process at %ctor time (see Tweak.x). It exposes
+// FOUR OpenType variation axes via its `fvar` table:
 //
-//   - 'wght' (weight):  1 .. 1000  (default 400 / Regular)
-//   - 'wdth' (width):  30 .. 150   (default 100 / Standard)
-//   - 'opsz' (optical size, automatic): 17 .. 28
+//   - 'HGHT' (height):  100 .. 500   (default 100)
+//                       The axis Apple actually uses on iOS 26 lock-
+//                       screen clocks. Scales glyph height ONLY -- the
+//                       advance width and the stroke thicknesses are
+//                       NOT modified by this axis. Driving HGHT from
+//                       100 to 500 gives a 5x cap-height with the same
+//                       digit width and the same stroke weight, which
+//                       is the literal "growing taller" effect Apple
+//                       ships and which we never managed to mimic on
+//                       SF Pro (which has no height axis at all).
+//   - 'wdth' (width):    60 .. 100   (default 100)
+//   - 'wght' (weight):    1 .. 1000  (default 400)
+//   - 'GRAD' (grade):   400 .. 1000  (hidden, leave at default)
 //
-// Apple's iOS 26 lock-screen-clock resize is implemented by sweeping a
-// PRIVATE Height axis on the SpringBoard system font, which doesn't
-// exist in the publicly-shipped SF Pro variable font. We approximate
-// the same visual effect using the public axes the font DOES have:
-// at higher vStretch values we crank the weight axis toward Black
-// (digits get visibly bolder, just like the iOS 26 effect) and the
-// width axis toward Compressed (digits stay inside the screen even
-// at huge font sizes). Combined with a continuous font-size growth
-// from ~100pt to ~400pt, the digits look like they're "growing"
-// taller without distorting their proportions -- which is the whole
-// point of doing it via the variable font instead of CGAffineTransform.
+// Returns nil if the font isn't registered, or if the descriptor
+// resolver fell back to a non-Adaptive font (some iOS versions silently
+// substitute when the requested PostScript name isn't found). Callers
+// fall back to the static system-font path in that case.
 //
-// Returns nil if the font isn't registered or the descriptor falls
-// back to a non-SF font (some iOS versions silently substitute when
-// the requested PostScript name isn't found). Callers fall back to
-// the static system-font path in that case.
-//
-// Axis tag bytes in C: 'wght' = (0x77,0x67,0x68,0x74) = 0x77676874 etc.
-// The TrueType `fvar` table stores these tags as 4 bytes
-// big-endian; on Apple platforms the multi-character literal
-// 'wght' resolves to an int with the same byte layout, but
-// embedding the literal directly here is non-portable, so use
-// explicit hex.
-static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat width) {
+// Axis tag bytes in C: stored as 4 bytes big-endian. Use explicit hex
+// rather than multi-character literals so the encoding is portable.
+//   'HGHT' = 0x48 0x47 0x48 0x54 = 0x48474854
+//   'wdth' = 0x77 0x64 0x74 0x68 = 0x77647468
+//   'wght' = 0x77 0x67 0x68 0x74 = 0x77676874
+static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
+                                          CGFloat weight,
+                                          CGFloat width,
+                                          CGFloat height) {
     NSDictionary *axes = @{
-        @(0x77676874): @(weight),  // 'wght'
+        @(0x48474854): @(height),  // 'HGHT'
         @(0x77647468): @(width),   // 'wdth'
+        @(0x77676874): @(weight),  // 'wght'
     };
     NSDictionary *attrs = @{
-        (id)kCTFontNameAttribute:      @"SFPro-Regular",
+        (id)kCTFontNameAttribute:      @".SFAdaptiveNumeric-Regular",
         (id)kCTFontVariationAttribute: axes,
     };
     CTFontDescriptorRef desc = CTFontDescriptorCreateWithAttributes(
@@ -118,14 +118,14 @@ static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat wi
     CFRelease(desc);
     if (!ctFont) return nil;
 
-    // Sanity-check we got back a real SF Pro and not a system fallback
-    // -- if the font registration failed silently the descriptor
-    // resolver may quietly substitute Helvetica / system, which
-    // accepts the size but ignores our axis values. Detect that and
-    // tell the caller to fall back to the static-font path.
+    // Sanity-check we got back the real Adaptive-Numeric face and not a
+    // system fallback. If the .ttc registration failed silently the
+    // descriptor resolver may quietly substitute Helvetica / system,
+    // which accepts the size but ignores our axis values. Detect that
+    // and tell the caller to fall back to the static-font path.
     NSString *gotName = (__bridge_transfer NSString *)
         CTFontCopyPostScriptName(ctFont);
-    if (![gotName hasPrefix:@"SFPro"]) {
+    if (![gotName hasPrefix:@".SFAdaptive"]) {
         CFRelease(ctFont);
         return nil;
     }
@@ -366,34 +366,32 @@ static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat wi
     CGFloat boxW    = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);
 
-    // === iOS 26 lock-screen-clock resize via SF Pro's variable axes ===
+    // === iOS 26 Adaptive-Time clock resize via the HGHT axis ===
     //
-    // Replaces the older CGAffineTransform.scaleY pseudo-stretch (which
-    // produced thin/elongated digits at the top of the range -- macaroni-
-    // looking glyphs because horizontal stroke widths stayed constant
-    // while the layer was just visually scaled in Y).
+    // On iOS 26 Apple's lock-screen clock uses a special font called
+    // ".SFAdaptiveNumeric-Regular" (shipped inside ADTNumeric.ttc).
+    // What makes the resize feel right is the font's HGHT axis -- a
+    // private "height" variation axis that scales glyph height
+    // WITHOUT touching the advance width or the stroke thickness.
     //
-    // The new path drives the variable SF Pro axes directly: as vStretch
-    // climbs from 1.0 to 2.5,
+    // So when the user drags the resize handle:
     //
-    //   - fontSize grows from ~100pt to ~400pt (real font rendered at
-    //     each size, no upscaling, crisp glyphs at any value)
-    //   - 'wght' axis grows from 400 (Regular) to 1000 (Black) so the
-    //     digits get visibly bolder along the way -- closest public-axis
-    //     approximation of the iOS 26 private Height axis effect
-    //   - 'wdth' axis SHRINKS from 100 (Standard) toward 30 (ultra-
-    //     compressed) so even at fontSize=400pt the natural rendered
-    //     width of "00:00" stays within the iPhone's screen width with
-    //     a small kLFTimePad on each side. Without the wdth axis we'd
-    //     hit the right bezel well before reaching the desired cap-
-    //     height.
+    //   - fontSize is computed ONCE to make "00:00" naturally fill
+    //     boxW at HGHT=100 (default height). It does NOT change as
+    //     the user drags -- the digits keep the same horizontal
+    //     extent on the screen at every stretch level.
     //
-    // Result: glyphs render at proper proportions on every vStretch,
-    // even at full-stretch they look "tall and bold" rather than
-    // "tall and thin". And there's no transform involved at all -- the
-    // selection box's height is exactly the natural cap-height plus
-    // 2*kLFTimePad, so the box never has hidden empty ascender/descender
-    // headroom.
+    //   - HGHT is interpolated from 100 (vStretch=1.0) up to 500
+    //     (vStretch=2.5). At HGHT=500 the cap-height is 5x the
+    //     default, the digit advance widths are unchanged, and the
+    //     stroke weights are also unchanged. Result: the clock
+    //     "grows down" exactly the way Apple ships it on iOS 26.
+    //
+    //   - wght stays at 100 (Thin) the entire time, matching the
+    //     stock-iOS lock-screen visual weight.
+    //
+    //   - wdth stays at 100 (default standard width). HGHT does all
+    //     the visual work; we don't need to compress horizontally.
     static const CGFloat kLFVStretchMin = 1.0;
     static const CGFloat kLFVStretchMax = 2.5;
 
@@ -402,89 +400,78 @@ static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat wi
     CGFloat t = (vStretch - kLFVStretchMin) /
                 (kLFVStretchMax - kLFVStretchMin);  // 0 .. 1
 
-    // Linear interpolation across the variable axes. Tuned to make
-    // the resize feel like "the digits are growing TALLER" -- not
-    // "the digits are growing thicker". Earlier builds also swept
-    // the wght axis from Regular(400) all the way to Black(1000),
-    // which made the cap-height grow nicely but also made the stroke
-    // weights TRIPLE in thickness. Visually the user perceived the
-    // resize as "becoming bolder" instead of "becoming taller",
-    // because the stroke-weight change was more eye-grabbing than
-    // the height change.
-    //
-    // Fix: keep fontWeight CONSTANT at Semibold (600) across the
-    // entire vStretch range. Stroke widths stay visually identical
-    // from compact to full-stretch -- the only thing changing is
-    // the actual rendered font size and the wdth axis, which
-    // together produce digits that look like they're growing
-    // taller (cap-height 4x) while the strokes maintain a stable
-    // visual weight. Width compresses to keep the natural rendered
-    // "00:00" inside the iPhone screen.
-    //
-    // Coefficients tuned for iPhone 6s width (375pt screen, 359pt
-    // available after kLFFullWidthSideInset on each side): at t=1,
-    // SF Pro Semibold "00:00" at fontSize=400, width=30 has a
-    // natural rendered width of ~310pt -- comfortably under 359pt.
-    // The post-measure shrink step below catches any overflow on
-    // smaller-than-6s devices.
-    // fontSize cap raised from 400 to 520. The post-measure shrink
-    // step below will dynamically clamp it to whatever the screen
-    // can fit -- at full vStretch on a 6s the rendered "00:00" at
-    // Semibold + wdth=30 + 520pt is ~405pt, which the shrink scales
-    // back to ~455pt to fit the 360pt-wide target text region. Net
-    // cap-height at max ~328pt = 49% of a 6s's 667pt screen, just
-    // shy of the literal half but as close as constant-Semibold +
-    // public-axes can get without re-introducing the weight change.
-    CGFloat fontSize   = 100.0 + (520.0 - 100.0) * t;     // 100..520 pt
-    CGFloat fontWeight = 600.0;                            // Semibold, CONSTANT
-    CGFloat fontWidth  = 100.0 + ( 30.0 - 100.0) * t;     // wdth: 100..30
+    // HGHT axis: 100 (default) at vStretch=1.0, up to 500 (max) at
+    // vStretch=2.5. Linear ramp -- the user's finger movement maps
+    // directly to glyph height, which is the simplest and most
+    // predictable behaviour.
+    CGFloat hght       = 100.0 + (500.0 - 100.0) * t;   // 100..500
+    CGFloat fontWeight = 100.0;                          // Thin, constant
+    CGFloat fontWidth  = 100.0;                          // Standard, constant
 
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
 
-    UIFont *timeFont = lf_makeVariableSFProFont(fontSize, fontWeight, fontWidth);
+    // First, derive a fontSize that makes "00:00" naturally render at
+    // boxW - 2*kLFTimePad when HGHT is at its 100 default. Width
+    // doesn't change with HGHT, so this fontSize is correct for the
+    // entire resize range -- we only need to compute it once.
+    CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
+    CGFloat fontSize    = 144.0;     // sane default if probe fails
+
+    UIFont *probe100 = lf_makeAdaptiveNumericFont(100.0, fontWeight,
+                                                  fontWidth, 100.0);
+    if (probe100) {
+        CGSize probeSize = [probeText sizeWithAttributes:
+            @{ NSFontAttributeName: probe100 }];
+        if (probeSize.width > 1.0) {
+            // Width scales linearly with fontSize, so the size that
+            // hits targetTextW is targetTextW * 100 / probeSize.width.
+            fontSize = targetTextW * 100.0 / probeSize.width;
+        }
+    }
+
+    UIFont *timeFont = lf_makeAdaptiveNumericFont(fontSize, fontWeight,
+                                                  fontWidth, hght);
     if (!timeFont) {
-        // Bundled SF-Pro.ttf is missing, didn't register, or the
-        // descriptor resolver substituted a non-SF font. Fall back
-        // to the legacy static-font resolver so the clock at least
-        // renders SOMETHING -- with no axis support, the resize
-        // handle still affects fontSize but weight/width stay at
-        // whatever the system-font preset gives us.
-        timeFont = [s resolvedFontForReferenceSize:fontSize];
+        // Bundled ADTNumeric.ttc is missing or didn't register
+        // (descriptor resolver substituted a non-Adaptive font). Fall
+        // back to the legacy static-font path: scale the user's chosen
+        // font preset by vStretch so resize at least changes SOMETHING
+        // visually -- but without HGHT support this fallback also
+        // grows the digit width, so the clock won't behave perfectly.
+        timeFont = [s resolvedFontForReferenceSize:fontSize * vStretch];
     }
     _timeLabel.font = timeFont;
 
-    CGSize timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
+    CGSize timeSize = [probeText sizeWithAttributes:
+        @{ NSFontAttributeName: timeFont }];
     if (timeSize.width  < 1.0) timeSize.width  = 1.0;
     if (timeSize.height < 1.0) timeSize.height = 1.0;
 
-    // Time digits live INSIDE the selection box with kLFTimePad of
-    // breathing room on every side, so their target visible width
-    // is boxW minus padding on both sides. If the natural rendered
-    // width still exceeds the target (e.g. running on a screen
-    // smaller than 6s, or the linear ramp's coefficients overshoot
-    // for some reason), shrink the font size in one shot to fit.
-    // We preserve the chosen weight + width axes -- they're more
-    // visually important than getting the absolute max font size.
-    CGFloat targetTextW = MAX(80.0, boxW - 2 * kLFTimePad);
-    if (timeSize.width > targetTextW) {
-        CGFloat shrink = targetTextW / timeSize.width;
-        fontSize *= shrink;
-        UIFont *retried = lf_makeVariableSFProFont(fontSize, fontWeight, fontWidth);
-        if (!retried) retried = [s resolvedFontForReferenceSize:fontSize];
-        timeFont = retried;
-        _timeLabel.font = timeFont;
-        timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
+    // Cap height + ascender headroom for the chosen variation. The
+    // Adaptive Numeric font's MVAR table makes UIFont.capHeight and
+    // UIFont.ascender interpolate with HGHT correctly, so reading
+    // them here gives the actual visible cap height at the current
+    // HGHT value. We size boxH from the visible cap-height (not the
+    // full line-height) so kLFTimePad really shows up as kLFTimePad
+    // to the user, on every side.
+    CGFloat capHeight = timeFont.capHeight;
+    CGFloat capTopGap = timeFont.ascender - capHeight;
+
+    // Defensive sanity: if MVAR isn't being applied to capHeight on
+    // this iOS version, capHeight reads as the HGHT=100 value while
+    // the glyph is actually 5x taller. Detect that by comparing
+    // measured timeSize.height (which DOES scale with HGHT through
+    // the gvar deltas) against fontSize -- if timeSize.height is
+    // significantly larger than the un-scaled cap, derive cap from
+    // the measured height with a typical SF Pro ratio.
+    CGFloat heightRatio = hght / 100.0;
+    CGFloat fallbackCap = fontSize * 0.72 * heightRatio;
+    if (capHeight < fallbackCap * 0.6) {
+        capHeight = fallbackCap;
+        capTopGap = fontSize * 0.05 * heightRatio;
     }
 
-    // Cap height + ascender headroom for the chosen variable font.
-    // Same idea as the previous build: size the box from the visible
-    // cap height (not the full line-height) so kLFTimePad really
-    // shows up as kLFTimePad to the user, on every side. With the
-    // natural-rendering path there's no scaleY multiplier any more,
-    // so capHeight here is the exact visible cap height in points.
-    CGFloat capHeight = timeFont.capHeight;
-    CGFloat capTopGap = timeFont.ascender - capHeight;  // empty above caps in label
-    CGFloat boxH      = ceil(capHeight) + 2 * kLFTimePad;
+    CGFloat boxH = ceil(capHeight) + 2 * kLFTimePad;
 
     // Self bounds: date pill stacked above the selection box, with
     // a small fixed gap between them.

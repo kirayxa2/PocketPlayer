@@ -26,31 +26,43 @@
 #import "LFLockScreenSelector.h"
 
 // =====================================================================
-// Bundled variable SF Pro
+// Bundled iOS 26 Adaptive Time numeric font
 // =====================================================================
 //
-// SF-Pro.ttf ships in the LockForge .deb at /var/jb/Library/LockForge/
-// (rootless) or /Library/LockForge/ (rootful fallback). It's the
-// Apple-distributed variable font with three axes -- wght (1..1000),
-// wdth (30..150), opsz (17..28) -- which we drive per-frame from
-// LFClockOverlay to make the resize handle behave exactly like iOS 26:
-// digits grow taller and bolder along a single continuous axis, while
-// width compresses to fit the screen, all without distorting the
-// glyph proportions (no CGAffineTransform.scaleY needed any more).
+// ADTNumeric.ttc ships in the LockForge .deb at /var/jb/Library/LockForge/
+// (rootless) or /Library/LockForge/ (rootful fallback). It is the system
+// font Apple uses on the iOS 26 lock screen for the "Adaptive Time"
+// clock -- a TrueType Collection containing 13 numeric font faces
+// (Slab, NewYork, Compact Soft, Rail, Rounded, Stencil, ...) plus the
+// star face we drive from LFClockOverlay:
 //
-// Registering once at %ctor time into the SpringBoard process is
-// enough -- subsequent CTFontDescriptor lookups by PostScript name
-// "SFPro-Regular" find our font and use its variation axes.
+//     PostScript name:  .SFAdaptiveNumeric-Regular
+//     Variation axes:
+//       'HGHT'   100 .. 500  (HEIGHT axis -- glyph height scaling
+//                             that does NOT change advance width or
+//                             stroke thickness; this is the literal
+//                             axis Apple drags via the resize handle
+//                             on iOS 26 and is unique to this font)
+//       'wdth'    60 .. 100
+//       'wght'     1 .. 1000
+//       'GRAD'   400 .. 1000  (hidden grade axis)
+//
+// Registering the .ttc once at %ctor time registers EVERY face inside
+// it for the SpringBoard process; subsequent CTFontDescriptor lookups
+// by ".SFAdaptiveNumeric-Regular" find our font and use its full set
+// of variation axes (most importantly HGHT, which is the missing
+// piece that makes the resize feel exactly like iOS 26 -- digits
+// grow taller without growing thicker or wider).
 
-static void LFRegisterBundledVariableFont(void) {
+static void LFRegisterBundledNumericFont(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         // Try rootless path first (matches THEOS_PACKAGE_SCHEME = rootless),
         // fall back to rootful if for any reason the install layout is
         // different.
         NSArray<NSString *> *candidates = @[
-            @"/var/jb/Library/LockForge/SF-Pro.ttf",
-            @"/Library/LockForge/SF-Pro.ttf",
+            @"/var/jb/Library/LockForge/ADTNumeric.ttc",
+            @"/Library/LockForge/ADTNumeric.ttc",
         ];
         for (NSString *path in candidates) {
             if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -61,19 +73,21 @@ static void LFRegisterBundledVariableFont(void) {
                 kCTFontManagerScopeProcess,
                 &err);
             if (ok) {
-                NSLog(@"[LockForge] Registered variable SF Pro from %@", path);
+                NSLog(@"[LockForge] Registered ADTNumeric.ttc (13 faces incl. "
+                      @".SFAdaptiveNumeric-Regular) from %@", path);
             } else {
                 NSError *nsErr = (__bridge_transfer NSError *)err;
                 // 105 == kCTFontManagerErrorAlreadyRegistered, harmless.
                 if (nsErr.code != 105) {
-                    NSLog(@"[LockForge] Variable font register FAILED for %@: %@",
+                    NSLog(@"[LockForge] ADTNumeric.ttc register FAILED for %@: %@",
                           path, nsErr);
                 }
             }
             return;  // first existing candidate wins
         }
-        NSLog(@"[LockForge] Variable SF Pro NOT FOUND -- clock will fall back "
-              @"to system font. Expected at /var/jb/Library/LockForge/SF-Pro.ttf");
+        NSLog(@"[LockForge] ADTNumeric.ttc NOT FOUND -- clock will fall back "
+              @"to system font (HGHT axis unavailable, resize feel degraded). "
+              @"Expected at /var/jb/Library/LockForge/ADTNumeric.ttc");
     });
 }
 
@@ -320,10 +334,11 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
         NSString *exe = [[[NSBundle mainBundle] executablePath] lastPathComponent];
         if (![exe isEqualToString:@"SpringBoard"]) return;
 
-        // Register the bundled variable SF Pro into this process before
-        // anyone tries to render a clock label -- LFClockOverlay reads
-        // it by PostScript name during its very first recomputeMetrics.
-        LFRegisterBundledVariableFont();
+        // Register the bundled iOS 26 Adaptive-Time numeric font into
+        // this process before anyone tries to render a clock label --
+        // LFClockOverlay reads it by PostScript name during its very
+        // first recomputeMetrics.
+        LFRegisterBundledNumericFont();
 
         // Touch the singleton so settings load early. Defaults are
         // applied if no plist exists yet.

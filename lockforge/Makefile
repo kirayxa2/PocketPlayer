@@ -28,10 +28,12 @@ LockForge_FILES = \
 
 LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
 # CoreText is for CTFontManagerRegisterFontsForURL + variable-axis CTFont
-# creation. We register the bundled SF-Pro.ttf (variable font with
-# wght/wdth/opsz axes) into the SpringBoard process at %ctor time, then
-# LFClockOverlay creates per-frame CTFonts with custom (wght, wdth)
-# values to match Apple's iOS 26 lock-screen-clock resize behaviour.
+# creation. We register the bundled ADTNumeric.ttc (Apple's iOS 26
+# Adaptive-Time font collection, 13 numeric faces) into the SpringBoard
+# process at %ctor time, then LFClockOverlay creates per-frame CTFonts
+# with custom HGHT (height) axis values to match Apple's iOS 26
+# lock-screen-clock resize behaviour: digits grow taller without
+# changing width or stroke thickness.
 LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText
 
 include $(THEOS_MAKE_PATH)/tweak.mk
