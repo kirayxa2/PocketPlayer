@@ -257,52 +257,62 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     CGFloat width   = MAX(parentW - kLFFullWidthSideInset * 2.0,
                           datePillW + 24);  // never narrower than the date pill
 
-    // === iOS 26-style non-uniform vertical stretch ===
+    // === iOS 26-style non-uniform stretch with HUGE max height ===
     //
-    // Apple's resize in iOS 26 works like this:
+    // Apple's iOS 26 resize:
     //   - Digits ALWAYS fill the screen width (minus small padding)
     //   - Drag handle ONLY changes HEIGHT (non-uniform Y scale)
     //   - Width stays constant regardless of vStretch
-    //   - At max the clock can take ~half the screen height
+    //   - At max the clock takes well over half the screen height
     //
-    // Implementation: render the font at a FIXED large point size
-    // (chosen so "00:00" fills width - 16pt), then apply
-    // CGAffineTransformMakeScale(1.0, scaleY) where scaleY maps
-    // from vStretch. To avoid pixelation at max stretch, we render
-    // at the LARGEST needed size (fontPoints * kLFVStretchMax) and
-    // then COMPRESS at smaller stretches. Compression is always
-    // crisper than expansion because it discards pixels rather than
-    // interpolating new ones.
+    // Implementation rationale: we render the time at a FIXED HUGE
+    // font size (kLFLargeFontPoints), which means natural text size
+    // is much larger than any device screen. We then apply a
+    // CGAffineTransform with TWO compressions:
     //
-    // vStretch=1.0 → scaleY = 1.0/kLFVStretchMax (compressed, small)
-    // vStretch=kLFVStretchMax → scaleY = 1.0 (identity, crisp max)
-    static const CGFloat kLFVStretchMax = 2.5;
+    //   - scaleX (constant for given screen width): always compresses
+    //     the natural width down to the screen width, so digits look
+    //     like they fill the screen edge-to-edge
+    //   - scaleY (depends on vStretch): compresses the natural height
+    //     more or less, so the digits look short or tall
+    //
+    // Both transforms ALWAYS compress (scale < 1.0) -- never expand.
+    // Compression is crisper than expansion because it discards pixels
+    // rather than interpolating new ones. So at every vStretch from
+    // 1.0 to kLFVStretchMax, the digits stay sharp.
+    //
+    // vStretch=1.0           → scaleY = 1.0/kLFVStretchMax (~0.4),
+    //                          digits compact (~170pt tall on 6s)
+    // vStretch=kLFVStretchMax → scaleY = 1.0 (identity along Y),
+    //                          digits at full rendered height
+    //                          (~430pt tall on 6s -- over 60% of
+    //                          the 6s screen, way more than half)
+    static const CGFloat kLFVStretchMax     = 2.5;
+    static const CGFloat kLFLargeFontPoints = 380.0;
 
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
-    UIFont   *refFont   = [s resolvedFontForReferenceSize:kLFClockReferenceFontSize];
-    CGFloat   refTextW  = [probeText sizeWithAttributes:@{ NSFontAttributeName: refFont }].width;
-    if (refTextW < 1.0) refTextW = 1.0;
 
-    // Font size that makes digits fill (width - 16pt) at scaleY=1.
-    CGFloat targetTextW = MAX(80.0, width - 16.0);
-    CGFloat fontPoints  = kLFClockReferenceFontSize * (targetTextW / refTextW);
-    fontPoints          = MAX(20.0, fontPoints);
-
-    UIFont *timeFont = [s resolvedFontForReferenceSize:fontPoints];
+    UIFont *timeFont = [s resolvedFontForReferenceSize:kLFLargeFontPoints];
     _timeLabel.font  = timeFont;
 
-    // Measure at the rendered (large) font size.
+    // Measure at the HUGE rendered font size. timeSize is much larger
+    // than the screen on every supported device.
     CGSize timeSize = [probeText sizeWithAttributes:@{ NSFontAttributeName: timeFont }];
+    if (timeSize.width < 1.0)  timeSize.width  = 1.0;
+    if (timeSize.height < 1.0) timeSize.height = 1.0;
 
-    // scaleY maps vStretch [1.0, kLFVStretchMax] onto visual height.
-    // At vStretch=1.0 digits appear at their "natural" height
-    // (timeSize.height * 1/kLFVStretchMax ≈ 40% of rendered height).
-    // At vStretch=kLFVStretchMax digits appear at full rendered height
-    // (scaleY=1.0, identity, pixel-perfect).
+    // scaleX always compresses width to fit (overlay width - 16pt).
+    // It's effectively constant for a given screen.
+    CGFloat targetTextW = MAX(80.0, width - 16.0);
+    CGFloat scaleX      = targetTextW / timeSize.width;
+    if (scaleX > 1.0) scaleX = 1.0;   // never expand
+
+    // scaleY varies with vStretch.
     CGFloat vStretch = MAX(1.0, MIN(kLFVStretchMax, s.verticalStretch));
     CGFloat scaleY   = vStretch / kLFVStretchMax;
 
-    // The VISUAL height of the time label after transform:
+    // Visual sizes after transform.
+    CGFloat visualTimeW = timeSize.width  * scaleX;   // = targetTextW (constant)
     CGFloat visualTimeH = timeSize.height * scaleY;
 
     CGFloat height = datePillH + kLFDatePillToTimeGap + ceil(visualTimeH) + 12;
@@ -330,18 +340,26 @@ static const CGFloat kLFDatePillToTimeGap    = 12.0;
     _datePillView.layer.cornerRadius = datePillH / 2.0;
     _dateLabel.frame = CGRectMake(0, 0, datePillW, datePillH);
 
-    // The time label spans the full overlay width. It's rendered at
-    // the LARGE font size (fills width) but displayed with scaleY
-    // compression so it appears at the correct visual height for the
-    // current vStretch. The layer's anchorPoint sits at the TOP edge
-    // so the digits grow DOWNWARD only as the user drags.
-    _timeLabel.transform = CGAffineTransformIdentity;
+    // The time label is rendered at HUGE natural size; transform
+    // compresses to fit screen width (scaleX) and current vStretch
+    // (scaleY). Both compressions stay crisp because we never expand.
+    //
+    // We use bounds + position + anchorPoint (NOT frame) so the
+    // layer's intrinsic rendering canvas stays huge while the visual
+    // result on screen is compressed cleanly.
+    _timeLabel.transform = CGAffineTransformIdentity;   // reset before bounds change
+    _timeLabel.bounds    = CGRectMake(0, 0, timeSize.width, timeSize.height);
+
     CGFloat timeY = datePillH + kLFDatePillToTimeGap;
-    _timeLabel.frame = CGRectMake(0, timeY, width, ceil(timeSize.height));
+    CGFloat anchorScreenX;
+    if (s.alignment == LFClockAlignmentLeft)        anchorScreenX = 0;
+    else if (s.alignment == LFClockAlignmentRight)  anchorScreenX = width;
+    else                                            anchorScreenX = width / 2.0;
+
     _timeLabel.layer.anchorPoint = CGPointMake(ax, 0.0);
-    _timeLabel.layer.position    = CGPointMake(ax * width, timeY);
-    // Apply non-uniform Y-only scale. scaleX=1.0 keeps width constant.
-    _timeLabel.transform = CGAffineTransformMakeScale(1.0, scaleY);
+    _timeLabel.layer.position    = CGPointMake(anchorScreenX, timeY);
+    // Combined non-uniform compression.
+    _timeLabel.transform = CGAffineTransformMakeScale(scaleX, scaleY);
 
     _glassBackground.frame = self.bounds;
     _glassBackground.glassCornerRadius = MIN(28, height / 2.0);
@@ -608,14 +626,18 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     // Y scale). Drag DOWN grows digits taller, drag UP shrinks them
     // back toward natural height. Width stays constant.
     //
-    //   drag DOWN by N pt -> vStretch += N / 300 * (2.5 - 1.0)
+    //   drag DOWN by N pt -> vStretch += N / 180 * (2.5 - 1.0)
     //   drag UP   by N pt -> vStretch -= same
     //
-    // Clamped at [1.0, 2.5]. At 2.5 digits reach ~half the screen
-    // height on a 6s. Divisor 300 gives comfortable finger-feel:
-    // ~300pt of drag (full swipe on 6s) traverses the whole range.
+    // Clamped at [1.0, 2.5]. At 2.5 digits reach ~430pt tall on a
+    // 6s -- well over half the 667pt screen height.
+    //
+    // Divisor 180 (down from 300) makes the drag feel significantly
+    // lighter: a casual ~half-screen swipe (~330pt) takes the user
+    // well past max stretch, so the handle responds with strong
+    // visual feedback per pixel of finger movement.
     CGFloat range       = 2.5 - 1.0;
-    CGFloat delta       = t.y / 300.0 * range;
+    CGFloat delta       = t.y / 180.0 * range;
     CGFloat newVStretch = MAX(1.0, MIN(2.5, _resizeStartVStretch + delta));
 
     BOOL changed = NO;
