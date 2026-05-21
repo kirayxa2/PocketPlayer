@@ -390,16 +390,34 @@ static UIFont *lf_makeVariableSFProFont(CGFloat size, CGFloat weight, CGFloat wi
     CGFloat t = (vStretch - kLFVStretchMin) /
                 (kLFVStretchMax - kLFVStretchMin);  // 0 .. 1
 
-    // Linear interpolation across the three axes. Coefficients tuned
-    // for iPhone 6s width (375pt screen, 359pt available after the
-    // kLFFullWidthSideInset on each side): at t=1 the natural width
-    // of "00:00" with weight=1000, width=30, fontSize=400 is roughly
-    // 340pt -- comfortably under the 359pt limit. Smaller-screen or
-    // larger-screen devices fall back to the post-measure shrink
-    // step below if the natural width still overshoots.
-    CGFloat fontSize   = 100.0 + ( 400.0 -  100.0) * t;   // 100..400 pt
-    CGFloat fontWeight = 400.0 + (1000.0 -  400.0) * t;   // wght: 400..1000
-    CGFloat fontWidth  = 100.0 + (  30.0 -  100.0) * t;   // wdth: 100..30
+    // Linear interpolation across the variable axes. Tuned to make
+    // the resize feel like "the digits are growing TALLER" -- not
+    // "the digits are growing thicker". Earlier builds also swept
+    // the wght axis from Regular(400) all the way to Black(1000),
+    // which made the cap-height grow nicely but also made the stroke
+    // weights TRIPLE in thickness. Visually the user perceived the
+    // resize as "becoming bolder" instead of "becoming taller",
+    // because the stroke-weight change was more eye-grabbing than
+    // the height change.
+    //
+    // Fix: keep fontWeight CONSTANT at Semibold (600) across the
+    // entire vStretch range. Stroke widths stay visually identical
+    // from compact to full-stretch -- the only thing changing is
+    // the actual rendered font size and the wdth axis, which
+    // together produce digits that look like they're growing
+    // taller (cap-height 4x) while the strokes maintain a stable
+    // visual weight. Width compresses to keep the natural rendered
+    // "00:00" inside the iPhone screen.
+    //
+    // Coefficients tuned for iPhone 6s width (375pt screen, 359pt
+    // available after kLFFullWidthSideInset on each side): at t=1,
+    // SF Pro Semibold "00:00" at fontSize=400, width=30 has a
+    // natural rendered width of ~310pt -- comfortably under 359pt.
+    // The post-measure shrink step below catches any overflow on
+    // smaller-than-6s devices.
+    CGFloat fontSize   = 100.0 + (400.0 - 100.0) * t;     // 100..400 pt
+    CGFloat fontWeight = 600.0;                            // Semibold, CONSTANT
+    CGFloat fontWidth  = 100.0 + ( 30.0 - 100.0) * t;     // wdth: 100..30
 
     NSString *probeText = (_timeLabel.text.length ? _timeLabel.text : @"00:00");
 
