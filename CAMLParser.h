@@ -8,9 +8,14 @@
 //   - <CGImage src="assets/foo.png"/> contents
 //   - <states> with <LKState name="..."> containing <LKStateSetValue targetId keyPath><value/>
 //   - <stateTransitions> with per-(from,to) durations (basic)
+//   - <animations> blocks with <animation type="CAKeyframeAnimation"/CABasicAnimation"/...>
+//     attached natively via CALayer.addAnimation:forKey: so Apple's own animator
+//     handles repeat/autoreverse/timing without per-frame work from us.
 //
 // Not supported (gracefully ignored):
-//   - <modules>, animations, filters, text layers, gradient layers
+//   - <modules>, text layers, gradient layers
+//   - CAEmitterLayer (parsed as plain CALayer; particles don't spawn)
+//   - <filters> / CAFilter (private API; ignored)
 //
 // Usage:
 //   PPCAMLDocument *doc = [PPCAMLParser parseCAMLAtPath:camlPath assetsPath:assetsPath];
@@ -41,6 +46,13 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) NSDictionary<NSString *, PPCAMLState *> *states;
 // Names of states in the order they were declared in the .caml file.
 @property (nonatomic, strong, readonly) NSArray<NSString *> *stateOrder;
+
+// Diagnostics — parser fills these in so callers can show
+// "imgs=N missing=N emitters=N cells=N" in a debug label.
+@property (nonatomic, assign) NSInteger imagesLoaded;
+@property (nonatomic, assign) NSInteger imagesMissing;
+@property (nonatomic, assign) NSInteger emittersBuilt;
+@property (nonatomic, assign) NSInteger cellsBuilt;
 
 // Snapshot the "base" values (initial) so we can interpolate from them.
 - (void)captureBaseValues;

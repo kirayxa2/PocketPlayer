@@ -1,20 +1,31 @@
 // PPApplyBridge — talks to the PocketPlayer tweak running inside SpringBoard.
 //
-// V0.1 contract (what the tweak needs to honour, separately):
-//   1. The app writes a "request manifest" plist to a shared path:
-//        /var/jb/var/mobile/Library/PocketPlayer/apply.plist
-//      with keys:
-//        sourceBundlePath : NSString  — absolute path to the .wallpaper folder in our Documents
-//        timestamp        : NSDate
-//   2. The app posts a Darwin notification: "com.vortex.pocketplayer.apply"
-//   3. The tweak (next iteration) listens for that notification, reads
-//      the manifest, copies the bundle into the active PosterPlayer
-//      slot, and applies it without respring.
+// Apply is a TWO-STEP process now, on purpose:
 //
-// For now (v0.1 of the app) we only implement steps 1 and 2. The tweak
-// side of the contract isn't there yet — applying will only take effect
-// once we add the listener to Tweak.x. This way the UI is fully working
-// and the wiring is a small follow-up.
+//   Step 1. applyItem: — write a manifest to a shared path that the
+//   tweak's listener reads, then post Darwin notification
+//   "com.vortex.pocketplayer.apply". The tweak copies the chosen
+//   .wallpaper bundle into PosterPlayer's active slot. NO respring.
+//
+//   Step 2. respring — post Darwin notification
+//   "com.vortex.pocketplayer.respring". The tweak kills SpringBoard,
+//   launchd brings it back in ~3s, and on the next launch PosterKit
+//   plus our overlay both pick up the new bundle on lockscreen,
+//   homescreen and behind the lock UI.
+//
+// Splitting these lets users on fragile jailbreaks (where respring
+// occasionally drops the jailbreak and forces a re-Dopamine) hold off
+// the respring until they're ready -- e.g. plug in their charger or
+// close important apps first. Until they tap Respring, only our
+// overlay updates; the system wallpaper takes effect on the next
+// natural restart.
+//
+// Manifest path:  /var/mobile/Library/PocketPlayer/apply.plist
+// Manifest keys:
+//   sourceBundlePath : NSString  — absolute path to the .wallpaper folder
+//   itemID           : NSString
+//   displayName      : NSString
+//   timestamp        : NSDate
 
 #import <Foundation/Foundation.h>
 
@@ -22,8 +33,13 @@
 
 @interface PPApplyBridge : NSObject
 
-// Returns YES if the manifest was written and the notification posted.
-// Does NOT mean the wallpaper actually applied (see header comment).
+// Step 1. Stage the bundle for apply. Returns YES if the manifest
+// landed and the apply notification was posted. Does NOT respring;
+// caller is expected to follow up with -respring when ready.
 + (BOOL)applyItem:(PPWallpaperItem *)item error:(NSError **)error;
+
+// Step 2. Ask the tweak to respring. No-op if the tweak isn't
+// installed or running. SpringBoard returns in ~3 seconds.
++ (void)respring;
 
 @end

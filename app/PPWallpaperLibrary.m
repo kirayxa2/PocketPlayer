@@ -1,4 +1,7 @@
 #import "PPWallpaperLibrary.h"
+#import "PPPreviewRenderer.h"
+#import "PPWallpaperResizer.h"
+#import <UIKit/UIKit.h>
 
 @implementation PPWallpaperItem
 @end
@@ -93,8 +96,104 @@
 // separate function so we can swap in libarchive later.
 static BOOL PPUnzipFile(NSString *src, NSString *dst, NSError **error);
 
+// Recursively walk `root` (depth-first, breadth-balanced) up to `maxDepth`
+// and return the first directory whose name ends in `.wallpaper`, OR if
+// none is found, the parent directory of any `*.ca` folder that contains
+// `main.caml`. Returns nil if neither pattern matches.
+//
+// Real-world .tendies layouts seen in the wild:
+//   A. Foo.tendies/Foo.wallpaper/Floating.ca/main.caml   (clean)
+//   B. Foo.tendies/Floating.ca/main.caml                 (no .wallpaper)
+//   C. Foo.tendies/__MACOSX/... + Foo.wallpaper/...       (Mac packers)
+//   D. Foo.tendies/Random/Foo.wallpaper/...               (nested)
+static NSString *PPFindWallpaperBundleDir(NSString *root, BOOL *needsWrap) {
+    if (needsWrap) *needsWrap = NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *queue = [NSMutableArray arrayWithObject:root];
+    NSString *fallbackCAParent = nil;
+
+    int visited = 0;
+    while (queue.count > 0 && visited < 1024) {
+        NSString *dir = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        visited++;
+
+        NSArray *kids = [fm contentsOfDirectoryAtPath:dir error:NULL];
+        if (!kids) continue;
+
+        for (NSString *kid in kids) {
+            // Skip Mac metadata dumps.
+            if ([kid hasPrefix:@"__MACOSX"]) continue;
+            if ([kid hasPrefix:@"."])         continue;
+
+            NSString *kidPath = [dir stringByAppendingPathComponent:kid];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:kidPath isDirectory:&isDir] || !isDir) continue;
+
+            // Best case: a real .wallpaper folder.
+            if ([kid hasSuffix:@".wallpaper"]) {
+                if (needsWrap) *needsWrap = NO;
+                return kidPath;
+            }
+
+            // Second best: a *.ca folder with main.caml inside. Remember
+            // its parent so we can wrap it later if no .wallpaper exists.
+            if ([kid hasSuffix:@".ca"]) {
+                NSString *caml = [kidPath stringByAppendingPathComponent:@"main.caml"];
+                if ([fm fileExistsAtPath:caml] && !fallbackCAParent) {
+                    fallbackCAParent = dir;
+                }
+            }
+
+            [queue addObject:kidPath];
+        }
+    }
+
+    if (fallbackCAParent) {
+        if (needsWrap) *needsWrap = YES;
+        return fallbackCAParent;
+    }
+    return nil;
+}
+
+// Build a "what's actually in this archive" snippet for error messages.
+// Helps the user (and us) debug weird .tendies layouts without SSH.
+static NSString *PPDescribeArchiveContents(NSString *root) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:root];
+    NSString *p;
+    int count = 0;
+    while ((p = [e nextObject]) && count < 12) {
+        if ([p hasPrefix:@"__MACOSX"]) continue;
+        [lines addObject:p];
+        count++;
+    }
+    if (lines.count == 0) return @"(empty)";
+    NSString *joined = [lines componentsJoinedByString:@"\n  "];
+    return [@"  " stringByAppendingString:joined];
+}
+
 - (PPWallpaperItem *)importTendiesAtURL:(NSURL *)url
                                   error:(NSError **)error {
+    // Backwards-compatible one-shot. Unpacks AND resizes to the main
+    // screen in a single call; returns the ready-to-display item.
+    PPWallpaperItem *it = [self beginImportTendiesAtURL:url error:error];
+    if (!it) return nil;
+    UIScreen *s = [UIScreen mainScreen];
+    NSError *re = nil;
+    if (![self resizeItem:it toSize:s.bounds.size error:&re]) {
+        // Resize failure isn't fatal -- the unscaled bundle still
+        // renders, just with the canvas-fit hack the runtime applies.
+        // Log it via the caller's error pointer if they passed one but
+        // the item is otherwise valid.
+        if (error && !*error) *error = re;
+    }
+    return it;
+}
+
+- (PPWallpaperItem *)beginImportTendiesAtURL:(NSURL *)url
+                                       error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *root = [self libraryRoot];
 
@@ -128,41 +227,182 @@ static BOOL PPUnzipFile(NSString *src, NSString *dst, NSError **error);
         }
     }
 
-    if (!PPUnzipFile(stagedZip, itemDir, error)) {
+    // Default display name from the source filename: "mario_galaxy.tendies"
+    // -> "mario galaxy". Caller of -beginImportTendiesAtPath:displayName:
+    // can override this by passing a non-nil string.
+    NSString *baseFromURL = [[url.lastPathComponent stringByDeletingPathExtension]
+                             stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+
+    return [self _finishStagedImportAtItemDir:itemDir
+                                    stagedZip:stagedZip
+                                  displayName:baseFromURL
+                                    sourceURL:url.absoluteString
+                                        error:error];
+}
+
+- (PPWallpaperItem *)beginImportTendiesAtPath:(NSString *)path
+                                  displayName:(NSString *)displayName
+                                        error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = [self libraryRoot];
+
+    NSString *uuid = [[NSUUID UUID] UUIDString];
+    NSString *itemDir = [root stringByAppendingPathComponent:uuid];
+    if (![fm createDirectoryAtPath:itemDir
+       withIntermediateDirectories:YES
+                        attributes:nil
+                             error:error]) {
+        return nil;
+    }
+
+    // Already a plain absolute path inside our sandbox -- no security
+    // scope dance, just copy.
+    NSString *stagedZip = [itemDir stringByAppendingPathComponent:@"src.tendies"];
+    if (![fm copyItemAtPath:path toPath:stagedZip error:error]) {
+        [fm removeItemAtPath:itemDir error:NULL];
+        return nil;
+    }
+
+    // Use caller's displayName if provided, else stem-of-filename.
+    NSString *fallback = [[[path lastPathComponent] stringByDeletingPathExtension]
+                          stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+    NSString *useName = displayName.length ? displayName : fallback;
+
+    return [self _finishStagedImportAtItemDir:itemDir
+                                    stagedZip:stagedZip
+                                  displayName:useName
+                                    sourceURL:path
+                                        error:error];
+}
+
+// Shared tail of both -beginImportTendiesAtURL: and ...AtPath:. The two
+// public entries differ only in HOW they get the .tendies bytes onto
+// disk (security-scoped URL read vs. plain copy). After that, the work
+// is identical: unzip, locate the wallpaper bundle, wrap it if needed,
+// drop scratch, write meta, reload.
+- (PPWallpaperItem *)_finishStagedImportAtItemDir:(NSString *)itemDir
+                                        stagedZip:(NSString *)stagedZip
+                                      displayName:(NSString *)displayName
+                                        sourceURL:(NSString *)sourceURL
+                                            error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Unzip into a scratch subdir (NOT itemDir directly) so we can move
+    // just the relevant payload into place after we figure out the
+    // archive's layout. Avoids littering itemDir with __MACOSX/ etc.
+    NSString *scratch = [itemDir stringByAppendingPathComponent:@"_unpack"];
+    [fm createDirectoryAtPath:scratch
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:NULL];
+    if (!PPUnzipFile(stagedZip, scratch, error)) {
         [fm removeItemAtPath:itemDir error:NULL];
         return nil;
     }
     [fm removeItemAtPath:stagedZip error:NULL];
 
-    // Find the .wallpaper folder produced by unzip.
-    NSArray *kids = [fm contentsOfDirectoryAtPath:itemDir error:NULL];
-    NSString *bundle = nil;
-    for (NSString *k in kids) {
-        if ([k hasSuffix:@".wallpaper"]) { bundle = k; break; }
-    }
-    if (!bundle) {
+    // Try to find a .wallpaper bundle anywhere in the unpacked tree, or
+    // failing that the parent of a *.ca/main.caml pair.
+    BOOL needsWrap = NO;
+    NSString *foundDir = PPFindWallpaperBundleDir(scratch, &needsWrap);
+
+    if (!foundDir) {
+        NSString *contents = PPDescribeArchiveContents(scratch);
+        NSString *msg = [NSString stringWithFormat:
+            @"Couldn't find a wallpaper bundle in this .tendies file.\n\n"
+            @"Looked for any *.wallpaper folder, or any *.ca/main.caml.\n"
+            @"Archive contents (first 12 entries):\n%@", contents];
         if (error) *error = [NSError errorWithDomain:@"PocketPoster" code:1
-                              userInfo:@{NSLocalizedDescriptionKey:
-                                  @"Archive does not contain a .wallpaper bundle"}];
+                              userInfo:@{NSLocalizedDescriptionKey: msg}];
         [fm removeItemAtPath:itemDir error:NULL];
         return nil;
     }
 
-    NSString *displayName = [[url.lastPathComponent stringByDeletingPathExtension]
-                             stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+    // Decide the bundle name and (if needed) wrap a bare *.ca tree into
+    // a synthetic .wallpaper folder so the rest of the codebase (and
+    // PosterPlayer itself) sees the layout it expects.
+    NSString *bundleName;
+    NSString *bundlePath;
+
+    if (needsWrap) {
+        // foundDir is the parent of a *.ca/main.caml. Wrap it.
+        bundleName = [displayName stringByAppendingPathExtension:@"wallpaper"];
+        bundlePath = [itemDir stringByAppendingPathComponent:bundleName];
+        [fm createDirectoryAtPath:bundlePath
+      withIntermediateDirectories:YES
+                       attributes:nil
+                            error:NULL];
+        // Move every non-junk child of foundDir into the new .wallpaper.
+        for (NSString *kid in [fm contentsOfDirectoryAtPath:foundDir error:NULL]) {
+            if ([kid hasPrefix:@"__MACOSX"]) continue;
+            NSString *src = [foundDir stringByAppendingPathComponent:kid];
+            NSString *dst = [bundlePath stringByAppendingPathComponent:kid];
+            [fm moveItemAtPath:src toPath:dst error:NULL];
+        }
+    } else {
+        // foundDir IS the .wallpaper -- move it up to itemDir level.
+        bundleName = [foundDir lastPathComponent];
+        bundlePath = [itemDir stringByAppendingPathComponent:bundleName];
+        [fm moveItemAtPath:foundDir toPath:bundlePath error:NULL];
+    }
+
+    // Drop the scratch tree (and any __MACOSX/ etc. left in it).
+    [fm removeItemAtPath:scratch error:NULL];
+
     NSDictionary *meta = @{
-        @"displayName": displayName ?: bundle,
+        @"displayName": displayName.length ? displayName : [bundleName stringByDeletingPathExtension],
         @"importedAt":  [NSDate date],
-        @"sourceURL":   url.absoluteString ?: @"",
+        @"sourceURL":   sourceURL ?: @"",
+        @"wrapped":     @(needsWrap),
     };
     [meta writeToFile:[itemDir stringByAppendingPathComponent:@"meta.plist"]
             atomically:YES];
 
+    // Don't render preview here -- the caller will trigger that once
+    // the resize stage completes (otherwise we'd render a preview of
+    // the unscaled CAML, which then needs re-rendering).
+
     [self reload];
+    NSString *uuid = itemDir.lastPathComponent;
     for (PPWallpaperItem *it in self.cache) {
         if ([it.itemID isEqualToString:uuid]) return it;
     }
     return nil;
+}
+
+- (BOOL)resizeItem:(PPWallpaperItem *)item
+            toSize:(CGSize)targetSize
+             error:(NSError **)error {
+    if (!item.bundlePath.length) {
+        if (error) *error = [NSError errorWithDomain:@"PocketPoster" code:40
+            userInfo:@{NSLocalizedDescriptionKey: @"Item has no bundle path"}];
+        return NO;
+    }
+
+    if (![PPWallpaperResizer resizeBundleAtPath:item.bundlePath
+                                         toSize:targetSize
+                                          error:error]) {
+        return NO;
+    }
+
+    // Preview is now safe to render: it'll reflect the rescaled CAML.
+    NSString *root = [self libraryRoot];
+    NSString *itemDir = [root stringByAppendingPathComponent:item.itemID];
+    NSString *previewPath = [itemDir stringByAppendingPathComponent:@"preview.png"];
+    NSString *bundleForPreview = [item.bundlePath copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [PPPreviewRenderer renderPreviewForBundle:bundleForPreview
+                                             size:CGSizeMake(360, 640)
+                                          outPath:previewPath
+                                            error:NULL];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"PPWallpaperPreviewDidUpdate"
+                              object:nil];
+        });
+    });
+
+    return YES;
 }
 
 - (BOOL)deleteItem:(PPWallpaperItem *)item error:(NSError **)error {

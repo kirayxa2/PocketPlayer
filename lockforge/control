@@ -1,0 +1,9 @@
+Package: com.vortex.lockforge
+Name: LockForge
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: iOS 16/26-style lock screen editor for jailbroken iOS 15. Long-press to customize, resizable clock, custom fonts and colors.
+Maintainer: vortex
+Author: vortex
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
