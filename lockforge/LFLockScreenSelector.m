@@ -61,8 +61,13 @@ static const CGFloat kLFTopLabelToCardGap  = 14.0;
 // doesn't need an inset constant.
 static const CGFloat kLFBottomBarMargin    = 16.0;     // distance from safeArea bottom
 static const CGFloat kLFBottomBarSideInset = 22.0;     // inset for "+" only
-static const CGFloat kLFCustomizeBtnH      = 50.0;
-static const CGFloat kLFCustomizeBtnW      = 124.0;
+// Customize pill is the visual anchor of the bottom action bar --
+// noticeably larger than the auxiliary "+" button so it reads as the
+// primary action. iOS 26 dimensions on a 6s-class screen: ~180pt
+// wide x 52pt tall, 17pt Semibold label. Earlier 124x50pt was too
+// small relative to the card and got lost on the bar.
+static const CGFloat kLFCustomizeBtnH      = 52.0;
+static const CGFloat kLFCustomizeBtnW      = 180.0;
 static const CGFloat kLFPlusBtnSize        = 50.0;
 
 // Page dots (above the action bar)
@@ -180,16 +185,36 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     card.layer.borderColor     =
         [[UIColor colorWithWhite:1.0 alpha:0.08] CGColor];
 
-    // Snapshot of the live cover sheet -- includes the wallpaper plus
-    // our installed LFClockOverlay rendered at full size. This is a
-    // STATIC IMAGE (UIView snapshot), not the live clock, so it's
-    // safe to embed without competing for hit-tests with the editor
-    // path that also wants to reparent the live clock.
-    UIView *snap = [_sourceCoverSheet snapshotViewAfterScreenUpdates:NO];
+    // Snapshot of the live lock screen. We snapshot the WHOLE SCREEN,
+    // not just _sourceCoverSheet, because on iOS 15 the wallpaper
+    // doesn't live inside the cover-sheet view -- it's rendered by a
+    // separate window underneath (SBWallpaperWindow / SBHomeScreen-
+    // Window), and the cover sheet itself is mostly transparent so the
+    // wallpaper shows through compositing. Snapshotting just the cover
+    // sheet would only capture our installed clock overlay on a black
+    // background -- which is exactly what the user reported as "пустая
+    // карточка, не видно ни обоев ни часов".
+    //
+    // [UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES walks
+    // ALL the windows in the screen's z-order and produces a single
+    // composited UIView -- so wallpaper + cover-sheet content + our
+    // clock overlay all show up in the snapshot, exactly as the user
+    // saw them just before long-pressing.
+    //
+    // afterScreenUpdates:YES forces a full re-layout pass, which is
+    // slower than :NO but reliable: the carousel only spawns once per
+    // long-press, so the perf cost is invisible. With :NO some layers
+    // (e.g. the wallpaper, which is hardware-composited) come back as
+    // empty bitmaps because their cached layer state isn't populated
+    // for offscreen rendering.
+    UIView *snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES];
+    if (!snap) {
+        // Fallback: try the cover sheet only. Won't have wallpaper,
+        // but at least won't be a totally black card.
+        snap = [_sourceCoverSheet snapshotViewAfterScreenUpdates:YES];
+    }
     if (snap) {
         snap.tag                = kLFTagSnapshot;
-        snap.autoresizingMask   = UIViewAutoresizingFlexibleWidth |
-                                  UIViewAutoresizingFlexibleHeight;
         snap.userInteractionEnabled = NO;
         [card addSubview:snap];
     }
@@ -261,7 +286,7 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     _customizeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_customizeButton setTitle:@"Customize" forState:UIControlStateNormal];
     _customizeButton.titleLabel.font =
-        [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
     [_customizeButton setTitleColor:[UIColor whiteColor]
                            forState:UIControlStateNormal];
     _customizeButton.backgroundColor =
@@ -355,8 +380,15 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     //    vertical area, we shrink the card width down so the height
     //    fits -- the carousel still looks correct because aspect is
     //    preserved.
-    CGFloat sourceW       = _sourceCoverSheet ? _sourceCoverSheet.bounds.size.width  : b.size.width;
-    CGFloat sourceH       = _sourceCoverSheet ? _sourceCoverSheet.bounds.size.height : b.size.height;
+    //
+    //    Source dimensions come from UIScreen (not _sourceCoverSheet)
+    //    because we snapshot the WHOLE screen now -- the snapshot view
+    //    bounds match the screen bounds, so aspect math has to use
+    //    screen dimensions to scale the snapshot correctly inside the
+    //    card without distortion.
+    CGRect screenB = [UIScreen mainScreen].bounds;
+    CGFloat sourceW = screenB.size.width;
+    CGFloat sourceH = screenB.size.height;
     if (sourceW < 1.0) sourceW = b.size.width;
     if (sourceH < 1.0) sourceH = b.size.height;
 
