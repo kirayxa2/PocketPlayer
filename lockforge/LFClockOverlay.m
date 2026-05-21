@@ -178,6 +178,31 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
 @property (nonatomic, strong) UIView            *resizeHandle;       // 44x44 invisible touch zone
 @property (nonatomic, strong) CAShapeLayer      *resizeHandleArc;     // curved stroke along the corner
 
+// Digit-shaped mask layer applied to _glassBackground.layer when
+// liquidGlassIntensity > 0. This is what makes the glass effect
+// render INSIDE THE DIGITS THEMSELVES (the "цифры из стекла" iOS 26
+// look) instead of as a rectangle BEHIND the digits.
+//
+// Technique: a CATextLayer with the SAME font, size, transform, and
+// alignment as _timeLabel. CATextLayer renders white glyphs; when
+// installed as `_glassBackground.layer.mask`, Core Animation uses
+// each glyph's alpha as the visibility mask for the entire glass
+// view. Result: blur, tint, specular highlight, gyro shimmer all
+// show only inside the silhouettes of "9:10".
+//
+// While the mask is active, _timeLabel.layer.opacity is set to 0 so
+// the regular non-glass text doesn't double up on top of the glass
+// rendering. The label itself stays in the view tree (text accessible,
+// metrics unchanged) -- only its visible alpha is gated.
+//
+// Apple uses an analogous technique on iOS 26: a "GlassMaterial" Metal
+// pipeline runs over a region defined by the glyph paths, with the
+// glyphs serving as the clipping geometry for the shader. We can't
+// run that exact shader on iOS 15 (no .metallib at our build time),
+// but the masking principle is the same and the visual result is the
+// digit shapes are filled with the live blurred-wallpaper material.
+@property (nonatomic, strong) CATextLayer       *digitMaskLayer;
+
 @property (nonatomic, strong) NSTimer           *tickTimer;
 @property (nonatomic, strong) UIPanGestureRecognizer *resizePan;
 @property (nonatomic, strong, nullable) NSNumber *cachedLuminance;
@@ -557,13 +582,85 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
                                                kLFTimePad - capTopGap);
     _timeLabel.transform         = CGAffineTransformMakeScale(scaleX, 1.0);
 
-    // Liquid-glass backdrop sits BEHIND the time digits, occupying
-    // exactly the selection box. We position it in self's coords
-    // (it's a sibling of _selectionBoxView) so the box's chrome
-    // stays in front and the glass corner radius matches the box.
+    // Liquid-glass material now renders ON THE DIGITS THEMSELVES via a
+    // glyph-shaped mask, NOT as a rectangle behind the digits. The
+    // glass view spans the full selection box (so its blur captures
+    // wallpaper from the full digit region), but the layer mask
+    // clips the rendered effect to the digit silhouettes only.
+    //
+    // When intensity == 0 (Solid mode) the mask is removed and the
+    // regular textColor-tinted UILabel is shown -- a plain solid
+    // colour, exactly the toggle the user picked in the editor.
     _glassBackground.frame             = _selectionBoxView.frame;
     _glassBackground.glassCornerRadius = MIN(28, boxH / 2.0);
     _glassBackground.intensity         = s.liquidGlassIntensity;
+
+    if (s.liquidGlassIntensity > 0) {
+        // Glass mode: hide the regular text rendering, build/refresh
+        // the digit-shaped mask, install it on the glass view's layer.
+        // The text stays in _timeLabel (so accessibility and any other
+        // text-driven layout still works) but its visible alpha is 0;
+        // the glass material with its own shimmer/specular IS the
+        // digit rendering now.
+        _timeLabel.layer.opacity = 0.0;
+
+        if (!_digitMaskLayer) {
+            _digitMaskLayer = [CATextLayer layer];
+            _digitMaskLayer.foregroundColor = [[UIColor whiteColor] CGColor];
+            _digitMaskLayer.contentsScale   = [UIScreen mainScreen].scale;
+            // Disable implicit animations on every property -- when the
+            // minute rolls over and we update string/font/position, we
+            // want the mask to switch instantly along with the visible
+            // glass material, not lag behind with a fade.
+            _digitMaskLayer.actions = @{
+                @"contents":  [NSNull null],
+                @"position":  [NSNull null],
+                @"bounds":    [NSNull null],
+                @"transform": [NSNull null],
+                @"string":    [NSNull null],
+                @"font":      [NSNull null],
+                @"fontSize":  [NSNull null],
+            };
+        }
+        _digitMaskLayer.string    = _timeLabel.text ?: @"";
+        // CATextLayer wants a CTFont/CGFont/UIFont OR a string family
+        // name. Pass the resolved variable UIFont directly -- CA bridges
+        // it to a CTFont with all our axis values intact.
+        _digitMaskLayer.font      = (__bridge CFTypeRef)timeFont;
+        _digitMaskLayer.fontSize  = timeFont.pointSize;
+        _digitMaskLayer.alignmentMode =
+            (s.alignment == LFClockAlignmentLeft)  ? kCAAlignmentLeft  :
+            (s.alignment == LFClockAlignmentRight) ? kCAAlignmentRight :
+                                                     kCAAlignmentCenter;
+
+        // Place the mask in the glass view's local coords. The glass
+        // view's frame == _selectionBoxView.frame, so positions inside
+        // the selection box translate 1:1 to positions inside the
+        // glass view. We mirror exactly what we did to _timeLabel:
+        //   - bounds   = natural rendered text size
+        //   - anchor   = (ax, 0.0)  top-edge anchored
+        //   - position = (anchorBoxX, kLFTimePad - capTopGap)
+        //   - transform= horizontal squeeze identical to _timeLabel
+        // so the digit silhouettes line up pixel-perfect with where
+        // _timeLabel WOULD render if it weren't hidden.
+        _digitMaskLayer.bounds      = CGRectMake(0, 0,
+                                                 timeSize.width,
+                                                 timeSize.height);
+        _digitMaskLayer.anchorPoint = CGPointMake(ax, 0.0);
+        _digitMaskLayer.position    = CGPointMake(anchorBoxX,
+                                                  kLFTimePad - capTopGap);
+        _digitMaskLayer.transform   = CATransform3DMakeAffineTransform(
+            CGAffineTransformMakeScale(scaleX, 1.0));
+
+        _glassBackground.layer.mask = _digitMaskLayer;
+    } else {
+        // Solid mode: tear down the mask and show the regular label.
+        _timeLabel.layer.opacity   = 1.0;
+        _glassBackground.layer.mask = nil;
+        // Keep _digitMaskLayer instance alive between toggles so we
+        // don't re-allocate when the user flips Glass/Solid back and
+        // forth in the editor.
+    }
 
     // Resize-handle arc: traces the bottom-right corner curve of
     // the SELECTION BOX, drawn in the box's local coord space (the
