@@ -1,45 +1,90 @@
 #import "LFLiquidGlassMetalView.h"
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
+#import <simd/simd.h>
 
 // =====================================================================
-// Uniform layout (MUST match `struct ShaderUniforms` in LiquidGlass.metal).
+// LiquidGlass.ShaderUniforms -- Obj-C mirror of the Swift struct.
 //
-// Order, type, and alignment all have to line up bit-for-bit with the
-// MSL struct or the GPU will read garbage. Keep float4 / vector_float4
-// fields 16-byte aligned -- the compiler does this automatically with
-// simd_float* but mixing scalars and vectors gets tricky. We sit on
-// `__attribute__((aligned(16)))` for the whole struct to make sure
-// the buffer offset is correct after rebuilds.
+// MUST stay bit-for-bit identical to:
+//   - `struct ShaderUniforms` in LiquidGlassKit/LiquidGlassFragment.metal
+//   - `struct ShaderUniforms` in LiquidGlassKit/LiquidGlassView.swift
+//
+// Field order, type, and size are read directly by the GPU via the
+// uniforms buffer at fragment-buffer index 0; if you re-order or
+// resize anything here, the shader will read garbage. The metal-side
+// struct uses `float4 rectangles[16]`; we mirror with a fixed-size
+// array of simd_float4. simd alignment is 16 bytes per float4 so the
+// total is naturally aligned and we don't need any pragma packing.
 // =====================================================================
-#pragma pack(push, 4)
-typedef struct __attribute__((aligned(16))) {
-    simd_float2 resolution;
-    float       contentsScale;
-    float       cornerRadius;
-    simd_float4 materialTint;
-    float       glassThickness;
-    float       refractiveIndex;
-    float       dispersionStrength;
-    float       fresnelDistanceRange;
-    float       fresnelIntensity;
-    float       fresnelEdgeSharpness;
-    simd_float4 rectangle;
-} LFLGMetalUniforms;
-#pragma pack(pop)
+#define kLFGlassMaxRectangles 16
 
-// CABackdropLayer is a private, undocumented CALayer subclass. It
-// auto-composites everything underneath it into its own contents
-// without requiring our process to render the background tree
-// manually. We use it via NSClassFromString so the symbol is looked
-// up at runtime; if Apple removes it on a future iOS version we
-// fall back to drawHierarchy at slightly higher CPU cost.
+typedef struct {
+    simd_float2 resolution;             // viewport pixels
+    float       contentsScale;          // [UIScreen mainScreen].scale
+    simd_float2 touchPoint;             // tilt-driven point (pts, UL origin)
+    float       shapeMergeSmoothness;
+    float       cornerRadius;           // pts
+    float       cornerRoundnessExponent;// 1=diamond, 2=circle, 4=squircle
+    simd_float4 materialTint;           // RGBA premultiplied weight
+    float       glassThickness;         // simulated thickness (pts)
+    float       refractiveIndex;        // ~1.5 borosilicate
+    float       dispersionStrength;     // 0..0.02 prism intensity
+    float       fresnelDistanceRange;   // edge falloff (pts)
+    float       fresnelIntensity;       // 0..1 rim weight
+    float       fresnelEdgeSharpness;   // pow exponent for falloff
+    float       glareDistanceRange;     // glare falloff (pts)
+    float       glareAngleConvergence;  // 0..pi
+    float       glareOppositeSideBias;  // >1 amplifies far-side
+    float       glareIntensity;         // 1..4
+    float       glareEdgeSharpness;
+    float       glareDirectionOffset;   // radians
+    int32_t     rectangleCount;
+    simd_float4 rectangles[kLFGlassMaxRectangles];
+} LFGlassShaderUniforms;
+
+// =====================================================================
+// .regular preset -- ported field-for-field from LiquidGlassKit's
 //
-// Every JB tweak that does Liquid-Glass-style backdrops on iOS 13+
-// uses this same trick -- LiquidGlassKit, LiquidUI, and Apple's own
-// internal _UIBackdropEffectView / UIVisualEffectView under the
-// hood all instantiate CABackdropLayer. Safe to use in our context.
+//     static let regular = Self.init(
+//       shaderUniforms: .init(
+//         glassThickness: 10,
+//         refractiveIndex: 1.5,
+//         ...
+//
+// in LiquidGlassKit/Sources/LiquidGlassKit/LiquidGlassView.swift.
+// Any future tweak of these values should also be applied upstream
+// (or pulled from upstream) so the visual signature stays the same.
+// =====================================================================
+static void lf_fillRegularPreset(LFGlassShaderUniforms *u) {
+    u->shapeMergeSmoothness     = 0.2f;
+    u->cornerRoundnessExponent  = 2.0f;
+    u->glassThickness           = 10.0f;
+    u->refractiveIndex          = 1.5f;
+    u->dispersionStrength       = 5.0f;
+    u->fresnelDistanceRange     = 70.0f;
+    u->fresnelIntensity         = 0.0f;
+    u->fresnelEdgeSharpness     = 0.0f;
+    u->glareDistanceRange       = 30.0f;
+    u->glareAngleConvergence    = 0.1f;
+    u->glareOppositeSideBias    = 1.0f;
+    u->glareIntensity           = 0.1f;
+    u->glareEdgeSharpness       = -0.15f;
+    u->glareDirectionOffset     = -((float)M_PI) / 4.0f;
+    // materialTint set per-frame from intensity + tintColor below.
+}
+
+// =====================================================================
+// CABackdropLayer-backed UIView. Same trick as LiquidGlassKit's
+// BackdropView -- swap layerClass to a private CABackdropLayer that
+// auto-composites everything beneath it (the wallpaper, other tweaks,
+// etc.) into its own contents cache. We then drawHierarchy that view
+// to drive a CGContext, which writes straight into a CVPixelBuffer-
+// backed MTLTexture (zero-copy).
+// =====================================================================
 @interface LFLGBackdropView : UIView
 @end
 @implementation LFLGBackdropView
@@ -50,12 +95,8 @@ typedef struct __attribute__((aligned(16))) {
 - (instancetype)init {
     if ((self = [super init])) {
         self.userInteractionEnabled = NO;
-        // The two private kvc keys below are documented from runtime
-        // headers / class-dump of QuartzCore. They make the backdrop
-        // layer (a) participate in window-server compositing (so it
-        // sees the real wallpaper underneath, not just our own view
-        // tree) and (b) give it a unique group identifier so the
-        // compositor doesn't merge it with another tweak's backdrop.
+        // Mirror LiquidGlassKit's BackdropView config.
+        [self.layer setValue:@(NO)  forKey:@"layerUsesCoreImageFilters"];
         [self.layer setValue:@(YES) forKey:@"windowServerAware"];
         [self.layer setValue:[[NSUUID UUID] UUIDString] forKey:@"groupName"];
     }
@@ -64,35 +105,114 @@ typedef struct __attribute__((aligned(16))) {
 @end
 
 // =====================================================================
-// LFLiquidGlassMetalView
+// ZeroCopyBridge -- Obj-C port of LiquidGlassKit's ZeroCopyBridge.swift.
+//
+// One CVPixelBuffer (BGRA8, IOSurface-backed) wraps a CGContext on the
+// CPU side and an MTLTexture on the GPU side; both views share memory.
+// We lock to draw, unlock + flush to publish to the GPU. The metal
+// texture is cached in a CVMetalTextureCache so we don't re-allocate
+// on every frame -- only on view resize.
+// =====================================================================
+@interface LFLGZeroCopyBridge : NSObject {
+@public
+    CVMetalTextureCacheRef _cache;
+    CVPixelBufferRef       _pixelBuffer;
+    CVMetalTextureRef      _cvTexture;
+    int                    _width;
+    int                    _height;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (void)setupBufferWidth:(int)w height:(int)h;
+- (id<MTLTexture>)renderActions:(void(^)(CGContextRef ctx))actions;
+@end
+
+@implementation LFLGZeroCopyBridge {
+    id<MTLDevice> _device;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)device {
+    if ((self = [super init])) {
+        _device = device;
+        CVReturn rc = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL,
+                                                device, NULL, &_cache);
+        if (rc != kCVReturnSuccess) {
+            NSLog(@"[LockForge] ZeroCopyBridge: failed to create texture cache: %d", rc);
+        }
+    }
+    return self;
+}
+- (void)dealloc {
+    if (_cvTexture)   CFRelease(_cvTexture);
+    if (_pixelBuffer) CVPixelBufferRelease(_pixelBuffer);
+    if (_cache)       CFRelease(_cache);
+}
+- (void)setupBufferWidth:(int)w height:(int)h {
+    if (w == _width && h == _height && _pixelBuffer && _cvTexture) return;
+    if (_cvTexture)   { CFRelease(_cvTexture);   _cvTexture   = NULL; }
+    if (_pixelBuffer) { CVPixelBufferRelease(_pixelBuffer); _pixelBuffer = NULL; }
+    _width  = w;
+    _height = h;
+
+    NSDictionary *attrs = @{
+        (NSString *)kCVPixelBufferMetalCompatibilityKey:    @YES,
+        (NSString *)kCVPixelBufferCGImageCompatibilityKey:  @YES,
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey:   @{},
+    };
+    CVReturn rc = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                      kCVPixelFormatType_32BGRA,
+                                      (__bridge CFDictionaryRef)attrs,
+                                      &_pixelBuffer);
+    if (rc != kCVReturnSuccess) {
+        NSLog(@"[LockForge] ZeroCopyBridge: pixel buffer create failed: %d", rc);
+        return;
+    }
+    rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
+        _cache, _pixelBuffer, NULL, MTLPixelFormatBGRA8Unorm, w, h, 0,
+        &_cvTexture);
+    if (rc != kCVReturnSuccess) {
+        NSLog(@"[LockForge] ZeroCopyBridge: cv-metal texture create failed: %d", rc);
+    }
+}
+- (id<MTLTexture>)renderActions:(void(^)(CGContextRef))actions {
+    if (!_pixelBuffer || !_cache) return nil;
+    size_t w  = CVPixelBufferGetWidth(_pixelBuffer);
+    size_t h  = CVPixelBufferGetHeight(_pixelBuffer);
+    CVPixelBufferLockBaseAddress(_pixelBuffer, 0);
+    void  *data        = CVPixelBufferGetBaseAddress(_pixelBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(_pixelBuffer);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(data, w, h, 8, bytesPerRow, cs,
+        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
+        return nil;
+    }
+    if (actions) actions(ctx);
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(_pixelBuffer, 0);
+    CVMetalTextureCacheFlush(_cache, 0);
+    return _cvTexture ? CVMetalTextureGetTexture(_cvTexture) : nil;
+}
+@end
+
+// =====================================================================
+// LFLiquidGlassMetalView -- public entry point for the Metal-driven
+// glass renderer. Owns the MTKView, the pipeline state, the uniforms
+// buffer, the backdrop view, and the zero-copy bridge.
 // =====================================================================
 @interface LFLiquidGlassMetalView () <MTKViewDelegate>
 @property (nonatomic, strong) MTKView                 *mtkView;
-@property (nonatomic, strong) LFLGBackdropView        *backdrop;
+@property (nonatomic, strong) LFLGBackdropView        *backdropView;
+@property (nonatomic, strong) LFLGZeroCopyBridge      *zeroCopy;
 
-// Metal objects (lazily built once at +isAvailable / -init time).
 @property (nonatomic, strong) id<MTLDevice>            device;
 @property (nonatomic, strong) id<MTLCommandQueue>      commandQueue;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipeline;
 @property (nonatomic, strong) id<MTLBuffer>            uniformsBuffer;
-@property (nonatomic, strong) MTKTextureLoader        *textureLoader;
+@property (nonatomic, strong) MPSImageGaussianBlur    *blur;
+
 @property (nonatomic, strong) id<MTLTexture>           backgroundTexture;
-
-// Uniform values that the fragment shader needs. We keep the shimmer
-// offset in here too even though the simplified .metal file doesn't
-// use it -- the existing API contract on LFLiquidGlassView.set-
-// ShimmerOffset: needs to do something visible, so we attach a
-// CGAffineTransform to the MTKView each tick.
 @property (nonatomic, assign) CGPoint                  shimmerOffset;
-
-// Frame counter for sub-rate capture. iPhone 6s renders the lock
-// screen at 60 Hz; capturing the backdrop and uploading it as a
-// texture every frame is the dominant cost. Most of the perceptual
-// quality survives capturing every 2nd frame (i.e. 30 Hz updates of
-// what's BEHIND the glass) while the shader still runs at 60 Hz on
-// the cached texture, which is what gives the gyro-shimmer its
-// smoothness without melting the GPU.
-@property (nonatomic, assign) uint32_t                 frameCounter;
 @end
 
 @implementation LFLiquidGlassMetalView
@@ -100,9 +220,6 @@ typedef struct __attribute__((aligned(16))) {
 #pragma mark - Availability
 
 + (NSString *)metallibPath {
-    // Two locations to probe; the rootless prefix wins on iOS 15+
-    // jailbreaks, the legacy /Library wins on rootful (older Cheyote
-    // / Taurine setups). Whichever exists first is what we load.
     NSArray *candidates = @[
         @"/var/jb/Library/LockForge/LiquidGlassShaders.metallib",
         @"/Library/LockForge/LiquidGlassShaders.metallib",
@@ -119,15 +236,14 @@ typedef struct __attribute__((aligned(16))) {
     dispatch_once(&once, ^{
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) {
-            NSLog(@"[LockForge] Metal not available -- using UIVisualEffectView fallback for glass.");
+            NSLog(@"[LockForge] No Metal device -- falling back to UIVisualEffectView.");
             ok = NO;
             return;
         }
-        NSString *path = [self metallibPath];
-        if (!path) {
-            NSLog(@"[LockForge] LiquidGlassShaders.metallib not found in /var/jb/Library/LockForge/ "
-                  @"or /Library/LockForge/ -- using UIVisualEffectView fallback. "
-                  @"Compile via .github/workflows/compile-metal.yml or push the .metal file to trigger CI.");
+        NSString *p = [self metallibPath];
+        if (!p) {
+            NSLog(@"[LockForge] LiquidGlassShaders.metallib not bundled (CI not run yet?) "
+                  @"-- falling back to UIVisualEffectView.");
             ok = NO;
             return;
         }
@@ -146,16 +262,11 @@ typedef struct __attribute__((aligned(16))) {
 
     _intensity         = 0;
     _tintColor         = [UIColor whiteColor];
-    _glassCornerRadius = 18;
+    _glassCornerRadius = 18.0;
     _shimmerOffset     = CGPointZero;
-    _frameCounter      = 0;
 
     if (![[self class] isAvailable] || ![self setupMetal]) {
-        // If Metal setup actually fails after isAvailable said YES
-        // (e.g. the metallib is corrupt), present as a transparent
-        // view -- LFLiquidGlassView's caller code will see no glass
-        // and the fallback is silently no glass. Better than crashing.
-        NSLog(@"[LockForge] Metal pipeline setup failed; LFLiquidGlassMetalView is a no-op.");
+        NSLog(@"[LockForge] Metal pipeline build failed -- LFLiquidGlassMetalView is a no-op.");
         return self;
     }
 
@@ -169,8 +280,6 @@ typedef struct __attribute__((aligned(16))) {
     if (!_device) return NO;
 
     NSString *path = [[self class] metallibPath];
-    if (!path) return NO;
-
     NSError *err = nil;
     id<MTLLibrary> lib = [_device newLibraryWithFile:path error:&err];
     if (!lib) {
@@ -188,10 +297,6 @@ typedef struct __attribute__((aligned(16))) {
     desc.vertexFunction   = vfn;
     desc.fragmentFunction = ffn;
     desc.colorAttachments[0].pixelFormat                 = MTLPixelFormatBGRA8Unorm;
-    // Premultiplied alpha so when we set the MTKView's clearColor to
-    // (0,0,0,0) and have semi-transparent fragment outputs (Fresnel
-    // edge blending), they composite correctly over the backdrop
-    // BEHIND the MTKView (which shows through where alpha is 0).
     desc.colorAttachments[0].blendingEnabled             = YES;
     desc.colorAttachments[0].rgbBlendOperation           = MTLBlendOperationAdd;
     desc.colorAttachments[0].alphaBlendOperation         = MTLBlendOperationAdd;
@@ -202,44 +307,62 @@ typedef struct __attribute__((aligned(16))) {
 
     _pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&err];
     if (!_pipeline) {
-        NSLog(@"[LockForge] Failed to create Metal pipeline state: %@", err);
+        NSLog(@"[LockForge] Pipeline state failed: %@", err);
         return NO;
     }
 
-    _commandQueue = [_device newCommandQueue];
-    _uniformsBuffer = [_device newBufferWithLength:sizeof(LFLGMetalUniforms)
+    _commandQueue   = [_device newCommandQueue];
+    _uniformsBuffer = [_device newBufferWithLength:sizeof(LFGlassShaderUniforms)
                                             options:MTLResourceStorageModeShared];
-    _textureLoader = [[MTKTextureLoader alloc] initWithDevice:_device];
+    _zeroCopy       = [[LFLGZeroCopyBridge alloc] initWithDevice:_device];
+
+    // Pre-build the Gaussian blur (sigma later, per layoutSubviews).
+    // .regular preset uses backgroundTextureBlurRadius = 0.3, scaled by
+    // contentsScale at use site -> very small sigma but nonzero, which
+    // softens the prism dispersion artefacts visibly.
+    _blur = [[MPSImageGaussianBlur alloc] initWithDevice:_device sigma:1.0f];
+    _blur.edgeMode = MPSImageEdgeModeClamp;
     return YES;
 }
 
 - (void)buildSubviews {
-    _backdrop = [[LFLGBackdropView alloc] init];
-    [self addSubview:_backdrop];
+    _backdropView = [[LFLGBackdropView alloc] init];
+    [self addSubview:_backdropView];
 
     _mtkView = [[MTKView alloc] initWithFrame:CGRectZero device:_device];
-    _mtkView.delegate                  = self;
-    _mtkView.userInteractionEnabled    = NO;
-    _mtkView.framebufferOnly           = YES;
-    _mtkView.opaque                    = NO;
-    _mtkView.layer.opaque              = NO;
-    _mtkView.backgroundColor           = [UIColor clearColor];
-    _mtkView.colorPixelFormat          = MTLPixelFormatBGRA8Unorm;
-    _mtkView.clearColor                = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
-    _mtkView.preferredFramesPerSecond  = 30;     // gentle on the A9
-    _mtkView.enableSetNeedsDisplay     = NO;
-    _mtkView.paused                    = NO;
+    _mtkView.delegate                 = self;
+    _mtkView.userInteractionEnabled   = NO;
+    _mtkView.framebufferOnly          = YES;
+    _mtkView.opaque                   = NO;
+    _mtkView.layer.opaque             = NO;
+    _mtkView.backgroundColor          = [UIColor clearColor];
+    _mtkView.colorPixelFormat         = MTLPixelFormatBGRA8Unorm;
+    _mtkView.clearColor               = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    _mtkView.preferredFramesPerSecond = 30;       // gentle on iPhone 6s A9
+    _mtkView.enableSetNeedsDisplay    = NO;
+    _mtkView.paused                   = NO;
     [self addSubview:_mtkView];
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    _backdrop.frame = self.bounds;
-    _mtkView.frame  = self.bounds;
+    _backdropView.frame = self.bounds;
+    _mtkView.frame      = self.bounds;
     [self updateUniformsCPUSide];
+
+    // Resize the zero-copy texture to match the current bounds. We
+    // capture at HALF resolution (matches LiquidGlassKit's default
+    // backgroundTextureScaleCoefficient * contentsScale layout) and
+    // let the fragment shader sample it bilinearly -- gives a 4x
+    // upload-bandwidth savings, invisible after the dispersion
+    // offsets and gaussian blur.
+    CGFloat scale = ([UIScreen mainScreen].scale) * 0.5;
+    int w = (int)(self.bounds.size.width  * scale);
+    int h = (int)(self.bounds.size.height * scale);
+    if (w > 4 && h > 4) [_zeroCopy setupBufferWidth:w height:h];
 }
 
-#pragma mark - Setters (forward changes into uniforms)
+#pragma mark - Setters
 
 - (void)setIntensity:(NSInteger)v {
     _intensity = MAX(0, MIN(3, v));
@@ -254,126 +377,91 @@ typedef struct __attribute__((aligned(16))) {
 
 - (void)setGlassCornerRadius:(CGFloat)r {
     _glassCornerRadius = MAX(0, r);
-    [self setNeedsLayout];
     [self updateUniformsCPUSide];
 }
 
 - (void)setShimmerOffset:(CGPoint)offset {
     _shimmerOffset = offset;
-    // Translate the whole MTKView a few points based on tilt so the
-    // glass appears to drift relative to the wallpaper underneath --
-    // this matches the cheap parallax LiquidGlassKit's reference UI
-    // does in its sample widgets and is what reads as "glass that
-    // moves with the device" from across the room.
-    CGFloat dx = MAX(-1, MIN(1, offset.x)) * 3.0;
-    CGFloat dy = MAX(-1, MIN(1, offset.y)) * 1.5;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    _mtkView.transform = CGAffineTransformMakeTranslation(dx, dy);
-    [CATransaction commit];
+    [self updateUniformsCPUSide];
 }
 
 #pragma mark - Uniforms
 
-- (void)applyIntensityIntoUniforms:(LFLGMetalUniforms *)u {
-    // Map 0..3 to perceptual presets matching what the legacy
-    // UIVisualEffectView path used to feel like at each level. The
-    // major dial is materialTint.a (how opaque the glass is) and
-    // fresnelIntensity (how bright the rim glows).
-    float ttintA = 0.05f, fInt = 0.4f;
-    switch (_intensity) {
-        case 1: ttintA = 0.04f; fInt = 0.30f; break;
-        case 2: ttintA = 0.10f; fInt = 0.55f; break;
-        case 3:
-        default:ttintA = 0.16f; fInt = 0.85f; break;
-    }
-    CGFloat r = 1.0, g = 1.0, b = 1.0, a = 1.0;
-    [_tintColor getRed:&r green:&g blue:&b alpha:&a];
-    u->materialTint = (simd_float4){ (float)r, (float)g, (float)b, ttintA };
-
-    u->glassThickness        = 14.0f;
-    u->refractiveIndex       = 1.50f;
-    u->dispersionStrength    = 7.0f;
-    u->fresnelDistanceRange  = 60.0f;
-    u->fresnelIntensity      = fInt;
-    u->fresnelEdgeSharpness  = -0.15f;
-}
-
 - (void)updateUniformsCPUSide {
     if (!_uniformsBuffer) return;
 
+    LFGlassShaderUniforms u;
+    memset(&u, 0, sizeof(u));
+    lf_fillRegularPreset(&u);
+
     CGFloat scale = self.window.screen.scale ?: [UIScreen mainScreen].scale;
-    LFLGMetalUniforms *u = (LFLGMetalUniforms *)_uniformsBuffer.contents;
-    u->resolution    = (simd_float2){ (float)(self.bounds.size.width * scale),
-                                      (float)(self.bounds.size.height * scale) };
-    u->contentsScale = (float)scale;
-    u->cornerRadius  = (float)_glassCornerRadius;
-    // Single rectangle covering the whole view in points, upper-left
-    // origin (the shader expects points; it scales to pixels itself).
-    u->rectangle     = (simd_float4){ 0.0f, 0.0f,
-                                      (float)self.bounds.size.width,
-                                      (float)self.bounds.size.height };
-    [self applyIntensityIntoUniforms:u];
+    u.resolution    = simd_make_float2((float)(self.bounds.size.width  * scale),
+                                       (float)(self.bounds.size.height * scale));
+    u.contentsScale = (float)scale;
+    u.cornerRadius  = (float)_glassCornerRadius;
+
+    // Single rectangle covering the whole MTKView bounds in points.
+    u.rectangleCount = 1;
+    u.rectangles[0]  = simd_make_float4(0.0f, 0.0f,
+                                        (float)self.bounds.size.width,
+                                        (float)self.bounds.size.height);
+
+    // touchPoint -- in LiquidGlassKit's demo widgets this is where the
+    // user is touching the glass; we feed gyro-tilt instead so the
+    // glare/Fresnel terms drift with device tilt. Same shader path.
+    u.touchPoint = simd_make_float2(
+        (float)(self.bounds.size.width  * 0.5 + _shimmerOffset.x * 12.0),
+        (float)(self.bounds.size.height * 0.5 + _shimmerOffset.y * 8.0));
+
+    // Map intensity -> materialTint. The .regular preset has tintColor
+    // pre-baked but we override here so the user-visible Glass strength
+    // slider/segment still does something. Higher intensity = darker
+    // tint with more weight, which the shader mixes into the refracted
+    // backdrop and the Fresnel rim.
+    CGFloat r = 1, g = 1, b = 1, a = 1;
+    [_tintColor getRed:&r green:&g blue:&b alpha:&a];
+    float tintWeight = 0.0f;
+    switch (_intensity) {
+        case 1: tintWeight = 0.25f; u.fresnelIntensity = 0.30f; break;
+        case 2: tintWeight = 0.50f; u.fresnelIntensity = 0.55f; break;
+        case 3:
+        default:tintWeight = 0.80f; u.fresnelIntensity = 0.85f; break;
+    }
+    u.materialTint = simd_make_float4((float)r, (float)g, (float)b, tintWeight);
+
+    memcpy(_uniformsBuffer.contents, &u, sizeof(u));
 }
 
-#pragma mark - Backdrop -> MTLTexture capture
+#pragma mark - Capture
 
-// Render the BackdropView (which has a CABackdropLayer attached so
-// it has the wallpaper composited into its presentation cache) into
-// a CGImage, then upload to a Metal texture via MTKTextureLoader.
-//
-// We sample at half resolution -- the shader's blur/refraction reads
-// 3x4 surrounding pixels per output, so the loss in detail is invisible
-// after the dispersion offsets are applied, and the texture upload
-// time drops by 4x. On iPhone 6s this is the difference between 18 fps
-// and 30 fps.
+// Drop the LiquidGlassKit captureBackdrop() path almost verbatim:
+// drawHierarchy of the backdrop view into a CGContext owned by the
+// zero-copy bridge. drawHierarchy includes hardware-composited layers
+// (the wallpaper) which renderInContext: doesn't see.
 - (id<MTLTexture>)captureBackdropTexture {
     if (!self.window) return nil;
+    if (self.bounds.size.width < 4 || self.bounds.size.height < 4) return nil;
 
-    CGSize sourceSize = self.bounds.size;
-    if (sourceSize.width < 4 || sourceSize.height < 4) return nil;
+    CGFloat scale = ([UIScreen mainScreen].scale) * 0.5;
+    LFLGBackdropView *bd = _backdropView;
+    return [_zeroCopy renderActions:^(CGContextRef ctx) {
+        CGContextScaleCTM(ctx, scale, scale);
+        UIGraphicsPushContext(ctx);
+        [bd drawViewHierarchyInRect:bd.bounds afterScreenUpdates:NO];
+        UIGraphicsPopContext();
+    }];
+}
 
-    CGFloat capScale = ([UIScreen mainScreen].scale) * 0.5;     // half-res
-    CGSize  capSize  = CGSizeMake(sourceSize.width  * capScale,
-                                  sourceSize.height * capScale);
-
-    UIGraphicsBeginImageContextWithOptions(sourceSize, NO, capScale);
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) {
-        UIGraphicsEndImageContext();
-        return nil;
-    }
-
-    // Translate so we render the part of the parent window that's
-    // BEHIND our backdrop view -- because the parent view tree owns
-    // the wallpaper composite, and we need its rect-under-us.
-    CGPoint originInWindow = [self convertPoint:CGPointZero toView:self.window];
-    CGContextTranslateCTM(ctx, -originInWindow.x, -originInWindow.y);
-
-    // drawViewHierarchy:afterScreenUpdates:NO captures the cached
-    // composited state of the window, including hardware-backed
-    // wallpaper layers. afterScreenUpdates:NO is critical -- YES
-    // would force a synchronous re-layout of every view in the
-    // window, which deadlocks during cover-sheet animation passes.
-    [self.window drawViewHierarchyInRect:self.window.bounds afterScreenUpdates:NO];
-
-    UIImage *snap = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    if (!snap || !snap.CGImage) return nil;
-
-    NSDictionary *opts = @{
-        MTKTextureLoaderOptionTextureUsage:        @(MTLTextureUsageShaderRead),
-        MTKTextureLoaderOptionTextureStorageMode:  @(MTLStorageModeShared),
-        MTKTextureLoaderOptionSRGB:                @(NO),
-    };
-    NSError *err = nil;
-    id<MTLTexture> tex = [_textureLoader newTextureWithCGImage:snap.CGImage
-                                                       options:opts
-                                                         error:&err];
-    if (!tex) {
-        NSLog(@"[LockForge] Backdrop texture upload failed: %@", err);
-    }
-    return tex;
+- (void)blurInPlace:(id<MTLTexture> _Nonnull __strong *)tex {
+    if (!*tex || !_blur) return;
+    id<MTLCommandBuffer> cmd = [_commandQueue commandBuffer];
+    if (!cmd) return;
+    // Sigma is a function of contentsScale and the .regular preset's
+    // backgroundTextureBlurRadius (0.3). On 6s with @2x scale that's
+    // sigma = 0.6 -- subtle softening of the dispersion fringes.
+    [_blur encodeToCommandBuffer:cmd inPlaceTexture:tex fallbackCopyAllocator:nil];
+    [cmd commit];
+    [cmd waitUntilCompleted];
 }
 
 #pragma mark - MTKViewDelegate
@@ -383,20 +471,17 @@ typedef struct __attribute__((aligned(16))) {
 }
 
 - (void)drawInMTKView:(MTKView *)view {
-    if (_intensity == 0) return;       // Solid mode -- view hidden anyway
+    if (_intensity == 0) return;
 
-    // Capture every other frame; reuse the previous texture in
-    // between to keep fragment-shader frame rate at 30 Hz on the A9.
-    _frameCounter++;
-    if ((_frameCounter % 2) == 0 || !_backgroundTexture) {
-        id<MTLTexture> fresh = [self captureBackdropTexture];
-        if (fresh) _backgroundTexture = fresh;
+    id<MTLTexture> bg = [self captureBackdropTexture];
+    if (bg) {
+        [self blurInPlace:&bg];
+        _backgroundTexture = bg;
     }
     if (!_backgroundTexture) return;
 
     MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
     if (!rpd) return;
-
     id<MTLCommandBuffer> cmd = [_commandQueue commandBuffer];
     if (!cmd) return;
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rpd];
@@ -407,7 +492,6 @@ typedef struct __attribute__((aligned(16))) {
             vertexStart:0
             vertexCount:4];
     [enc endEncoding];
-
     id<CAMetalDrawable> drawable = view.currentDrawable;
     if (drawable) [cmd presentDrawable:drawable];
     [cmd commit];

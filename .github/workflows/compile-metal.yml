@@ -1,8 +1,8 @@
 # Compile LockForge Metal shaders on a macOS runner and commit the
 # resulting .metallib back into the repo. Triggered automatically on
-# any push that touches lockforge/LiquidGlass.metal so the developer
-# never has to install the metal toolchain locally (it only ships
-# inside Xcode on macOS).
+# any push that touches the upstream-vendored LiquidGlassKit Metal
+# sources so the developer never has to install the metal toolchain
+# locally (it only ships inside Xcode on macOS).
 #
 # The committed artifact lives under
 #   lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
@@ -11,11 +11,17 @@
 #   /var/jb/Library/LockForge/LiquidGlassShaders.metallib  (rootless)
 # at runtime.
 #
+# We compile the TWO original LiquidGlassKit metal files together
+# (LiquidGlassVertex.metal + LiquidGlassFragment.metal) -- they're
+# byte-identical copies of upstream and contain `vertex fullscreenQuad`
+# and `fragment liquidGlassEffect` respectively, which the host
+# Obj-C code looks up by name.
+#
 # Why a workflow vs. a hand-checked binary in git: nobody wants to
-# round-trip a .metal change through "open Xcode on Mac, run xcrun,
-# git add the binary". This way the developer pushes a .metal source
-# change, GitHub spins up a free macOS runner (~30s for a single
-# shader), and the .metallib lands in main automatically.
+# round-trip a metal change through "open Xcode on Mac, run xcrun,
+# git add the binary". This way developer pushes a .metal change,
+# GitHub spins up a free macOS runner (~30s for two shaders), and the
+# .metallib lands in main automatically.
 
 name: Compile Metal Shaders
 
@@ -23,7 +29,8 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'lockforge/LiquidGlass.metal'
+      - 'lockforge/LiquidGlassKit/LiquidGlassFragment.metal'
+      - 'lockforge/LiquidGlassKit/LiquidGlassVertex.metal'
       - '.github/workflows/compile-metal.yml'
   # Allow manual re-run from the Actions tab if a build was lost.
   workflow_dispatch:
@@ -53,7 +60,7 @@ jobs:
 
       - name: Show toolchain
         # Sanity check that the runner has the iOS Metal SDK installed.
-        # If Apple ever ships a runner image that drops it, we want a
+        # If Apple ever ships a runner image that drops it we want a
         # clear failure here rather than a confused "metal: command
         # not found" further down.
         run: |
@@ -61,27 +68,36 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-path
           xcrun --sdk iphoneos metal --version || true
 
-      - name: Compile shaders
-        # Two-stage: source -> .air (intermediate) -> .metallib (final).
-        # iOS-min-15.0 matches our Theos TARGET so the compiled
-        # shader bytecode is loadable on iPhone 6s (A9, Metal 1).
+      - name: Compile LiquidGlassKit shaders
+        # Compile both .metal sources to .air, then link into one
+        # metallib. iOS-min-15.0 matches our Theos TARGET so the
+        # bytecode is loadable on iPhone 6s (A9, Metal 1).
+        # -ffast-math is what Apple uses for SF/Liquid Glass shaders
+        # too; gives us the trig speedups inside the Snell refraction
+        # path.
         run: |
           set -euo pipefail
-          cd lockforge
+          cd lockforge/LiquidGlassKit
 
           xcrun -sdk iphoneos metal \
                 -mios-version-min=15.0 \
                 -ffast-math \
-                -c LiquidGlass.metal \
-                -o LiquidGlass.air
+                -c LiquidGlassVertex.metal \
+                -o LiquidGlassVertex.air
 
-          mkdir -p layout/Library/LockForge
+          xcrun -sdk iphoneos metal \
+                -mios-version-min=15.0 \
+                -ffast-math \
+                -c LiquidGlassFragment.metal \
+                -o LiquidGlassFragment.air
+
+          mkdir -p ../layout/Library/LockForge
           xcrun -sdk iphoneos metallib \
-                LiquidGlass.air \
-                -o layout/Library/LockForge/LiquidGlassShaders.metallib
+                LiquidGlassVertex.air LiquidGlassFragment.air \
+                -o ../layout/Library/LockForge/LiquidGlassShaders.metallib
 
-          rm -f LiquidGlass.air
-          ls -la layout/Library/LockForge/LiquidGlassShaders.metallib
+          rm -f LiquidGlassVertex.air LiquidGlassFragment.air
+          ls -la ../layout/Library/LockForge/LiquidGlassShaders.metallib
 
       - name: Commit and push if metallib changed
         # Skip the commit if running on a workflow_dispatch dry-run
@@ -97,8 +113,6 @@ jobs:
           fi
           git add lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
           git commit -m "ci: recompile LiquidGlassShaders.metallib for $(git rev-parse --short HEAD~)"
-          # We disable hooks because the runner image doesn't have
-          # them and the [skip ci] guard below prevents a recursion.
           git push origin HEAD:main
         env:
           GIT_COMMITTER_NAME: metal-ci

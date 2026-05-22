@@ -28,21 +28,24 @@ LockForge_FILES = \
     LFLockScreenSelector.m
 
 LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
-# CoreText is for CTFontManagerRegisterFontsForURL + variable-axis CTFont
-# creation. We register the bundled ADTNumeric.ttc (Apple's iOS 26
-# Adaptive-Time font collection, 13 numeric faces) into the SpringBoard
-# process at %ctor time, then LFClockOverlay creates per-frame CTFonts
-# with custom HGHT (height) axis values to match Apple's iOS 26
-# lock-screen-clock resize behaviour: digits grow taller without
-# changing width or stroke thickness.
+# CoreText: registers the bundled ADTNumeric.ttc (Apple's iOS 26 Adaptive-
+# Time font collection, 13 numeric faces) into SpringBoard at %ctor time
+# so LFClockOverlay can drive the HGHT axis for iOS 26-style clock resize.
 #
-# Metal + MetalKit drive the Liquid Glass shader pipeline in
-# LFLiquidGlassMetalView. The shader binary itself
+# Metal + MetalKit + MetalPerformanceShaders: drive the LiquidGlassKit
+# shader pipeline in LFLiquidGlassMetalView. The shader binary
 # (LiquidGlassShaders.metallib) is compiled by .github/workflows/
-# compile-metal.yml on a macOS runner whenever LiquidGlass.metal
-# changes -- it lives under layout/Library/LockForge/ and is bundled
-# into the .deb automatically by Theos.
-LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText Metal MetalKit
+# compile-metal.yml on a macOS runner from the byte-identical upstream
+# LiquidGlassKit/{LiquidGlassFragment,LiquidGlassVertex}.metal sources;
+# it lands in layout/Library/LockForge/ and Theos packages it into the
+# .deb. MetalPerformanceShaders ships MPSImageGaussianBlur which the
+# host code uses to soften the captured backdrop before refraction --
+# matches LiquidGlassKit's blurTexture() path.
+#
+# CoreVideo: CVPixelBuffer + CVMetalTextureCache for the zero-copy
+# CGContext<->MTLTexture bridge (mirrors LiquidGlassKit's ZeroCopyBridge).
+LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText \
+                       Metal MetalKit MetalPerformanceShaders CoreVideo
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
