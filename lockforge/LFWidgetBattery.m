@@ -141,11 +141,19 @@
         _titleLabel.text = charging ? @"CHARGING" : @"BATTERY";
     }
     _boltView.hidden = !charging;
-    if (charging && !_boltView.image && @available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
-            configurationWithPointSize:12 weight:UIImageSymbolWeightBold];
-        _boltView.image = [UIImage systemImageNamed:@"bolt.fill"
-                                  withConfiguration:cfg];
+    // @available(...) cannot be combined with other expressions through
+    // && in a regular if-condition -- the compiler refuses to treat it
+    // as guarding an availability check in that context. Split the
+    // version guard into its own if so the symbol-image API is properly
+    // gated for any pre-iOS-13 SDK usage that might happen to compile
+    // this file.
+    if (charging && !_boltView.image) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+                configurationWithPointSize:12 weight:UIImageSymbolWeightBold];
+            _boltView.image = [UIImage systemImageNamed:@"bolt.fill"
+                                      withConfiguration:cfg];
+        }
     }
 }
 
