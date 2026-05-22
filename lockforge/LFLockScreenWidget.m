@@ -8,6 +8,12 @@
     LFWidgetKind   _kind;
     LFWidgetFamily _family;
     NSDictionary  *_config;
+
+    // Held weak so the subclass owns the actual subview tree; we
+    // just keep pointers so layoutSubviews can keep the corner
+    // radius and rim in sync with the live bounds.
+    __weak UIVisualEffectView *_glassBackdrop;
+    __weak UIView             *_glassRim;
 }
 @end
 
@@ -43,24 +49,72 @@
 }
 
 // ---------------------------------------------------------------------------
-// Glass backdrop -- INTENTIONAL NO-OP since iOS 26 lock screen widgets
-// no longer have an opaque per-tile chip behind their content. The
-// edit-mode "selection rectangle" lives on the TRAY itself (matching
-// the chrome around clock and date), not on individual widgets. Each
-// widget renders directly on the wallpaper.
+// Glass backdrop.
 //
-// Subclasses still call -installGlassBackdrop in their constructors so
-// the signature stays valid and existing widget code compiles unchanged.
-// We return a tiny invisible UIVisualEffectView so the call site can
-// keep its return-value type if it ever chooses to use it; the view
-// has no effect (clear background) and adds nothing visible.
+// Earlier iteration removed this entirely on the user's request so widgets
+// would render straight on the wallpaper with no per-tile chip. That
+// made widgets with strong visual content (Battery / Steps / Weather --
+// rings, icons, etc) look great, but text-only widgets (Calendar /
+// Reminders / WorldClock and Music's labels) became unreadable on busy
+// wallpapers -- the user's words: "некоторые виджеты как надо а
+// некоторые полное говно". The fix is consistency: every widget gets
+// the SAME subtle translucent chip Apple actually uses on iOS 26 lock-
+// screen widgets, properly rounded so it never looks like a grey
+// rectangle.
+//
+// Each widget gets:
+//   * a UIVisualEffectView with SystemUltraThinMaterialDark (very
+//     light blur, just enough darken-and-blur to make text legible
+//     on bright wallpapers without overpowering the photo);
+//   * cornerRadius matched to family -- circular: h/2 = perfect
+//     circle on 76x76, rectangular: 22pt = Apple's iOS 16/26 widget
+//     tile radius, inline: h/2 = pill;
+//   * a 0.5pt hairline rim inside the blur's contentView at white
+//     alpha 0.18 -- same trick Apple uses to outline glass tiles
+//     against busy wallpapers without darkening their interior;
+//   * frame/cornerRadius re-synced in -layoutSubviews so circular
+//     widgets keep a true circle even when the tray's integer-
+//     rounded layout pass settles them at slightly different
+//     dimensions.
 // ---------------------------------------------------------------------------
 - (UIVisualEffectView *)installGlassBackdrop {
-    UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:nil];
-    bg.frame              = CGRectZero;
-    bg.hidden             = YES;
-    bg.userInteractionEnabled = NO;
+    UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
+    UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:eff];
+    bg.frame              = self.bounds;
+    bg.autoresizingMask   = UIViewAutoresizingFlexibleWidth |
+                            UIViewAutoresizingFlexibleHeight;
+    bg.layer.masksToBounds = YES;
+    bg.layer.cornerRadius  = [self lf_cornerRadiusForFamily:_family bounds:self.bounds];
+    [self insertSubview:bg atIndex:0];
+    _glassBackdrop = bg;
+
+    UIView *rim                  = [[UIView alloc] initWithFrame:bg.contentView.bounds];
+    rim.autoresizingMask         = UIViewAutoresizingFlexibleWidth |
+                                   UIViewAutoresizingFlexibleHeight;
+    rim.userInteractionEnabled   = NO;
+    rim.layer.borderWidth        = 0.5;
+    rim.layer.borderColor        = [[UIColor colorWithWhite:1.0 alpha:0.18] CGColor];
+    rim.layer.cornerRadius       = bg.layer.cornerRadius;
+    [bg.contentView addSubview:rim];
+    _glassRim = rim;
     return bg;
+}
+
+- (CGFloat)lf_cornerRadiusForFamily:(LFWidgetFamily)family bounds:(CGRect)b {
+    switch (family) {
+        case LFWidgetFamilyCircular:    return MIN(b.size.width, b.size.height) / 2.0;
+        case LFWidgetFamilyRectangular: return 22.0;
+        case LFWidgetFamilyInline:      return b.size.height / 2.0;
+    }
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (_glassBackdrop) {
+        CGFloat r = [self lf_cornerRadiusForFamily:_family bounds:self.bounds];
+        _glassBackdrop.layer.cornerRadius = r;
+        _glassRim.layer.cornerRadius      = r;
+    }
 }
 
 + (UIFont *)systemFontOfSize:(CGFloat)size weight:(UIFontWeight)w {

@@ -13,7 +13,7 @@ static const NSInteger kLFTagTrailingEmptySlot = 0xEEFA;
 // widgets in editing mode (big circular plus + "Add Widgets" label).
 static const NSInteger kLFTagEmptyStateContainer = 0xEEFB;
 
-@interface LFLockScreenWidgetTray () <LFLockScreenWidgetSlotDelegate> {
+@interface LFLockScreenWidgetTray () <LFLockScreenWidgetSlotDelegate, UIGestureRecognizerDelegate> {
     NSMutableArray<LFLockScreenWidgetSlot *> *_slots;
     UIPanGestureRecognizer *_dragPan;
 
@@ -58,7 +58,52 @@ static const NSInteger kLFTagEmptyStateContainer = 0xEEFB;
     _dragPan.maximumNumberOfTouches = 1;
     [self addGestureRecognizer:_dragPan];
 
+    // Tap anywhere on the tray opens the picker -- once the tray
+    // already has at least one widget, iOS 26 doesn't show a
+    // dedicated trailing "+" tile, the entire tray itself becomes
+    // the tap target. The recognizer's gestureRecognizerShouldBegin:
+    // delegate filters out taps that land INSIDE a filled slot
+    // (because those want to be claimed by the slot's minus button)
+    // and only fires for the empty-area-around-widgets case.
+    UITapGestureRecognizer *trayTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onTrayTap:)];
+    trayTap.delegate = self;
+    [self addGestureRecognizer:trayTap];
+
     return self;
+}
+
+#pragma mark - UIGestureRecognizerDelegate
+
+// The tray-level tap recognizer only fires if the touch landed in
+// the "empty space" of the tray -- i.e. NOT inside any filled slot's
+// frame, NOT on the minus button, NOT on the empty-state container
+// (which has its OWN tap recognizer). Without this filter the tray-
+// tap would fight the minus button and the empty-state tap.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+       shouldReceiveTouch:(UITouch *)touch {
+    if (!_isEditing) return NO;
+    if (![g isKindOfClass:[UITapGestureRecognizer class]]) return YES;
+    UIView *hit = touch.view;
+    while (hit && hit != self) {
+        // Touch landed inside a slot OR the trailing empty-state
+        // container -- those views have their own tap handlers,
+        // don't double-trigger.
+        if ([hit isKindOfClass:[LFLockScreenWidgetSlot class]]) return NO;
+        if (hit.tag == kLFTagEmptyStateContainer)               return NO;
+        hit = hit.superview;
+    }
+    return YES;
+}
+
+- (void)onTrayTap:(UITapGestureRecognizer *)tap {
+    if (!_isEditing) return;
+    if (self.usedUnits >= kLFTrayMaxUnits) {
+        // Tray is full -- nothing useful for this tap to do; ignore
+        // rather than open a picker that would just reject the add.
+        return;
+    }
+    [self.delegate trayDidRequestPicker:self family:LFWidgetFamilyCircular];
 }
 
 #pragma mark - Capacity bookkeeping
@@ -159,16 +204,6 @@ static NSInteger lf_unitsForFamily(LFWidgetFamily f) {
         if (w > 0) w += kLFTrayGap;
         w += sz.width;
     }
-    // Reserve space for ONE empty trailing slot ONLY when the tray
-    // already has at least one widget -- the "tray is fully empty"
-    // case is rendered as a single big "Add Widgets" panel that spans
-    // the full chrome width and isn't represented in this measurement.
-    if (_slots.count > 0 && self.usedUnits < kLFTrayMaxUnits) {
-        CGSize empty = [LFLockScreenWidget naturalSizeForFamily:LFWidgetFamilyCircular];
-        if (h < empty.height) h = empty.height;
-        if (w > 0) w += kLFTrayGap;
-        w += empty.width;
-    }
     if (h < 76) h = 76;
     // Always report at least 1pt of width so the tray's superview
     // doesn't auto-hide an empty editing tray (the empty-state panel
@@ -227,28 +262,13 @@ static NSInteger lf_unitsForFamily(LFWidgetFamily f) {
         x += sz.width + kLFTrayGap;
     }
 
-    // 4) Trailing-empty plus-slot. Only visible in edit mode AND when
-    //    the tray already has at least one widget AND there's room
-    //    for one more. The fully-empty case is handled by step (2).
-    if (self.isEditing && _slots.count > 0 && self.usedUnits < kLFTrayMaxUnits) {
-        LFLockScreenWidgetSlot *trailing =
-            (LFLockScreenWidgetSlot *)[self viewWithTag:kLFTagTrailingEmptySlot];
-        if (!trailing) {
-            trailing = [[LFLockScreenWidgetSlot alloc] initWithFamily:LFWidgetFamilyCircular];
-            trailing.tag       = kLFTagTrailingEmptySlot;
-            trailing.delegate  = self;
-            trailing.isEditing = YES;
-            [self addSubview:trailing];
-        }
-        trailing.hidden = NO;
-        trailing.isEditing = YES;
-        CGSize sz = [LFLockScreenWidget naturalSizeForFamily:LFWidgetFamilyCircular];
-        trailing.frame = CGRectMake(x, y + (natural.height - sz.height) / 2.0,
-                                     sz.width, sz.height);
-    } else {
-        UIView *trailing = [self viewWithTag:kLFTagTrailingEmptySlot];
-        trailing.hidden  = YES;
-    }
+    // 4) NO trailing-empty plus slot -- once the tray has at least
+    //    one widget, iOS 26 doesn't show a per-cell "add another"
+    //    affordance. The user taps anywhere in the tray's empty
+    //    chrome area and onTrayTap: opens the picker (handled at
+    //    the recognizer level above).
+    UIView *trailing = [self viewWithTag:kLFTagTrailingEmptySlot];
+    trailing.hidden  = YES;
 }
 
 // Big "Add Widgets" empty-state, rendered when the tray has no widgets.
