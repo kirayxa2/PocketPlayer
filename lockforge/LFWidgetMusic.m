@@ -107,11 +107,16 @@
     _artView.hidden = !hasArt;
     _placeholder.hidden = hasArt;
 
-    if (!hasArt && @available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
-            configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
-        _placeholder.image = [UIImage systemImageNamed:@"music.note"
-                                     withConfiguration:cfg];
+    // @available cannot be combined with other expressions through &&
+    // in a regular if -- clang refuses to treat that form as a guard
+    // for symbol-API calls. Split into nested ifs so the API is gated.
+    if (!hasArt) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+                configurationWithPointSize:18 weight:UIImageSymbolWeightSemibold];
+            _placeholder.image = [UIImage systemImageNamed:@"music.note"
+                                         withConfiguration:cfg];
+        }
     }
 
     if (_titleLabel) {

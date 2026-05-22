@@ -49,12 +49,23 @@ static EKEventStore *lf_inlineStore(void) {
     [super layoutSubviews];
     CGRect b = self.bounds;
     NSString *symbol = [[self class] sfSymbolForKind:self.kind];
-    if (symbol.length && @available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
-            configurationWithPointSize:12 weight:UIImageSymbolWeightSemibold];
-        if (!_iconView.image) {
-            _iconView.image = [UIImage systemImageNamed:symbol withConfiguration:cfg];
+    // @available cannot be combined with another expression through
+    // && inside a regular if condition -- clang refuses to treat that
+    // form as gating the SF Symbol API below. Nest the version guard
+    // inside the symbol-presence check instead.
+    BOOL haveSymbol = NO;
+    if (symbol.length) {
+        if (@available(iOS 13.0, *)) {
+            haveSymbol = YES;
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+                configurationWithPointSize:12 weight:UIImageSymbolWeightSemibold];
+            if (!_iconView.image) {
+                _iconView.image = [UIImage systemImageNamed:symbol withConfiguration:cfg];
+            }
         }
+    }
+    if (haveSymbol) {
+        _iconView.hidden = NO;
         _iconView.frame = CGRectMake(0, (b.size.height - 14) / 2.0, 14, 14);
         _label.frame    = CGRectMake(18, 0, b.size.width - 18, b.size.height);
         _label.textAlignment = NSTextAlignmentLeft;
