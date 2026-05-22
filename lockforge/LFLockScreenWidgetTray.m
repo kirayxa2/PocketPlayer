@@ -21,7 +21,14 @@ static const NSInteger kLFTagEmptyStateContainer = 0xEEFB;
     // selection rectangle drawn around the clock and date pill in
     // edit mode. Driven by .selectionWidth + intrinsic height.
     UIView *_chromeBorder;
+
+    // Drag state for live-follow tray drag (iOS 26 lets the user
+    // drag the whole tray vertically; we move the frame in real-
+    // time so the tray "sticks to the finger" rather than jumping
+    // discretely between two snap points on release).
+    CGFloat _dragStartFrameY;
 }
+@property (nonatomic, assign, readwrite) BOOL isUserDragging;
 @end
 
 @implementation LFLockScreenWidgetTray
@@ -345,6 +352,15 @@ static NSInteger lf_unitsForFamily(LFWidgetFamily f) {
     [self setNeedsLayout];
 }
 
+- (void)setBottomPanelOpen:(BOOL)open {
+    _bottomPanelOpen = open;
+    for (LFLockScreenWidgetSlot *s in _slots) s.bottomPanelOpen = open;
+    UIView *trailing = [self viewWithTag:kLFTagTrailingEmptySlot];
+    if ([trailing isKindOfClass:[LFLockScreenWidgetSlot class]]) {
+        ((LFLockScreenWidgetSlot *)trailing).bottomPanelOpen = open;
+    }
+}
+
 - (void)setSelectionWidth:(CGFloat)w {
     if (fabs(_selectionWidth - w) < 0.5) return;
     _selectionWidth = w;
@@ -365,14 +381,59 @@ static NSInteger lf_unitsForFamily(LFWidgetFamily f) {
 
 #pragma mark - Drag-to-bottom
 
+// iOS 26 lock-screen widget area drag is LIVE: the tray's frame
+// follows the finger 1:1 while the gesture is in flight, and
+// snaps to the nearest valid Y position when the finger lifts.
+// Earlier rev only signalled translation to the delegate without
+// moving the tray, so the tray "perescakivalo" (snapped abruptly)
+// at the end -- the user reported that. Now we move the frame in
+// real time, set isUserDragging=YES so the clock overlay knows
+// not to fight us in -repositionWidgetTray, and the delegate fires
+// only on Ended so the editor can do the snap decision once with
+// the FINAL accumulated translation.
 - (void)onDragPan:(UIPanGestureRecognizer *)pan {
     if (!_isEditing) return;
+
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        _dragStartFrameY = self.frame.origin.y;
+        self.isUserDragging = YES;
+    }
+
     CGPoint t = [pan translationInView:self.superview];
-    [self.delegate tray:self didDragWithTranslationY:t.y
-                  ended:(pan.state == UIGestureRecognizerStateEnded ||
-                         pan.state == UIGestureRecognizerStateCancelled ||
-                         pan.state == UIGestureRecognizerStateFailed)];
-    if (pan.state == UIGestureRecognizerStateEnded) {
+
+    if (pan.state == UIGestureRecognizerStateChanged ||
+        pan.state == UIGestureRecognizerStateBegan) {
+        // Live follow: tray.frame.origin.y = startY + translation.y,
+        // clamped within sensible parent bounds so we don't drag the
+        // tray off-screen or over the status bar. The editor's snap
+        // logic later picks one of two known positions; in between,
+        // the user gets a smooth visual.
+        UIView *parent = self.superview;
+        CGFloat parentH = parent ? parent.bounds.size.height
+                                  : [UIScreen mainScreen].bounds.size.height;
+        UIEdgeInsets safe = parent ? parent.safeAreaInsets
+                                    : UIEdgeInsetsZero;
+        CGFloat minY = safe.top + 80.0;     // never overlap status bar
+        CGFloat maxY = parentH - safe.bottom - 60.0
+                       - self.bounds.size.height;
+        if (maxY < minY) maxY = minY;
+        CGFloat newY = MAX(minY, MIN(maxY, _dragStartFrameY + t.y));
+        CGRect f = self.frame;
+        f.origin.y = newY;
+        // Disable Core Animation implicit animations during the
+        // drag so each frame update is rendered as-is (no 0.25s
+        // tween that lags behind the finger).
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        self.frame = f;
+        [CATransaction commit];
+    }
+
+    if (pan.state == UIGestureRecognizerStateEnded ||
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+        self.isUserDragging = NO;
+        [self.delegate tray:self didDragWithTranslationY:t.y ended:YES];
         [pan setTranslation:CGPointZero inView:self.superview];
     }
 }

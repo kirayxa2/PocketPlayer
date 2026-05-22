@@ -26,6 +26,14 @@ NS_ASSUME_NONNULL_BEGIN
 // Whether the surrounding tray is in edit mode (shows chrome).
 @property (nonatomic, assign) BOOL isEditing;
 
+// Whether the editor's bottom customize-panel is currently open.
+// In iOS 26 the per-tile minus button is REVEALED only while the
+// bottom-customize sheet is up -- when the sheet is dismissed, the
+// minus button hides so the user sees a clean edit-mode preview.
+// The tray propagates its own bottomPanelOpen flag down to each
+// slot so the visual state matches Apple.
+@property (nonatomic, assign) BOOL bottomPanelOpen;
+
 // The currently-installed widget, if any. Setting nil clears the
 // slot back to "empty + plus glyph".
 @property (nonatomic, strong, nullable) LFLockScreenWidget *widget;

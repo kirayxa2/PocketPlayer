@@ -52,6 +52,16 @@ NS_ASSUME_NONNULL_BEGIN
 // and pan/long-press drag is enabled. Set by the editor.
 @property (nonatomic, assign) BOOL isEditing;
 
+// Mirrors the editor's bottom customize-panel visibility state.
+// iOS 26 only reveals the per-tile minus button while that panel
+// is up -- the tray broadcasts the flag down to each slot.
+@property (nonatomic, assign) BOOL bottomPanelOpen;
+
+// True while the user's finger is dragging the tray vertically.
+// The clock overlay reads this in -repositionWidgetTray and skips
+// re-positioning so the drag isn't fought by the live layout pass.
+@property (nonatomic, assign, readonly) BOOL isUserDragging;
+
 // Width of the edit-mode selection-rectangle chrome. Editor sets this
 // to match the clock-box width so the three chrome rectangles (clock,
 // date pill, widget tray) align as a column. If 0 the chrome falls

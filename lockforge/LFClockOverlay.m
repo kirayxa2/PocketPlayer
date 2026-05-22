@@ -903,6 +903,16 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     if (!parent || !_widgetTray) return;
     LFLockScreenWidgetTray *tray = (LFLockScreenWidgetTray *)_widgetTray;
 
+    // While the user is actively dragging the tray with a finger,
+    // hand the frame off to the tray's own pan handler -- if we
+    // overwrite frame from here, the live drag would visibly fight
+    // the user's gesture (jitter to where we want it, snap back to
+    // where the finger is, etc).
+    if ([tray respondsToSelector:@selector(isUserDragging)] &&
+        tray.isUserDragging) {
+        return;
+    }
+
     // The selection-rect chrome around the tray has to match the
     // clock-box width exactly so the three rectangles (clock, date
     // pill, widget tray) line up as a column when editing.
@@ -1136,6 +1146,32 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
     BOOL changed = NO;
     if (fabs(newVStretch - [LFClockSettings shared].verticalStretch) > 0.001) {
         [LFClockSettings shared].verticalStretch = newVStretch;
+        changed = YES;
+    }
+
+    // iOS 26: as soon as the user starts growing the clock, the
+    // widget tray "переплывает" из положения под часами в нижнее
+    // (above the camera/flashlight strip), so the growing digits
+    // never collide with the tray. Threshold a little above 1.0 so
+    // tiny incidental drift doesn't kick the tray loose; once we
+    // commit the move, the tray stays at the bottom until the user
+    // explicitly drags it back up (handled in editor's
+    // -tray:didDragWithTranslationY:ended:).
+    if (newVStretch > 1.05 &&
+        [LFClockSettings shared].trayPosition == LFTrayPositionUnderClock) {
+        [LFClockSettings shared].trayPosition = LFTrayPositionAtBottom;
+        // Animate the tray's frame to its new home so the move
+        // reads as "tray flowing downward" rather than a teleport.
+        [UIView animateWithDuration:0.32
+                              delay:0
+             usingSpringWithDamping:0.9
+              initialSpringVelocity:0.0
+                            options:UIViewAnimationOptionCurveEaseOut |
+                                    UIViewAnimationOptionAllowUserInteraction
+                         animations:^{
+            [self repositionWidgetTray];
+        }
+                         completion:nil];
         changed = YES;
     }
 

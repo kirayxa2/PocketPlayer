@@ -8,7 +8,8 @@
     UIImageView  *_plusGlyph;
 
     // Filled-state chrome: minus button anchored top-left, only
-    // visible in edit mode.
+    // visible in edit mode AND while the editor's bottom customize-
+    // panel is up (matches iOS 26 behaviour).
     UIButton     *_removeButton;
 }
 @end
@@ -75,6 +76,11 @@
     [self updateChrome];
 }
 
+- (void)setBottomPanelOpen:(BOOL)open {
+    _bottomPanelOpen = open;
+    [self updateChrome];
+}
+
 - (void)setWidget:(LFLockScreenWidget *)w {
     if (_widget == w) return;
     [_widget removeFromSuperview];
@@ -93,7 +99,15 @@
     BOOL empty = (_widget == nil);
     _dashLayer.hidden = !empty;
     _plusGlyph.hidden = !empty;
-    _removeButton.hidden = !(_isEditing && !empty);
+    // iOS 26: minus button is visible only when ALL of:
+    //   - the slot is occupied,
+    //   - the tray is in edit mode,
+    //   - AND the editor's bottom customize-panel is currently up.
+    // The third clause is what the user reported missing -- without
+    // it the minus button stayed permanently visible whenever the
+    // editor was open, which doesn't match Apple's behaviour.
+    _removeButton.hidden =
+        !(_isEditing && !empty && _bottomPanelOpen);
 }
 
 - (void)layoutSubviews {
@@ -106,8 +120,44 @@
     CGFloat g = 26;
     _plusGlyph.frame = CGRectMake((b.size.width - g) / 2.0,
                                   (b.size.height - g) / 2.0, g, g);
-    _removeButton.frame = CGRectMake(-10, -10, 28, 28);
+    // Minus button frame -- larger than the visible glyph so the
+    // fingertip target is forgiving. iOS 26 uses a 30pt visible glyph
+    // inside a ~44pt invisible touch target. The visible image-view
+    // alignment auto-centers the glyph inside the button frame.
+    _removeButton.frame = CGRectMake(-14, -14, 36, 36);
     if (_widget) _widget.frame = b;
+}
+
+// The minus button sits with its centre at slot's top-left corner
+// (frame origin -14,-14), so the OUTER half of the button hangs
+// outside self.bounds. UIKit hit-testing clips at bounds, which means
+// touches on that outer half were silently dropped -- which is what
+// the user reported as "сложно нажать на кнопку удаления". Override
+// hit-test so we route minus-button touches to it directly.
+//
+// Also expand the touch area further (well past the visible chrome)
+// so the user can tap "near" the button and still hit it.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (_isEditing && _bottomPanelOpen && !_removeButton.hidden) {
+        // Inflated touch area: 44pt diameter centred on the
+        // minus-button's centre, regardless of the visible 36pt
+        // chrome. Same trick Apple uses for small toolbar buttons.
+        CGPoint c = CGPointMake(CGRectGetMidX(_removeButton.frame),
+                                CGRectGetMidY(_removeButton.frame));
+        CGRect target = CGRectMake(c.x - 22, c.y - 22, 44, 44);
+        if (CGRectContainsPoint(target, point)) return _removeButton;
+    }
+    return [super hitTest:point withEvent:event];
+}
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (_isEditing && _bottomPanelOpen && !_removeButton.hidden) {
+        CGPoint c = CGPointMake(CGRectGetMidX(_removeButton.frame),
+                                CGRectGetMidY(_removeButton.frame));
+        CGRect target = CGRectMake(c.x - 22, c.y - 22, 44, 44);
+        if (CGRectContainsPoint(target, point)) return YES;
+    }
+    return [super pointInside:point withEvent:event];
 }
 
 - (void)onTap {

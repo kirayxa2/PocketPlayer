@@ -526,6 +526,16 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 - (void)setBottomPanelVisible:(BOOL)visible animated:(BOOL)animated {
     if (_bottomPanelVisible == visible) return;
     _bottomPanelVisible = visible;
+
+    // iOS 26: per-tile minus buttons are visible only while the
+    // bottom customize-panel is up. Push the flag down to the tray
+    // immediately (before the animation) so the appearance change
+    // animates in sync with the panel sliding up/down.
+    UIView *trayV = _clockOverlay.widgetTray;
+    if ([trayV respondsToSelector:@selector(setBottomPanelOpen:)]) {
+        ((LFLockScreenWidgetTray *)trayV).bottomPanelOpen = visible;
+    }
+
     [self.view setNeedsLayout];
     if (animated) {
         // Spring damping 0.9 / no initial velocity is the same curve
@@ -1010,23 +1020,79 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     [[LFClockSettings shared] save];
 }
 
-// User pan'd the tray vertically. iOS 26 lets the user drag the tray
-// from under-clock to bottom-of-screen and snap. We track translation
-// while the gesture is in flight (no-op visually -- the tray's frame
-// is not driven by the pan in this iteration), and on release we
-// snap to whichever edge the cumulative drag is closer to.
+// User pan'd the tray vertically. iOS 26 lets the user drag the
+// tray with the finger (live follow now -- the tray's own
+// onDragPan moves its frame in real time during the gesture). At
+// release we snap to the nearest of two valid positions:
+//
+//   * UnderClock -- right beneath the clock-overlay's frame.
+//                   ONLY available while the clock is at minimum
+//                   vStretch=1.0; if the user is currently in a
+//                   stretched-clock state and drops the tray
+//                   close to the clock, we ALSO shrink the clock
+//                   back to vStretch=1.0 so the tray + clock fit
+//                   together cleanly. This is the "widgets stick
+//                   to the clock and the clock politely shrinks
+//                   to its minimum to make room" behaviour.
+//
+//   * AtBottom   -- pinned above the camera/flashlight strip
+//                   (~110pt above safe-area bottom).
+//
+// We pick which one based on the tray's CURRENT frame.y after the
+// finger lifts -- whichever target Y is closer wins. The tray's
+// own onDragPan has already moved the frame to wherever the
+// finger ended; we just decide UnderClock vs AtBottom and
+// re-anchor via clockOverlay.refreshFromSettings.
 - (void)tray:(LFLockScreenWidgetTray *)tray
    didDragWithTranslationY:(CGFloat)dy
                      ended:(BOOL)ended {
     if (!ended) return;
-    LFTrayPosition cur  = [LFClockSettings shared].trayPosition;
-    LFTrayPosition want = cur;
-    if (cur == LFTrayPositionUnderClock && dy >  60.0) want = LFTrayPositionAtBottom;
-    if (cur == LFTrayPositionAtBottom   && dy < -60.0) want = LFTrayPositionUnderClock;
-    if (want == cur) return;
+
+    // Compute target Y for each candidate position so we can
+    // pick the closest one to where the finger actually let go.
+    UIView *parent = tray.superview;
+    if (!parent) return;
+
+    CGFloat parentH    = parent.bounds.size.height;
+    UIEdgeInsets safe  = parent.safeAreaInsets;
+    CGFloat trayH      = tray.bounds.size.height;
+    CGFloat finalY     = tray.frame.origin.y;
+
+    CGFloat targetUnder  = CGRectGetMaxY(_clockOverlay.frame) + 12.0;
+    CGFloat targetBottom = parentH - safe.bottom - 110.0 - trayH;
+
+    LFTrayPosition want = (fabs(finalY - targetUnder) <
+                           fabs(finalY - targetBottom))
+        ? LFTrayPositionUnderClock
+        : LFTrayPositionAtBottom;
+
+    // If the user wants UnderClock but the clock is currently
+    // stretched, shrink it back to minimum so the tray actually
+    // FITS under the (now shorter) clock. Animate the change so
+    // the clock visibly recoils up while the tray slides into
+    // its new home.
+    BOOL needShrink = (want == LFTrayPositionUnderClock &&
+                       [LFClockSettings shared].verticalStretch > 1.001);
+    if (needShrink) {
+        [LFClockSettings shared].verticalStretch = 1.0;
+    }
+
     [LFClockSettings shared].trayPosition = want;
     [[LFClockSettings shared] save];
-    [_clockOverlay refreshFromSettings];
+
+    // Animate the result so the tray's snap and (optional) clock
+    // shrink read as a coherent gesture rather than two independent
+    // teleports.
+    [UIView animateWithDuration:0.32
+                          delay:0
+         usingSpringWithDamping:0.9
+          initialSpringVelocity:0.0
+                        options:UIViewAnimationOptionCurveEaseOut |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        [_clockOverlay refreshFromSettings];
+    }
+                     completion:nil];
 }
 
 @end
