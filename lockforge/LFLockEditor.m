@@ -357,6 +357,11 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [tf resignFirstResponder];
     return YES;
 }
+
+// Refresh visual state of the Glass / Solid toggle so it matches the
+// current LFClockSettings.liquidGlassIntensity. Called from
+// onGlassMode / onSolidMode and during initial setup.
+- (void)refreshModeToggleSelection {
     BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
     UIColor *active   = [UIColor colorWithWhite:1.0 alpha:0.90];
     UIColor *inactive = [UIColor colorWithWhite:1.0 alpha:0.45];
