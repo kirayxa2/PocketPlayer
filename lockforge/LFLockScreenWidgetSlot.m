@@ -99,15 +99,16 @@
     BOOL empty = (_widget == nil);
     _dashLayer.hidden = !empty;
     _plusGlyph.hidden = !empty;
-    // iOS 26: minus button is visible only when ALL of:
-    //   - the slot is occupied,
-    //   - the tray is in edit mode,
-    //   - AND the editor's bottom customize-panel is currently up.
-    // The third clause is what the user reported missing -- without
-    // it the minus button stayed permanently visible whenever the
-    // editor was open, which doesn't match Apple's behaviour.
-    _removeButton.hidden =
-        !(_isEditing && !empty && _bottomPanelOpen);
+    // Minus button is visible whenever the slot is occupied AND
+    // the tray is in edit mode. We tried gating it on the editor's
+    // bottom-panel visibility (the iOS 26 customize-sheet pattern)
+    // but the user prefers the older flow where the minus is
+    // available straight from the regular edit mode without having
+    // to toggle the bottom panel first. The bottomPanelOpen flag
+    // is still tracked and propagated through the view tree so
+    // future tweaks can reuse it -- it just no longer gates this
+    // particular control.
+    _removeButton.hidden = !(_isEditing && !empty);
 }
 
 - (void)layoutSubviews {
@@ -138,10 +139,11 @@
 // Also expand the touch area further (well past the visible chrome)
 // so the user can tap "near" the button and still hit it.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (_isEditing && _bottomPanelOpen && !_removeButton.hidden) {
+    if (_isEditing && !_removeButton.hidden) {
         // Inflated touch area: 44pt diameter centred on the
         // minus-button's centre, regardless of the visible 36pt
-        // chrome. Same trick Apple uses for small toolbar buttons.
+        // chrome. Same trick Apple uses for small toolbar buttons --
+        // tap "near" the button still reaches it.
         CGPoint c = CGPointMake(CGRectGetMidX(_removeButton.frame),
                                 CGRectGetMidY(_removeButton.frame));
         CGRect target = CGRectMake(c.x - 22, c.y - 22, 44, 44);
@@ -151,7 +153,7 @@
 }
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (_isEditing && _bottomPanelOpen && !_removeButton.hidden) {
+    if (_isEditing && !_removeButton.hidden) {
         CGPoint c = CGPointMake(CGRectGetMidX(_removeButton.frame),
                                 CGRectGetMidY(_removeButton.frame));
         CGRect target = CGRectMake(c.x - 22, c.y - 22, 44, 44);
