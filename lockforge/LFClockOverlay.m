@@ -152,8 +152,8 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     // call.
     CGFloat _fixedTopY;
 }
-@property (nonatomic, strong, readonly) LFLiquidGlassView *glassBackground;
-@property (nonatomic, strong, readonly) UIView            *datePillView;
+@property (nonatomic, strong, readwrite) LFLiquidGlassView *glassBackground;
+@property (nonatomic, strong, readwrite) UIView            *datePillView;
 // Selection box: rounded-rect chrome that wraps the time digits.
 // Always present as a layout container (so the time has a stable
 // local coord system), but the visible border only appears in edit
