@@ -1,6 +1,7 @@
 #import "LFWidgetInline.h"
 #import "LFOpenMeteoClient.h"
 #import "LFLocationService.h"
+#import "LFStocksClient.h"
 #import <MediaPlayer/MediaPlayer.h>
 #import <EventKit/EventKit.h>
 
@@ -173,7 +174,37 @@ static EKEventStore *lf_inlineStore(void) {
             return cachedTitle ?: @"REMINDERS";
         }
         case LFWidgetKindStocksInline: {
-            return @"STOCKS";
+            // Symbol comes from the user-typed config the editor
+            // captures when the inline kind is set to Stocks.
+            // Without a symbol we fall back to a placeholder so the
+            // option remains selectable in the picker even before
+            // the user has configured it.
+            NSString *raw = nil;
+            if ([config isKindOfClass:[NSDictionary class]]) {
+                raw = config[@"symbol"];
+            }
+            NSString *sym = [LFStocksClient normalizedSymbol:raw];
+            if (!sym) return @"STOCKS";
+
+            // Always kick off a stale-aware refresh -- if the cache
+            // is fresh the call returns synchronously without hitting
+            // the network. The next minute-tick repaint picks up any
+            // new value the network call landed.
+            [[LFStocksClient shared] refreshIfStaleForSymbol:sym
+                                                       force:NO
+                                                  completion:nil];
+            LFStockQuote *q = [[LFStocksClient shared] cachedQuoteForSymbol:sym];
+            if (!q) {
+                // First-ever fetch hasn't completed yet -- show the
+                // bare ticker so the user knows the widget is wired
+                // up and waiting on the network.
+                return [NSString stringWithFormat:@"%@ —", sym];
+            }
+            // Apple-style "AAPL 192.42  +1.42%". Two decimal places
+            // for price, one for percent (matches Apple Stocks app).
+            NSString *sign = (q.changePercent >= 0) ? @"+" : @"";
+            return [[NSString stringWithFormat:@"%@ %.2f  %@%.2f%%",
+                     sym, q.price, sign, q.changePercent] uppercaseString];
         }
         case LFWidgetKindActivityInline: {
             // HealthKit on iOS 15 from a JB tweak isn't trivially

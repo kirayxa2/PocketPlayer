@@ -33,6 +33,7 @@ LockForge_FILES = \
     LFLockScreenWidgetPicker.m \
     LFOpenMeteoClient.m \
     LFLocationService.m \
+    LFStocksClient.m \
     LFWidgetBattery.m \
     LFWidgetWeather.m \
     LFWidgetMusic.m \

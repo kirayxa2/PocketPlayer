@@ -4,6 +4,7 @@
 #import "LFLockScreenWidgetTray.h"
 #import "LFLockScreenWidgetPicker.h"
 #import "LFLockScreenWidgetCatalog.h"
+#import "LFStocksClient.h"
 
 // =====================================================================
 // LFPassthroughView -- transparent container for the editor.
@@ -94,6 +95,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 @property (nonatomic, copy)   NSArray<LFLockScreenWidgetDescriptor *> *inlineDescriptors;
 @property (nonatomic, strong) UITapGestureRecognizer *clockTap;
 @property (nonatomic, strong) UITapGestureRecognizer *outsideTap;
+- (void)promptForStocksSymbol;
 @end
 
 #define kLFEditorTargetClock  0
@@ -925,11 +927,13 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     } else if (cv.tag == 3) {
         // Inline picker: write to dateInlineKind, preserve any
         // existing config dict where it makes sense (e.g. user re-
-        // selecting CustomText shouldn't clear their saved string).
+        // selecting CustomText shouldn't clear their saved string,
+        // user re-selecting Stocks shouldn't clear their ticker).
         LFLockScreenWidgetDescriptor *d = _inlineDescriptors[idx.item];
         LFClockSettings *s = [LFClockSettings shared];
         s.dateInlineKind = d.kind;
-        if (d.kind != LFWidgetKindCustomText) {
+        if (d.kind != LFWidgetKindCustomText &&
+            d.kind != LFWidgetKindStocksInline) {
             s.dateInlineConfig = @{};
         }
         // Keep the legacy dateWidget enum loosely in sync so older
@@ -955,6 +959,14 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
                 ([LFClockSettings shared].dateInlineConfig[@"text"]
                  ?: [LFClockSettings shared].dateCustomText) ?: @"";
         }
+
+        // Stocks needs a symbol; surface a prompt as soon as the
+        // user picks the kind so the inline pill stops showing the
+        // bare "STOCKS" placeholder. The user can re-tap the pill
+        // and re-pick Stocks later to change the ticker.
+        if (d.kind == LFWidgetKindStocksInline) {
+            [self promptForStocksSymbol];
+        }
     }
     [_clockOverlay refreshFromSettings];
     [cv reloadData];
@@ -976,6 +988,66 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     UIColor *c = [[LFClockSettings shared] resolvedColorForBackgroundLuminance:nil];
     [LFClockSettings shared].colorMode = saved;
     return c;
+}
+
+// UIAlertController-based ticker prompt for the Stocks inline widget.
+// Looks like Apple's iOS 26 "Edit Widget" sheet for Stocks: a single
+// text field pre-filled with the saved symbol (or "AAPL" first time),
+// Cancel / Done buttons. We accept anything LFStocksClient can
+// normalise -- so users can type "$msft" / "MSFT" / "msft " and we
+// store "MSFT". Empty input cancels. On Done we kick the network
+// fetch immediately so the inline pill can refresh on the next tick
+// with real data instead of "AAPL —".
+- (void)promptForStocksSymbol {
+    NSString *current =
+        [LFClockSettings shared].dateInlineConfig[@"symbol"];
+    if (![current isKindOfClass:[NSString class]] || current.length == 0) {
+        current = @"AAPL";
+    }
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Stock Ticker"
+                         message:@"Enter a ticker symbol (e.g. AAPL, MSFT, BRK.B, ^GSPC)"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder            = @"AAPL";
+        tf.text                   = current;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType     = UITextAutocorrectionTypeNo;
+        tf.spellCheckingType      = UITextSpellCheckingTypeNo;
+        tf.returnKeyType          = UIReturnKeyDone;
+        tf.clearButtonMode        = UITextFieldViewModeWhileEditing;
+    }];
+    __weak __typeof(self) wself = self;
+    __weak UIAlertController *wa = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Done"
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        UITextField *tf = wa.textFields.firstObject;
+        NSString *sym   = [LFStocksClient normalizedSymbol:tf.text];
+        if (!sym) return;
+        LFClockSettings *s = [LFClockSettings shared];
+        // Merge into existing config so we don't drop unrelated keys
+        // a future update might add to the Stocks dict.
+        NSMutableDictionary *m =
+            [(s.dateInlineConfig ?: @{}) mutableCopy];
+        m[@"symbol"] = sym;
+        s.dateInlineConfig = m;
+        // Force-fetch immediately (ignores 5-min TTL) so the user
+        // sees a real price within seconds instead of waiting for
+        // the next minute-tick to trigger a stale-aware refresh.
+        [[LFStocksClient shared] refreshIfStaleForSymbol:sym
+                                                   force:YES
+                                              completion:^(LFStockQuote *q,
+                                                            NSError *err) {
+            __strong __typeof(wself) sself = wself;
+            [sself.clockOverlay refreshFromSettings];
+        }];
+        [wself.clockOverlay refreshFromSettings];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 #pragma mark - LFLockScreenWidgetTrayDelegate
