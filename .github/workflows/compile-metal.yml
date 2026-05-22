@@ -100,19 +100,35 @@ jobs:
           ls -la ../layout/Library/LockForge/LiquidGlassShaders.metallib
 
       - name: Commit and push if metallib changed
-        # Skip the commit if running on a workflow_dispatch dry-run
-        # that produced a bit-identical result (deterministic builds
-        # of the same .metal source produce the same metallib).
+        # First-run-vs-rebuild handling: the first time CI runs after
+        # a .metal source addition, the .metallib doesn't exist in the
+        # repo yet, so it shows up as UNTRACKED -- and `git diff` only
+        # inspects tracked files, which made the previous version of
+        # this step silently skip the commit ("nothing to commit").
+        #
+        # The fix is to `git add` first, then check `git diff --cached`
+        # which DOES report new files. If the staged diff is empty,
+        # the binary is byte-identical to what's already in the repo
+        # (deterministic build, no source change) and we exit cleanly.
         run: |
           set -euo pipefail
           git config user.name  "metal-ci"
           git config user.email "metal-ci@users.noreply.github.com"
-          if git diff --quiet -- lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib; then
-              echo "metallib unchanged, nothing to commit."
+
+          METALLIB=lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
+          if [ ! -f "$METALLIB" ]; then
+              echo "ERROR: $METALLIB not produced by compile step." >&2
+              exit 1
+          fi
+          ls -la "$METALLIB"
+
+          git add "$METALLIB"
+          if git diff --cached --quiet -- "$METALLIB"; then
+              echo "metallib byte-identical to committed copy, nothing to commit."
               exit 0
           fi
-          git add lockforge/layout/Library/LockForge/LiquidGlassShaders.metallib
-          git commit -m "ci: recompile LiquidGlassShaders.metallib for $(git rev-parse --short HEAD~)"
+
+          git commit -m "ci: recompile LiquidGlassShaders.metallib for $(git rev-parse --short HEAD)"
           git push origin HEAD:main
         env:
           GIT_COMMITTER_NAME: metal-ci
