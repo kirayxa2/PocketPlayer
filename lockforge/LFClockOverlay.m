@@ -152,14 +152,8 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     // call.
     CGFloat _fixedTopY;
 }
-@property (nonatomic, strong) LFLiquidGlassView *glassBackground;
-// Date pill: small rounded rect with a thin white border that floats
-// ABOVE the clock's selection box, exactly like iOS 16/26's editor
-// preview. Contains the dateLabel as its single subview. The border
-// is only set when -isEditing -- otherwise the pill is just a
-// transparent label container, just like Apple shows the date as
-// plain text outside the editor.
-@property (nonatomic, strong) UIView            *datePillView;
+@property (nonatomic, strong, readonly) LFLiquidGlassView *glassBackground;
+@property (nonatomic, strong, readonly) UIView            *datePillView;
 // Selection box: rounded-rect chrome that wraps the time digits.
 // Always present as a layout container (so the time has a stable
 // local coord system), but the visible border only appears in edit
@@ -227,12 +221,18 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     [self centerInParentApplyingSettings];
     [self startTicker];
     [self subscribeToGyroscope];
+    [self subscribeToBatteryNotifications];
 
     return self;
 }
 
+- (CGRect)datePillFrameInOverlayCoords {
+    return _datePillView ? _datePillView.frame : CGRectZero;
+}
+
 - (void)dealloc {
     [_tickTimer invalidate];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     if (_gyroSubscriberKey) {
         [[LFGyroscopeManager shared] removeSubscriber:_gyroSubscriberKey];
     }
@@ -343,6 +343,38 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     }];
 }
 
+// Battery widget (LFDateWidgetBattery) needs to refresh as soon as
+// the level/state changes, not just on the once-a-second tick (which
+// only updates if text *shape* changed -- the shape is identical for
+// 85% vs 86%, so the per-second tick wouldn't catch small drops).
+//
+// Subscribe to the two NSNotifications UIDevice posts whenever the
+// battery monitor sees a change, and force a text refresh from each.
+// Cheap: notifications fire only on actual state transitions (~once
+// per percent), and the refresh path is just a setText + layout.
+- (void)subscribeToBatteryNotifications {
+    UIDevice *dev = [UIDevice currentDevice];
+    if (!dev.batteryMonitoringEnabled) {
+        dev.batteryMonitoringEnabled = YES;
+    }
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(onBatteryChanged:)
+               name:UIDeviceBatteryLevelDidChangeNotification
+             object:nil];
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+           selector:@selector(onBatteryChanged:)
+               name:UIDeviceBatteryStateDidChangeNotification
+             object:nil];
+}
+
+- (void)onBatteryChanged:(NSNotification *)note {
+    if ([LFClockSettings shared].dateWidget == LFDateWidgetBattery) {
+        [self updateTimeText];
+    }
+}
+
 #pragma mark - Metrics
 
 // Computes the natural size based on current font + scale + text and
@@ -378,10 +410,14 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     CGSize dateSize = [(_dateLabel.text ?: @" ")
         sizeWithAttributes:@{ NSFontAttributeName: _dateLabel.font }];
 
-    // Date pill geometry: text size + symmetric padding, rounded
-    // ends.
-    CGFloat datePillW = ceil(dateSize.width)  + 2 * kLFDatePillHPad;
+    // Date pill geometry. iOS 16/26 customize sheet draws the date
+    // pill's selection rectangle at the SAME width as the clock's
+    // selection box -- they look like two stacked rounded boxes,
+    // identical width, identical chrome. Outside edit mode the pill
+    // is just a transparent text container, hugging the date string
+    // tightly.
     CGFloat datePillH = ceil(dateSize.height) + 2 * kLFDatePillVPad;
+    CGFloat datePillW;            // computed below after boxW is known
 
     // FULL-WIDTH iOS 16/26-style selection box. Spans the screen
     // width minus a small bezel inset -- not the natural width of
@@ -389,7 +425,16 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     UIView *parentForWidth = self.superview;
     CGFloat parentW = parentForWidth ? parentForWidth.bounds.size.width : 393.0;
     CGFloat boxW    = MAX(parentW - kLFFullWidthSideInset * 2.0,
-                          datePillW + 24);
+                          ceil(dateSize.width) + 2 * kLFDatePillHPad + 24);
+
+    // Date pill width: in edit mode -> full clock-box width (so the
+    // chrome border matches the box's chrome border exactly, like
+    // Apple). In non-edit mode -> tight around the date text.
+    if (_isEditing) {
+        datePillW = boxW;
+    } else {
+        datePillW = ceil(dateSize.width) + 2 * kLFDatePillHPad;
+    }
 
     // === iOS 26 Adaptive-Time clock resize via HGHT + wdth axes ===
     //
@@ -539,10 +584,17 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
 
     self.bounds = CGRectMake(0, 0, width, height);
 
-    // Date pill at the top of self, horizontally centred.
+    // Date pill at the top of self, horizontally centred. Corner
+    // radius matches the selection box's corner in edit mode (so the
+    // two stacked rectangles read as a matched pair), and falls back
+    // to fully-rounded "pill" ends in non-edit mode (Apple's stock
+    // lock-screen date renders without any visible chrome anyway, so
+    // the corner only really matters in edit).
     _datePillView.frame              = CGRectMake((width - datePillW) / 2.0, 0,
                                                   datePillW, datePillH);
-    _datePillView.layer.cornerRadius = datePillH / 2.0;
+    _datePillView.layer.cornerRadius = _isEditing
+        ? MIN(28, datePillH / 2.0)
+        : (datePillH / 2.0);
     _dateLabel.frame                 = CGRectMake(0, 0, datePillW, datePillH);
 
     // Selection box below the pill, full overlay width.
@@ -804,7 +856,7 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     });
     NSDate *now = [NSDate date];
     NSString *t = [timeF stringFromDate:now];
-    NSString *d = [[dateF stringFromDate:now] localizedUppercaseString];
+    NSString *d = [self resolvedDateWidgetTextForDate:now formatter:dateF];
     BOOL textChanged = (![t isEqualToString:_timeLabel.text] ||
                         ![d isEqualToString:_dateLabel.text]);
     _timeLabel.text = t;
@@ -812,6 +864,79 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     // Only redo metrics if text actually changed shape (e.g. minute
     // rolled, or HH digit width changed). Otherwise we waste cycles.
     if (textChanged) [self recomputeMetrics];
+}
+
+// === iOS 26 single-line widget resolver for the "date pill" ===
+//
+// Reads LFClockSettings.dateWidget and produces the string that the
+// _dateLabel renders. The four cases each derive their text from a
+// system API that's free on iOS 15:
+//
+//   Date        -> NSDateFormatter localized
+//   Battery     -> UIDevice.batteryLevel (-1.0 if monitoring is off)
+//   DayCounter  -> NSCalendar -ordinalityOfUnit:inUnit: (day in year)
+//   CustomText  -> raw string from the user's editor input
+//
+// Every text path is upper-cased to match the shipped lock-screen
+// look (Apple uppercases the date string on lock-screen specifically;
+// other contexts use sentence-case).
+- (NSString *)resolvedDateWidgetTextForDate:(NSDate *)now
+                                  formatter:(NSDateFormatter *)dateFmt {
+    LFClockSettings *s = [LFClockSettings shared];
+    switch (s.dateWidget) {
+        case LFDateWidgetDate:
+        default: {
+            return [[dateFmt stringFromDate:now] localizedUppercaseString];
+        }
+        case LFDateWidgetBattery: {
+            UIDevice *dev = [UIDevice currentDevice];
+            // Apple gates batteryLevel behind `batteryMonitoringEnabled`.
+            // Turn it on lazily on first read; cheap, no observable
+            // side-effects on SpringBoard performance.
+            if (!dev.batteryMonitoringEnabled) {
+                dev.batteryMonitoringEnabled = YES;
+            }
+            float lvl = dev.batteryLevel;
+            if (lvl < 0) {
+                // Either monitoring still off, or simulator. Show a
+                // clear placeholder rather than 0% which would scare
+                // the user.
+                return @"BATTERY";
+            }
+            int pct = (int)roundf(lvl * 100.0f);
+            UIDeviceBatteryState state = dev.batteryState;
+            if (state == UIDeviceBatteryStateCharging ||
+                state == UIDeviceBatteryStateFull) {
+                return [NSString stringWithFormat:@"CHARGING %d%%", pct];
+            }
+            return [NSString stringWithFormat:@"BATTERY %d%%", pct];
+        }
+        case LFDateWidgetDayCounter: {
+            // Day-of-year in the current calendar. ordinalityOfUnit
+            // returns NSNotFound for some weird calendars; cheap to
+            // guard against.
+            NSCalendar *cal = [NSCalendar currentCalendar];
+            NSUInteger dayOfYear = [cal ordinalityOfUnit:NSCalendarUnitDay
+                                                  inUnit:NSCalendarUnitYear
+                                                 forDate:now];
+            NSDateComponents *yc = [cal components:NSCalendarUnitYear fromDate:now];
+            NSRange r = [cal rangeOfUnit:NSCalendarUnitDay
+                                  inUnit:NSCalendarUnitYear
+                                 forDate:now];
+            NSUInteger total = (r.length == NSNotFound) ? 365 : r.length;
+            if (dayOfYear == NSNotFound) dayOfYear = 1;
+            return [NSString stringWithFormat:@"DAY %lu OF %lu",
+                    (unsigned long)dayOfYear, (unsigned long)total];
+        }
+        case LFDateWidgetCustomText: {
+            NSString *t = s.dateCustomText ?: @"";
+            // Trim to a sane length so an over-long custom string
+            // can't push the pill beyond the screen edges. 60 chars
+            // covers any reasonable line.
+            if (t.length > 60) t = [t substringToIndex:60];
+            return t.length ? [t localizedUppercaseString] : @"CUSTOM";
+        }
+    }
 }
 
 - (void)applyAdaptiveColorWithBackgroundImage:(UIImage *)bgImage {

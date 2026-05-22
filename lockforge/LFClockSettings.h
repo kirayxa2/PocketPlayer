@@ -40,6 +40,29 @@ typedef NS_ENUM(NSInteger, LFClockAlignment) {
     LFClockAlignmentCount,
 };
 
+// What appears in the date "pill" above the clock. iOS 26 calls these
+// single-line widgets -- replacements for the date that show one line
+// of dynamic text (and an optional small icon). On iOS 15 we don't
+// have WidgetKit so the picker is limited to widgets we can compute
+// natively without 3rd-party APIs:
+//
+//   Date        -- "Monday, June 23"  (default, system date format)
+//   Battery     -- "85%"  / "Charging 85%"  via UIDevice.batteryLevel
+//   DayCounter  -- "Day 174 of 365" via NSCalendar.ordinalityOfUnit
+//   CustomText  -- whatever string the user typed in the editor field
+//
+// Phase 2 will add Weather (OpenWeatherMap key in settings), Calendar
+// (EKEventStore next event), Reminders, Astronomy (moon phase, sunrise
+// from CLLocation). Each new case appended at the end keeps the int
+// values stable.
+typedef NS_ENUM(NSInteger, LFDateWidget) {
+    LFDateWidgetDate       = 0,  // default -- locale-formatted date string
+    LFDateWidgetBattery    = 1,
+    LFDateWidgetDayCounter = 2,
+    LFDateWidgetCustomText = 3,
+    LFDateWidgetCount,
+};
+
 // Color choices: 6 presets + custom (UIColor stored as RGBA in plist).
 // `Adaptive` reads the wallpaper luminance under the clock and picks
 // white or black for legibility (iOS 26 "adaptive time").
@@ -121,6 +144,18 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 // multi-layer wallpapers. Default YES, but cheap to disable for
 // battery-conscious users.
 @property (nonatomic, assign) BOOL gyroEffectsEnabled;
+
+// Which "single-line widget" sits where the date used to sit. Tapping
+// the date pill in the editor opens a picker driving this value.
+// Default LFDateWidgetDate so existing users see the classic date
+// string without doing anything.
+@property (nonatomic, assign) LFDateWidget dateWidget;
+
+// User-editable text used when dateWidget == LFDateWidgetCustomText.
+// Editor exposes a UITextField writing into this field. Default ""
+// (renders empty in custom mode -- the editor pre-fills with a
+// suggestion the first time the user enters custom mode).
+@property (nonatomic, copy) NSString *dateCustomText;
 
 // Resolves the current settings to a concrete UIFont at the requested
 // reference height (in points). Used by LFClockOverlay each render.

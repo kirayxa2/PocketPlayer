@@ -34,6 +34,8 @@ static NSString *const kLFSettingsPath =
     _positionOffset       = CGPointZero;
     _liquidGlassIntensity = 0;
     _gyroEffectsEnabled   = YES;
+    _dateWidget           = LFDateWidgetDate;
+    _dateCustomText       = @"";
 }
 
 - (UIFont *)resolvedFontForReferenceSize:(CGFloat)refSize {
@@ -179,6 +181,8 @@ static NSString *const kLFSettingsPath =
     }
     if (d[@"liquidGlassIntensity"]) _liquidGlassIntensity = [d[@"liquidGlassIntensity"] integerValue];
     if (d[@"gyroEffectsEnabled"])   _gyroEffectsEnabled   = [d[@"gyroEffectsEnabled"]   boolValue];
+    if (d[@"dateWidget"])           _dateWidget           = (LFDateWidget)[d[@"dateWidget"] integerValue];
+    if (d[@"dateCustomText"])       _dateCustomText       = d[@"dateCustomText"];
 }
 
 - (void)save {
@@ -200,6 +204,8 @@ static NSString *const kLFSettingsPath =
         @"positionOffsetY":      @(_positionOffset.y),
         @"liquidGlassIntensity": @(_liquidGlassIntensity),
         @"gyroEffectsEnabled":   @(_gyroEffectsEnabled),
+        @"dateWidget":           @(_dateWidget),
+        @"dateCustomText":       _dateCustomText ?: @"",
     };
     [d writeToFile:kLFSettingsPath atomically:YES];
 }

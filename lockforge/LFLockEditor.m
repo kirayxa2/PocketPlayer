@@ -42,7 +42,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 // are always centred; the row served no purpose and just made the
 // panel taller than necessary.)
 
-@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate>
+@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate, UITextFieldDelegate>
 @property (nonatomic, weak)   LFClockOverlay      *clockOverlay;
 @property (nonatomic, weak)   UIView              *clockOriginalParent;  // remember home for re-parenting on dismiss
 @property (nonatomic, strong) UIVisualEffectView  *dimmer;       // covers wallpaper
@@ -59,6 +59,23 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 @property (nonatomic, strong) UIButton            *glassToggleButton;
 @property (nonatomic, strong) UIButton            *solidToggleButton;
 @property (nonatomic, strong) UIView              *modeToggleContainer;
+// Date editing. Tapping the date pill in the editor flips
+// activeTarget to LFEditorTargetDate and the bottom panel re-lays
+// itself to show:
+//   - the same Font + Color rows (font/color are shared between
+//     time and date in this iteration; per-element fonts can be a
+//     follow-up PR)
+//   - a Date Widget picker (4 cells: Date / Battery / Day / Custom)
+//   - a Custom Text field, only visible when the picker selects
+//     LFDateWidgetCustomText
+//
+// Tapping the clock body flips it back to LFEditorTargetClock and
+// the panel re-lays to show the Glass/Solid toggle in place of the
+// widget picker + text field.
+@property (nonatomic, assign) NSInteger            activeTarget;     // 0 = Clock, 1 = Date
+@property (nonatomic, strong) UICollectionView    *dateWidgetPickerRow;
+@property (nonatomic, strong) UITextField         *customTextField;
+@property (nonatomic, strong) UILabel             *targetTitleLabel;
 // iOS 16/26 customize-sheet behaviour: the bottom panel is HIDDEN
 // when the editor first appears (just selection rect + handle on
 // the clock). Tapping the clock toggles the panel up/down. Tapping
@@ -74,6 +91,9 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 @property (nonatomic, strong) UITapGestureRecognizer *clockTap;
 @property (nonatomic, strong) UITapGestureRecognizer *outsideTap;
 @end
+
+#define kLFEditorTargetClock  0
+#define kLFEditorTargetDate   1
 
 @implementation LFLockEditor
 
@@ -160,9 +180,36 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [_bottomPanel addSubview:_bottomPanelBlur];
 
     [self buildCloseButton];
+    [self buildTargetTitle];
     [self buildFontRow];
     [self buildColorRow];
     [self buildModeToggle];
+    [self buildDateWidgetPicker];
+    [self buildCustomTextField];
+}
+
+// Small label at top-left of the panel showing what the user is
+// currently editing -- "CLOCK" or "DATE". Same kerning/style as
+// "PHOTOS" in the carousel header so the editor visually echoes
+// the selector. Updated every time activeTarget changes.
+- (void)buildTargetTitle {
+    _targetTitleLabel = [UILabel new];
+    _targetTitleLabel.textAlignment = NSTextAlignmentLeft;
+    _targetTitleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    _targetTitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.6];
+    [_bottomPanel addSubview:_targetTitleLabel];
+    [self refreshTargetTitle];
+}
+
+- (void)refreshTargetTitle {
+    NSDictionary *attrs = @{
+        NSKernAttributeName: @(1.2),
+        NSFontAttributeName: _targetTitleLabel.font,
+        NSForegroundColorAttributeName: _targetTitleLabel.textColor,
+    };
+    NSString *txt = (_activeTarget == kLFEditorTargetDate) ? @"DATE" : @"CLOCK";
+    _targetTitleLabel.attributedText = [[NSAttributedString alloc]
+        initWithString:txt attributes:attrs];
 }
 
 - (void)buildFontRow {
@@ -244,7 +291,72 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [self refreshModeToggleSelection];
 }
 
-- (void)refreshModeToggleSelection {
+// Date Widget picker -- horizontal scroll row of 4 pill cells: Date /
+// Battery / Day / Custom. Active cell gets a brighter pill backdrop
+// like the clock-target font row. Tapping a cell mutates
+// LFClockSettings.dateWidget and tells the clock overlay to refresh,
+// so the date pill on screen updates instantly.
+- (void)buildDateWidgetPicker {
+    UICollectionViewFlowLayout *layout = [UICollectionViewFlowLayout new];
+    layout.scrollDirection      = UICollectionViewScrollDirectionHorizontal;
+    layout.itemSize             = CGSizeMake(96, 40);
+    layout.minimumLineSpacing   = 10;
+    layout.sectionInset         = UIEdgeInsetsMake(0, 16, 0, 16);
+
+    _dateWidgetPickerRow = [[UICollectionView alloc] initWithFrame:CGRectZero
+                                              collectionViewLayout:layout];
+    _dateWidgetPickerRow.backgroundColor = [UIColor clearColor];
+    _dateWidgetPickerRow.dataSource      = self;
+    _dateWidgetPickerRow.delegate        = self;
+    _dateWidgetPickerRow.showsHorizontalScrollIndicator = NO;
+    _dateWidgetPickerRow.tag             = 3;
+    [_dateWidgetPickerRow registerClass:[UICollectionViewCell class]
+             forCellWithReuseIdentifier:@"dateWidget"];
+    [_bottomPanel addSubview:_dateWidgetPickerRow];
+    _dateWidgetPickerRow.hidden = YES;
+}
+
+// Plain UITextField used to edit LFClockSettings.dateCustomText. Only
+// visible when the active target is Date AND the selected widget is
+// LFDateWidgetCustomText. Live-updates the settings on every
+// editingChanged event so the user sees the text appear in the date
+// pill while they type.
+- (void)buildCustomTextField {
+    _customTextField = [UITextField new];
+    _customTextField.delegate         = self;
+    _customTextField.placeholder      = @"Custom date text…";
+    _customTextField.font             = [UIFont systemFontOfSize:15];
+    _customTextField.textColor        = [UIColor whiteColor];
+    _customTextField.tintColor        = [UIColor whiteColor];
+    _customTextField.backgroundColor  = [UIColor colorWithWhite:0.0 alpha:0.30];
+    _customTextField.layer.cornerRadius  = 10;
+    _customTextField.layer.masksToBounds = YES;
+    _customTextField.returnKeyType    = UIReturnKeyDone;
+    _customTextField.autocorrectionType = UITextAutocorrectionTypeNo;
+    // Inset the editable area a bit so the text doesn't kiss the
+    // rounded edge.
+    UIView *spacer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 0)];
+    _customTextField.leftView         = spacer;
+    _customTextField.leftViewMode     = UITextFieldViewModeAlways;
+    _customTextField.rightView        = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 0)];
+    _customTextField.rightViewMode    = UITextFieldViewModeAlways;
+    [_customTextField addTarget:self
+                         action:@selector(onCustomTextChanged)
+               forControlEvents:UIControlEventEditingChanged];
+    [_bottomPanel addSubview:_customTextField];
+    _customTextField.hidden = YES;
+    _customTextField.text = [LFClockSettings shared].dateCustomText ?: @"";
+}
+
+- (void)onCustomTextChanged {
+    [LFClockSettings shared].dateCustomText = _customTextField.text ?: @"";
+    [_clockOverlay refreshFromSettings];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)tf {
+    [tf resignFirstResponder];
+    return YES;
+}
     BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
     UIColor *active   = [UIColor colorWithWhite:1.0 alpha:0.90];
     UIColor *inactive = [UIColor colorWithWhite:1.0 alpha:0.45];
@@ -276,11 +388,24 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [super viewDidLayoutSubviews];
     UIEdgeInsets safe = self.view.safeAreaInsets;
 
-    // Total panel height: top pad (room for close-X) + 3 rows + bottom
-    // pad + safe-area inset. Computed dynamically because
-    // safeAreaInsets isn't available at compile time.
+    // Visibility based on activeTarget. Clock target shows the Glass/
+    // Solid mode toggle; Date target shows the date-widget picker
+    // and (conditionally) the custom-text field. Font + Color rows
+    // are shared across both targets.
+    BOOL isDate = (_activeTarget == kLFEditorTargetDate);
+    LFDateWidget dw = [LFClockSettings shared].dateWidget;
+    BOOL needsCustomField = (isDate && dw == LFDateWidgetCustomText);
+
+    _modeToggleContainer.hidden  = isDate;
+    _dateWidgetPickerRow.hidden  = !isDate;
+    _customTextField.hidden      = !needsCustomField;
+
+    // Total panel height: top pad (room for close-X) + target title +
+    // font + color + (mode-toggle | date-widget-picker) + (custom-text
+    // field?) + bottom pad + safe-area inset.
     CGFloat panelH = kLFPanelTopPad + kLFFontRowHeight + kLFColorRowHeight +
                      kLFSliderRowHeight + kLFPanelBotPad + safe.bottom;
+    if (needsCustomField) panelH += 50.0;          // text field row
     _panelHeight = panelH;
 
     // Panel position: at the screen bottom when visible, fully OFF
@@ -303,6 +428,12 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
                                     12,
                                     closeSize, closeSize);
 
+    // Target title at top-left, vertically centred against the close
+    // button so they sit on the same baseline.
+    _targetTitleLabel.frame = CGRectMake(20,
+                                         12 + (closeSize - 18) / 2.0,
+                                         140, 18);
+
     // Picker rows. Font row starts BELOW the close-X (kLFPanelTopPad
     // = 50pt = 12pt top inset + 30pt button + 8pt gap) so its cells
     // never overlap the X visually or steal touches from it.
@@ -311,32 +442,48 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     y += kLFFontRowHeight;
     _colorPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFColorRowHeight);
     y += kLFColorRowHeight;
-    // Mode toggle (Glass / Solid) -- replaces the old liquidGlass
-    // slider. Centered horizontally inside the panel with comfortable
-    // side margins, ~40pt tall. The selected-segment backdrop pill
-    // animates between the two halves so taps feel instant.
-    const CGFloat kToggleSideMargin = 32.0;
-    const CGFloat kToggleH          = 36.0;
-    CGFloat toggleW = self.view.bounds.size.width - 2 * kToggleSideMargin;
-    if (toggleW < 120) toggleW = 120;
-    _modeToggleContainer.frame = CGRectMake(kToggleSideMargin,
-                                            y + (kLFSliderRowHeight - kToggleH) / 2.0,
-                                            toggleW, kToggleH);
-    CGFloat halfW = toggleW / 2.0;
-    _glassToggleButton.frame = CGRectMake(0,        0, halfW, kToggleH);
-    _solidToggleButton.frame = CGRectMake(halfW,    0, halfW, kToggleH);
 
-    // Selected-segment backdrop pill: 4pt inset on all sides, slides
-    // to the active half. We update its frame inline with the layout
-    // pass so the panel slide-up animation carries the backdrop
-    // smoothly with it.
-    UIView *backdrop = [_modeToggleContainer viewWithTag:0xB10B];
-    if (backdrop) {
-        const CGFloat inset = 4.0;
-        BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
-        CGFloat bx = isGlass ? inset : (halfW + inset);
-        backdrop.frame = CGRectMake(bx, inset,
-                                    halfW - 2 * inset, kToggleH - 2 * inset);
+    if (isDate) {
+        // Date widget picker takes the slot the mode-toggle would in
+        // clock mode. Same height so panel total stays predictable.
+        _dateWidgetPickerRow.frame = CGRectMake(0, y, self.view.bounds.size.width, kLFSliderRowHeight);
+        y += kLFSliderRowHeight;
+        if (needsCustomField) {
+            // Custom text field below the picker. 12pt side margins
+            // to match the picker section insets.
+            _customTextField.frame = CGRectMake(20, y + 6,
+                                                self.view.bounds.size.width - 40,
+                                                38);
+            y += 50.0;
+        }
+    } else {
+        // Mode toggle (Glass / Solid) -- replaces the old liquidGlass
+        // slider. Centered horizontally inside the panel with comfortable
+        // side margins, ~40pt tall. The selected-segment backdrop pill
+        // animates between the two halves so taps feel instant.
+        const CGFloat kToggleSideMargin = 32.0;
+        const CGFloat kToggleH          = 36.0;
+        CGFloat toggleW = self.view.bounds.size.width - 2 * kToggleSideMargin;
+        if (toggleW < 120) toggleW = 120;
+        _modeToggleContainer.frame = CGRectMake(kToggleSideMargin,
+                                                y + (kLFSliderRowHeight - kToggleH) / 2.0,
+                                                toggleW, kToggleH);
+        CGFloat halfW = toggleW / 2.0;
+        _glassToggleButton.frame = CGRectMake(0,        0, halfW, kToggleH);
+        _solidToggleButton.frame = CGRectMake(halfW,    0, halfW, kToggleH);
+
+        // Selected-segment backdrop pill: 4pt inset on all sides, slides
+        // to the active half. We update its frame inline with the layout
+        // pass so the panel slide-up animation carries the backdrop
+        // smoothly with it.
+        UIView *backdrop = [_modeToggleContainer viewWithTag:0xB10B];
+        if (backdrop) {
+            const CGFloat inset = 4.0;
+            BOOL isGlass = ([LFClockSettings shared].liquidGlassIntensity > 0);
+            CGFloat bx = isGlass ? inset : (halfW + inset);
+            backdrop.frame = CGRectMake(bx, inset,
+                                        halfW - 2 * inset, kToggleH - 2 * inset);
+        }
     }
 }
 
@@ -395,7 +542,50 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 // Tap on the clock: bring the customize sheet up if it's down,
 // otherwise hide it again. Same finger affordance as iOS 16's editor
 // where tapping a widget toggles its option sheet.
+//
+// We also discriminate WHICH element the user tapped: a tap inside
+// the date-pill region switches the editor's active target to Date
+// and re-lays the bottom panel for date editing; any other tap
+// switches back to Clock target. Apple's iOS 16/26 customize sheet
+// does the same.
 - (void)onClockTap:(UITapGestureRecognizer *)tap {
+    NSInteger newTarget = kLFEditorTargetClock;
+    CGPoint p = [tap locationInView:_clockOverlay];
+    CGRect dateRect = _clockOverlay.datePillFrameInOverlayCoords;
+    if (!CGRectIsEmpty(dateRect) && CGRectContainsPoint(dateRect, p)) {
+        newTarget = kLFEditorTargetDate;
+    }
+
+    if (newTarget != _activeTarget) {
+        _activeTarget = newTarget;
+        [self refreshTargetTitle];
+        // If we just switched into custom-text mode, prefill the
+        // text field with the saved string so the user can edit
+        // rather than retyping.
+        _customTextField.text = [LFClockSettings shared].dateCustomText ?: @"";
+        // Bottom panel will re-lay (visibility, panel height) on
+        // next layout pass triggered by the toggle below.
+        [self.view setNeedsLayout];
+        // Always SHOW the panel when switching target -- a target
+        // switch is an explicit "I want to edit this" signal, not a
+        // toggle. Without this, the second tap on a different
+        // element would just hide the panel again.
+        if (!_bottomPanelVisible) {
+            [self setBottomPanelVisible:YES animated:YES];
+        } else {
+            // Same visible state, but layout has changed -- animate
+            // the height/content swap nicely.
+            [UIView animateWithDuration:0.25 animations:^{
+                [self.view layoutIfNeeded];
+            }];
+            // Reload pickers so the new target's selected indices
+            // light up.
+            [_fontPickerRow reloadData];
+            [_colorPickerRow reloadData];
+            [_dateWidgetPickerRow reloadData];
+        }
+        return;
+    }
     [self setBottomPanelVisible:!_bottomPanelVisible animated:YES];
 }
 
@@ -557,6 +747,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
      numberOfItemsInSection:(NSInteger)section {
     if (cv.tag == 1) return LFClockFontCount;
     if (cv.tag == 2) return LFClockColorModeCount;
+    if (cv.tag == 3) return LFDateWidgetCount;
     return 0;
 }
 
@@ -611,7 +802,47 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
         cell.contentView.layer.cornerRadius = cell.contentView.bounds.size.width / 2.0;
         return cell;
     }
+    if (cv.tag == 3) {
+        UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"dateWidget"
+                                                                   forIndexPath:idx];
+        for (UIView *v in cell.contentView.subviews) [v removeFromSuperview];
+
+        UILabel *lab = [UILabel new];
+        lab.text          = [self dateWidgetTitleForIndex:idx.item];
+        lab.font          = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+        lab.textAlignment = NSTextAlignmentCenter;
+        lab.textColor     = [UIColor whiteColor];
+        lab.frame         = cell.contentView.bounds;
+        [cell.contentView addSubview:lab];
+
+        BOOL selected = (idx.item == [LFClockSettings shared].dateWidget);
+        cell.contentView.backgroundColor =
+            selected ? [UIColor colorWithWhite:1.0 alpha:0.18]
+                     : [UIColor colorWithWhite:0.0 alpha:0.30];
+        cell.contentView.layer.cornerRadius  = 13;
+        cell.contentView.layer.masksToBounds = YES;
+        cell.contentView.layer.borderColor =
+            (selected ? [[UIColor colorWithWhite:1.0 alpha:0.60] CGColor]
+                      : [[UIColor clearColor] CGColor]);
+        cell.contentView.layer.borderWidth  = selected ? 1.0 : 0.0;
+        return cell;
+    }
     return [UICollectionViewCell new];
+}
+
+// Localized labels for the four built-in single-line date widgets.
+// Free-standing helper so adding a new case (Phase 2: Calendar /
+// Reminders / Astronomy) only needs ONE switch update here -- the
+// rest of the picker plumbing handles count + state automatically
+// via LFDateWidgetCount.
+- (NSString *)dateWidgetTitleForIndex:(NSInteger)i {
+    switch (i) {
+        case LFDateWidgetDate:        return @"Date";
+        case LFDateWidgetBattery:     return @"Battery";
+        case LFDateWidgetDayCounter:  return @"Day";
+        case LFDateWidgetCustomText:  return @"Custom";
+        default:                      return @"";
+    }
 }
 
 - (void)collectionView:(UICollectionView *)cv
@@ -620,6 +851,20 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
         [LFClockSettings shared].font = (LFClockFont)idx.item;
     } else if (cv.tag == 2) {
         [LFClockSettings shared].colorMode = (LFClockColorMode)idx.item;
+    } else if (cv.tag == 3) {
+        [LFClockSettings shared].dateWidget = (LFDateWidget)idx.item;
+        // Selecting Custom shows the text field; any other widget
+        // hides it. Trigger a layout pass so the panel resizes.
+        [self.view setNeedsLayout];
+        [UIView animateWithDuration:0.20 animations:^{
+            [self.view layoutIfNeeded];
+        }];
+        // Pre-fill the field with the saved text so the user can
+        // edit on entry rather than retyping.
+        if ((LFDateWidget)idx.item == LFDateWidgetCustomText) {
+            _customTextField.text =
+                [LFClockSettings shared].dateCustomText ?: @"";
+        }
     }
     [_clockOverlay refreshFromSettings];
     [cv reloadData];

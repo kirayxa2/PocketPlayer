@@ -37,6 +37,18 @@ NS_ASSUME_NONNULL_BEGIN
 // LFClockSettings.liquidGlassIntensity > 0.
 @property (nonatomic, strong, readonly) LFLiquidGlassView *glassBackground;
 
+// Date pill view, exposed read-only so the editor can hit-test taps.
+// Lives ABOVE the selection box; in edit mode it expands to the full
+// box width and gets the same chrome border as the box, matching
+// iOS 16/26's customize-sheet visual where date and clock have
+// identical-width selection rectangles.
+@property (nonatomic, strong, readonly) UIView *datePillView;
+
+// Frame of the date pill in self's coordinate space. Editor's tap
+// handler uses this to discriminate "tap on date pill" vs "tap on
+// clock body" within a single tap recognizer.
+@property (nonatomic, readonly) CGRect datePillFrameInOverlayCoords;
+
 // Force a re-render. Called when settings change (font/color/etc) or
 // when the wallpaper changes (so adaptive color can re-evaluate).
 - (void)refreshFromSettings;
