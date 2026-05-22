@@ -15,6 +15,13 @@
 //   * Tap a filled slot's minus button -> remove
 //   * Long-press anywhere on the tray -> drag whole tray vertically
 //     to change LFTrayPosition (under-clock <-> at-bottom)
+//
+// Edit-mode SELECTION RECTANGLE: when isEditing=YES the tray draws a
+// hairline rounded-rect chrome around its full extent -- same look as
+// the chrome around the clock and date pill -- so the user can see
+// the widget area's bounds while customizing. The chrome's WIDTH is
+// driven by the editor (set via -setSelectionWidth: to match the
+// clock-box width) and its HEIGHT is the natural widget height (76pt).
 
 #import <UIKit/UIKit.h>
 #import "LFLockScreenWidget.h"
@@ -44,6 +51,12 @@ NS_ASSUME_NONNULL_BEGIN
 // When YES, slots show chrome (minus button on filled, plus on empty)
 // and pan/long-press drag is enabled. Set by the editor.
 @property (nonatomic, assign) BOOL isEditing;
+
+// Width of the edit-mode selection-rectangle chrome. Editor sets this
+// to match the clock-box width so the three chrome rectangles (clock,
+// date pill, widget tray) align as a column. If 0 the chrome falls
+// back to the natural widget content width.
+@property (nonatomic, assign) CGFloat selectionWidth;
 
 // Total natural width / height after layout. Caller positions the
 // tray and reads .intrinsicContentSize to get the right rect.

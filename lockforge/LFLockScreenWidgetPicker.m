@@ -233,15 +233,83 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     // For widgets that need follow-up config (CustomText / WorldClock)
     // we present a small UIAlertController to collect it. Battery /
     // Weather / Music / Calendar / etc. need no config and ship
-    // straight to the completion block.
+    // straight to the size-pick step (or completion if there's only
+    // one supported size).
     if (d.kind == LFWidgetKindCustomText) {
         [self promptForCustomTextWithDescriptor:d];
     } else if (d.kind == LFWidgetKindWorldClock) {
         [self promptForTimezoneWithDescriptor:d];
     } else {
-        if (_completion) _completion(d.kind, _targetFamily, @{});
-        [self dismissViewControllerAnimated:YES completion:nil];
+        [self promptForSizeWithDescriptor:d config:@{}];
     }
+}
+
+#pragma mark - Size picker (1x1 vs 2x1 etc.)
+
+// iOS 26 widget add flow lets the user swipe between size variations
+// (Small / Medium / Large) before confirming. On the lock screen only
+// two sizes are available -- circular (1x1, "Small") and rectangular
+// (2x1, "Medium"). When a descriptor supports both, we show a quick
+// action sheet that lets the user pick which one to add. Inline
+// widgets are reached through the date picker, never through this
+// path, so we only deal with circular vs rectangular here.
+- (void)promptForSizeWithDescriptor:(LFLockScreenWidgetDescriptor *)d
+                              config:(NSDictionary *)config {
+    BOOL supportsCircular = NO, supportsRect = NO;
+    for (NSNumber *n in d.supportedFamilies) {
+        LFWidgetFamily f = (LFWidgetFamily)[n integerValue];
+        if (f == LFWidgetFamilyCircular)    supportsCircular = YES;
+        if (f == LFWidgetFamilyRectangular) supportsRect     = YES;
+    }
+
+    // Single supported size -> ship the only valid choice. Honor
+    // targetFamily preference when both are valid for the SOURCE slot
+    // (we filtered to families supported at descriptor level above).
+    if (!(supportsCircular && supportsRect)) {
+        LFWidgetFamily fam = supportsCircular ? LFWidgetFamilyCircular
+                                              : LFWidgetFamilyRectangular;
+        if (_completion) _completion(d.kind, fam, config);
+        [self dismissViewControllerAnimated:YES completion:nil];
+        return;
+    }
+
+    // Both supported -> action sheet picker. Default selection follows
+    // the slot the user originally tapped (targetFamily) so the most
+    // common path -- "user tapped a circular slot, picked a widget,
+    // wants the circular variant" -- is one tap.
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:d.displayName
+                         message:@"Choose a size"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *smallTitle  = (_targetFamily == LFWidgetFamilyCircular)
+        ? @"Small (1×1)  ✓" : @"Small (1×1)";
+    NSString *mediumTitle = (_targetFamily == LFWidgetFamilyRectangular)
+        ? @"Medium (2×1)  ✓" : @"Medium (2×1)";
+
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:smallTitle
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *_) {
+        __strong typeof(self) ss = ws;
+        if (!ss) return;
+        if (ss.completion) ss.completion(d.kind,
+                                          LFWidgetFamilyCircular, config);
+        [ss dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:mediumTitle
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *_) {
+        __strong typeof(self) ss = ws;
+        if (!ss) return;
+        if (ss.completion) ss.completion(d.kind,
+                                          LFWidgetFamilyRectangular, config);
+        [ss dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 #pragma mark - Follow-up config prompts

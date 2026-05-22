@@ -902,12 +902,35 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     UIView *parent = self.superview;
     if (!parent || !_widgetTray) return;
     LFLockScreenWidgetTray *tray = (LFLockScreenWidgetTray *)_widgetTray;
+
+    // The selection-rect chrome around the tray has to match the
+    // clock-box width exactly so the three rectangles (clock, date
+    // pill, widget tray) line up as a column when editing.
+    CGFloat clockBoxW = _selectionBoxView.bounds.size.width;
+    if (clockBoxW < 1) clockBoxW = self.bounds.size.width;
+    tray.selectionWidth = clockBoxW;
+
     CGSize natural = tray.naturalSize;
     if (natural.width < 1 || natural.height < 1) {
         tray.hidden = YES;
         return;
     }
+    // Hide entirely off-edit when the tray has no widgets -- otherwise
+    // the lock screen reserves an invisible 1pt strip for nothing.
+    if (!_isEditing && tray.usedUnits == 0) {
+        tray.hidden = YES;
+        return;
+    }
     tray.hidden = NO;
+
+    // When editing, expand the tray's bounds to the clock-box width so
+    // the chrome rectangle has room to draw. Off-edit, hug the natural
+    // content size so the tray doesn't soak up touches outside the
+    // visible widgets.
+    CGFloat trayW = _isEditing ? MAX(natural.width, clockBoxW)
+                                : natural.width;
+    CGFloat trayH = MAX(natural.height, 76);
+
     LFTrayPosition pos = [LFClockSettings shared].trayPosition;
     CGFloat parentW = parent.bounds.size.width;
     CGFloat parentH = parent.bounds.size.height;
@@ -919,15 +942,15 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
         // iPhone X+ and the home-indicator. iPhone 6s has none of
         // those affordances but the tray still reads better with a
         // generous margin.
-        trayY = parentH - safe.bottom - 110.0 - natural.height;
+        trayY = parentH - safe.bottom - 110.0 - trayH;
     } else {
         // Just below the clock-overlay's frame, with a comfortable
         // gap so the tray doesn't kiss the selection-box border.
         trayY = CGRectGetMaxY(self.frame) + 12.0;
     }
-    CGRect f = CGRectMake((parentW - natural.width) / 2.0,
+    CGRect f = CGRectMake((parentW - trayW) / 2.0,
                           trayY,
-                          natural.width, natural.height);
+                          trayW, trayH);
     tray.frame = f;
 }
 
