@@ -24,6 +24,8 @@
 #import "LFClockOverlay.h"
 #import "LFLockEditor.h"
 #import "LFLockScreenSelector.h"
+#import "LFLockScreenLibrary.h"
+#import "LFLockScreenWallpaperView.h"
 
 // =====================================================================
 // Bundled iOS 26 Adaptive Time numeric font
@@ -103,6 +105,11 @@ static LFLockEditor           *gEditor;
 // Apple's iOS 16/26 flow exactly: long-press -> wallpaper picker
 // carousel -> Customize -> editor.
 static LFLockScreenSelector   *gSelector;
+// Custom-wallpaper overlay -- a UIImageView at the bottom of the cover
+// sheet that draws the active lock-screen's saved wallpaper above the
+// system's stock wallpaper. Listens to LFActiveLockScreenChanged-
+// Notification and re-reads from LFLockScreenLibrary on its own.
+static LFLockScreenWallpaperView *gWallpaperOverlay;
 static UILongPressGestureRecognizer *gLongPress;
 
 // Tracks whether we've already done the (heavy-ish) install pass for
@@ -168,6 +175,28 @@ static void LFInstallClockIntoCoverSheet(UIView *coverSheetView) {
     gClockOverlay.tag = 0xC10C;        // identifier for our hide-walk
     [coverSheetView addSubview:gClockOverlay];
     [gClockOverlay refreshFromSettings];
+}
+
+// Install (or re-install) the LFLockScreenWallpaperView at the BOTTOM
+// of the cover-sheet view. We want it BELOW the clock overlay (and any
+// other LockForge subviews) but ABOVE the system wallpaper -- the
+// cover-sheet view itself is a sibling of the wallpaper window, so any
+// subview we add covers the wallpaper underneath. Adding via
+// `insertSubview:atIndex:0` keeps it as the first visible layer in the
+// cover-sheet hierarchy so SBFLockScreen's date / clock / widget views
+// (when not hidden) still draw on top.
+static void LFInstallWallpaperOverlay(UIView *coverSheetView) {
+    if (!coverSheetView) return;
+    if (gWallpaperOverlay && gWallpaperOverlay.superview == coverSheetView) {
+        [gWallpaperOverlay refresh];
+        return;
+    }
+    [gWallpaperOverlay removeFromSuperview];
+
+    gWallpaperOverlay = [[LFLockScreenWallpaperView alloc]
+                          initWithFrame:coverSheetView.bounds];
+    gWallpaperOverlay.tag = 0xC10D;
+    [coverSheetView insertSubview:gWallpaperOverlay atIndex:0];
 }
 
 // Reads the current cover-sheet wallpaper as a UIImage so the clock can
@@ -283,6 +312,7 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
     }
     gCoverSheetView = self;
     LFHideSystemDateViewsIn(self);
+    LFInstallWallpaperOverlay(self);
     LFInstallClockIntoCoverSheet(self);
     gInstalledForCurrentMount = YES;
 
@@ -317,6 +347,7 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
     if (!editorOwnsClock &&
         (!gInstalledForCurrentMount || gClockOverlay.superview != self)) {
         LFHideSystemDateViewsIn(self);
+        LFInstallWallpaperOverlay(self);
         LFInstallClockIntoCoverSheet(self);
         gInstalledForCurrentMount = YES;
     }
@@ -324,6 +355,35 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
 }
 
 %end
+
+// Bridge between LFLockScreenLibrary's active-changed notification and
+// the live clock overlay. When the user swipes between cards in the
+// selector, the library updates LFClockSettings.shared with the new
+// active screen's values; this observer kicks the clock overlay to
+// re-render with the new font / colour / widgets.
+@interface LFActiveScreenObserver : NSObject
++ (instancetype)shared;
+@end
+
+@implementation LFActiveScreenObserver
++ (instancetype)shared {
+    static LFActiveScreenObserver *o;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        o = [LFActiveScreenObserver new];
+        [[NSNotificationCenter defaultCenter]
+            addObserver:o
+               selector:@selector(onActiveChanged:)
+                   name:LFActiveLockScreenChangedNotification
+                 object:nil];
+    });
+    return o;
+}
+- (void)onActiveChanged:(NSNotification *)n {
+    if (gClockOverlay) [gClockOverlay refreshFromSettings];
+    if (gWallpaperOverlay) [gWallpaperOverlay refresh];
+}
+@end
 
 // =====================================================================
 // %ctor
@@ -343,6 +403,17 @@ static void LFRefreshAdaptiveColor(UIView *coverSheetView) {
         // Touch the singleton so settings load early. Defaults are
         // applied if no plist exists yet.
         (void)[LFClockSettings shared];
+
+        // THEN initialise the library, which mirrors the active
+        // lock-screen's saved values onto LFClockSettings.shared via
+        // its setters. Order matters: the library re-enters
+        // [LFClockSettings shared] inside its loadFromDisk, so the
+        // settings dispatch_once has to be done first.
+        (void)[LFLockScreenLibrary shared];
+
+        // Wire up the active-changed observer so swipes in the
+        // selector immediately refresh the live clock + wallpaper.
+        (void)[LFActiveScreenObserver shared];
 
         %init;
     }

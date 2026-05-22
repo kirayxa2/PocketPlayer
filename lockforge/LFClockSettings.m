@@ -1,7 +1,10 @@
 #import "LFClockSettings.h"
 
-// Where the plist lives. Same parent as PocketPlayer's heartbeat / apply
-// manifest, so all our state is under /var/mobile/Library/LockForge/.
+// Legacy path that the pre-multi-lockscreen build used. The new
+// code persists through LFLockScreenLibrary (which writes
+// `/var/mobile/Library/LockForge/lockscreens.plist`). We still
+// reference this path so -load can read it as a fallback when no
+// library file is present (first run on an upgraded device).
 static NSString *const kLFSettingsPath =
     @"/var/mobile/Library/LockForge/clock.plist";
 
@@ -13,8 +16,12 @@ static NSString *const kLFSettingsPath =
     dispatch_once(&once, ^{
         s = [LFClockSettings new];
         [s applyDefaults];
-        [s load];
     });
+    // Library hydration happens in %ctor after this singleton is
+    // initialised -- see Tweak.x. We deliberately don't touch the
+    // library here because LFLockScreenLibrary's loadFromDisk
+    // re-enters [LFClockSettings shared] to mirror values back into
+    // this singleton, which would deadlock on dispatch_once.
     return s;
 }
 
@@ -230,32 +237,20 @@ static NSString *const kLFSettingsPath =
 }
 
 - (void)save {
-    NSString *dir = [kLFSettingsPath stringByDeletingLastPathComponent];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:NULL];
-    NSDictionary *d = @{
-        @"enabled":              @(_enabled),
-        @"font":                 @(_font),
-        @"colorMode":            @(_colorMode),
-        @"customColorRGBA":      _customColorRGBA ?: @[ @1, @1, @1, @1 ],
-        @"scale":                @(_scale),
-        @"horizontalStretch":    @(_horizontalStretch),
-        @"verticalStretch":      @(_verticalStretch),
-        @"alignment":            @(_alignment),
-        @"positionOffsetX":      @(_positionOffset.x),
-        @"positionOffsetY":      @(_positionOffset.y),
-        @"liquidGlassIntensity": @(_liquidGlassIntensity),
-        @"gyroEffectsEnabled":   @(_gyroEffectsEnabled),
-        @"dateWidget":           @(_dateWidget),
-        @"dateCustomText":       _dateCustomText ?: @"",
-        @"dateInlineKind":       @(_dateInlineKind),
-        @"dateInlineConfig":     _dateInlineConfig ?: @{},
-        @"trayPosition":         @(_trayPosition),
-        @"traySlots":            _traySlots ?: @[],
-    };
-    [d writeToFile:kLFSettingsPath atomically:YES];
+    // Multi-lockscreen world: the singleton's current values describe
+    // the ACTIVE lockscreen. Defer to the library to capture the
+    // mirrored values back into the active record and persist the
+    // entire library plist atomically. Forward declaration via
+    // performSelector keeps this file's import graph minimal -- we
+    // don't pull in LFLockScreenLibrary.h here so older callers
+    // that link only against LFClockSettings keep compiling.
+    Class lib = NSClassFromString(@"LFLockScreenLibrary");
+    if (lib) {
+        id shared = [lib performSelector:@selector(shared)];
+        if ([shared respondsToSelector:@selector(flushActiveStateToDisk)]) {
+            [shared performSelector:@selector(flushActiveStateToDisk)];
+        }
+    }
 }
 
 @end

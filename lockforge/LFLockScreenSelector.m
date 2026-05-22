@@ -1,5 +1,7 @@
 #import "LFLockScreenSelector.h"
 #import "LFClockOverlay.h"
+#import "LFLockScreenLibrary.h"
+#import <objc/runtime.h>
 
 // =====================================================================
 // iOS 26 selector layout constants -- picked off Apple's actual UI
@@ -15,31 +17,9 @@ static const CGFloat kLFCardBorderWidth    = 0.5;
 //
 // The card is sized to the DEVICE'S aspect ratio (so the carousel
 // looks like a stack of mini-phones), and occupies ~70% of the
-// viewport width. This is the single most important geometric
-// rule -- mismatched aspect was what made my first pass not look
-// like the iOS 26 picker.
-//
-// Once card width is fixed, peek of side cards is automatic:
-//
-//   peek_per_side = (viewport_width - card_width) / 2
-//
-// On iPhone 6s (375pt wide) -> 263pt card -> 56pt peek per side.
-static const CGFloat kLFCardWidthRatio     = 0.70;     // 70% of screen width
-static const CGFloat kLFCardInterSpacing   = 16.0;     // gap between adjacent cards
-
-// How much of the source cover-sheet's BOTTOM we hide in the card
-// preview. iOS 16/26 customize-sheet thumbnails show the wallpaper +
-// clock + (optional) widgets ONLY -- they don't show the camera /
-// flashlight shortcut buttons or the home indicator that live in
-// the bottom strip of the live lock screen. We mimic that by
-// growing the snapshot view past the bottom edge of the card by this
-// many points (in source coordinates), then relying on the card's
-// existing clipsToBounds to hide the overflow.
-//
-// 120pt covers:
-//   - camera/flashlight affordance buttons (~70-110pt from bottom)
-//   - "swipe up" / "press home" hint (~30-50pt from bottom)
-//   - home indicator on devices that have one (~30pt from bottom)
+// viewport width.
+static const CGFloat kLFCardWidthRatio     = 0.70;
+static const CGFloat kLFCardInterSpacing   = 16.0;
 static const CGFloat kLFSnapshotBottomCrop = 120.0;
 
 // Top label "PHOTOS" position
@@ -49,47 +29,19 @@ static const CGFloat kLFTopLabelKerning    = 1.2;
 static const CGFloat kLFTopLabelToCardGap  = 14.0;
 
 // Bottom buttons.
-//
-// iOS 26 wallpaper picker layout is: small wallpaper-thumbnail icon
-// in the bottom-LEFT, "Customize" pill CENTERED, "+" circle in the
-// bottom-RIGHT. We don't have a wallpaper thumbnail (PR-A keeps
-// PocketPlayer's wallpaper system separate), so the bar is just
-// Customize centered + "+" on the right.
-//
-// kLFBottomBarSideInset is how far the "+" button sits from the
-// right screen edge. Customize is purely centered horizontally and
-// doesn't need an inset constant.
-static const CGFloat kLFBottomBarMargin    = 16.0;     // distance from safeArea bottom
-static const CGFloat kLFBottomBarSideInset = 22.0;     // inset for "+" only
-// Customize pill is the visual anchor of the bottom action bar --
-// noticeably larger than the auxiliary "+" button so it reads as the
-// primary action. iOS 26 dimensions on a 6s-class screen: ~180pt
-// wide x 52pt tall, 17pt Semibold label. Earlier 124x50pt was too
-// small relative to the card and got lost on the bar.
-// Iteration history:
-//   124x50 / 15pt Medium    -- too small, lost on the bar
-//   180x52 / 17pt Semibold  -- still too small per user
-//   240x56 / 18pt Semibold  -- TOO big AND taller than "+", which
-//                              broke the visual hierarchy (Customize
-//                              should not tower over its sibling
-//                              auxiliary button)
-//   200x50 / 17pt Semibold  -- current. Same HEIGHT as the "+"
-//                              button (50pt) so they sit on the same
-//                              baseline; visibly wider so it reads as
-//                              the primary action; 17pt Semibold
-//                              label is bold enough to anchor the bar
-//                              without overpowering it.
+static const CGFloat kLFBottomBarMargin    = 16.0;
+static const CGFloat kLFBottomBarSideInset = 22.0;
 static const CGFloat kLFCustomizeBtnH      = 50.0;
 static const CGFloat kLFCustomizeBtnW      = 200.0;
 static const CGFloat kLFPlusBtnSize        = 50.0;
 
-// Page dots (above the action bar)
+// Page dots
 static const CGFloat kLFPageDotSize        = 7.0;
 static const CGFloat kLFPageDotSpacing     = 6.0;
-static const CGFloat kLFPageDotsBottomGap  = 16.0;     // gap from dots to action bar
-static const CGFloat kLFCardToDotsGap      = 18.0;     // gap from card bottom to dots
+static const CGFloat kLFPageDotsBottomGap  = 16.0;
+static const CGFloat kLFCardToDotsGap      = 18.0;
 
-// Focus pill (inside each card, bottom-center)
+// Focus pill (inside each card)
 static const CGFloat kLFFocusPillW         = 78.0;
 static const CGFloat kLFFocusPillH         = 28.0;
 static const CGFloat kLFFocusPillBottomGap = 22.0;
@@ -101,10 +53,20 @@ static const NSInteger kLFTagSnapshot   = 0xF50A;
 static const NSInteger kLFTagFocusPill  = 0xF0C5;
 static const NSInteger kLFTagFocusIcon  = 0xF06A;
 static const NSInteger kLFTagFocusLabel = 0xF06B;
+static const NSInteger kLFTagWallpaperImg = 0xF50B;     // UIImageView under snap
+// Each card's userdata key for the lock-screen UUID it represents.
+static char kLFCardUUIDKey;
 
 // =====================================================================
 
-@interface LFLockScreenSelector () <UIScrollViewDelegate>
+// Forward decl -- definition below in #pragma mark - Library bitmap
+// capture. Needed because viewDidLoad calls it before the function
+// itself appears in the file.
+static UIImage *LFCaptureLockScreenImage(UIView *coverSheet);
+
+@interface LFLockScreenSelector () <UIScrollViewDelegate,
+                                     UINavigationControllerDelegate,
+                                     UIImagePickerControllerDelegate>
 @property (nonatomic, weak)   UIView          *sourceCoverSheet;
 @property (nonatomic, weak)   LFClockOverlay  *clockOverlay;
 
@@ -116,9 +78,15 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
 @property (nonatomic, strong) UIButton        *customizeButton;
 @property (nonatomic, strong) UIButton        *plusButton;
 
-// PR-A: one card only. Refactor to dynamic count when multi-screens land.
-@property (nonatomic, assign) NSInteger        numCards;
+// Cached one-shot live-snapshot of the active screen taken at present
+// time. Used as the FIRST card's image; subsequent cards (inactive
+// lock screens) just show their wallpaper file with no live overlays.
+@property (nonatomic, strong) UIImage         *liveSnapshotAtPresent;
+@property (nonatomic, copy)   NSString        *liveSnapshotForUUID;
+
+@property (nonatomic, copy)   NSArray<NSString *> *lockScreenIds;
 @property (nonatomic, assign) NSInteger        currentIndex;
+
 @end
 
 @implementation LFLockScreenSelector
@@ -128,27 +96,50 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     if ((self = [super init])) {
         _sourceCoverSheet = coverSheetView;
         _clockOverlay     = overlay;
-        _numCards         = 1;     // PR-A
         _currentIndex     = 0;
     }
     return self;
 }
 
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor blackColor];
+
+    // Cache the snapshot of the live lock screen ONCE, while the user
+    // hasn't scrolled the active away yet. We use this image for
+    // whichever card matches the original-active uuid -- that card
+    // gets the "real" preview with clock + widgets, while other cards
+    // show only their wallpaper image. This keeps card construction
+    // cheap: capture is O(N) only on the first card, the rest are
+    // O(1) image-views.
+    LFLockScreenLibrary *lib = [LFLockScreenLibrary shared];
+    _liveSnapshotForUUID    = [lib.activeId copy];
+    _liveSnapshotAtPresent  = LFCaptureLockScreenImage(_sourceCoverSheet);
+
+    // Snapshot the library state for our current pass. We DON'T live-
+    // observe library changes here -- if the user adds/removes a card,
+    // we rebuild via -reloadCards. Initial scroll position == active.
+    _lockScreenIds = [lib.lockScreenIds copy];
+    NSInteger idx = [_lockScreenIds indexOfObject:lib.activeId];
+    _currentIndex = (idx == NSNotFound) ? 0 : idx;
+
     [self buildCategoryLabel];
     [self buildCardsScroll];
     [self buildPageDots];
     [self buildBottomBar];
     [self installDismissGesture];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self selector:@selector(onLibraryChanged:)
+               name:LFLockScreenLibraryChangedNotification object:nil];
 }
 
 #pragma mark - Build
 
-// "PHOTOS" label at the top -- semibold 13pt, white-60%, uppercase
-// with subtle letter-spacing. This matches Apple's typography on iOS
-// 26 customize sheet header exactly.
 - (void)buildCategoryLabel {
     _categoryLabel = [UILabel new];
     _categoryLabel.textAlignment = NSTextAlignmentCenter;
@@ -162,11 +153,6 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     [self.view addSubview:_categoryLabel];
 }
 
-// Horizontal scroll view holding the cards. Uses fast deceleration so
-// the snap behaves like Apple's "page-with-peek" carousel: each card
-// is the natural snap point, but the scroll view itself isn't paged
-// (paging would only allow one card per viewport, which kills the
-// peek illusion). Manual snap in -scrollViewWillEndDragging:.
 - (void)buildCardsScroll {
     _cardsScroll = [UIScrollView new];
     _cardsScroll.pagingEnabled                  = NO;
@@ -178,137 +164,36 @@ static const NSInteger kLFTagFocusLabel = 0xF06B;
     [self.view addSubview:_cardsScroll];
 
     _cards = [NSMutableArray array];
-    for (NSInteger i = 0; i < _numCards; i++) {
-        UIView *card = [self buildCard];
+    [self reloadCards];
+}
+
+- (void)reloadCards {
+    for (UIView *v in _cards) [v removeFromSuperview];
+    [_cards removeAllObjects];
+
+    LFLockScreenLibrary *lib = [LFLockScreenLibrary shared];
+    for (NSString *uuid in _lockScreenIds) {
+        UIView *card = [self buildCardForUUID:uuid library:lib];
         [_cardsScroll addSubview:card];
         [_cards addObject:card];
     }
+
+    // Rebuild page dots to match new count.
+    if (_pageDotsContainer) [self rebuildPageDots];
+
+    [self.view setNeedsLayout];
 }
 
-// Capture the live lock screen as a STATIC UIImage by rendering the
-// cover sheet's PARENT WINDOW directly.
-//
-// Why this approach (after two failed earlier ones)?
-//
-//   Attempt 1: -[CSCoverSheetView snapshotViewAfterScreenUpdates:NO]
-//   - failed because the wallpaper isn't a SUBVIEW of the cover
-//     sheet on iOS 15 -- it's composited from a separate layer
-//     underneath, so the snapshot was just the clock on black.
-//
-//   Attempt 2: -[UIScreen mainScreen snapshotViewAfterScreenUpdates:]
-//   - returned an iOS-private snapshot view that goes BLANK when
-//     reparented into a foreign hierarchy on iOS 15. User saw an
-//     empty card.
-//
-//   Attempt 3: iterate UIApplication.windows + renderInContext: each
-//   - captured the wallpaper window correctly but the SBLockScreen-
-//     Window with our LFClockOverlay inside it didn't always show up
-//     in [UIApplication windows] on jailbroken SpringBoard, so the
-//     clock was missing from the bitmap.
-//
-//   Attempt 4 (this one):
-//   Render _sourceCoverSheet.window.layer directly -- the cover-sheet
-//   view's PARENT WINDOW. On iOS 15 SpringBoard this single window is
-//   SBCoverSheetWindow / SBHomeScreenWindow, which is the deepest
-//   shared ancestor of:
-//     - the wallpaper view (SBLockScreenWallpaperView is a subview
-//       of the lock-screen window's content view)
-//     - the cover sheet view (SBCoverSheetView, also a subview)
-//     - our installed LFClockOverlay (a subview of SBCoverSheetView)
-//
-//   Rendering this single window's CALayer recursively renders ALL
-//   its sublayers -- wallpaper, cover sheet, our clock -- in their
-//   correct z-order, into a flat UIImage. No snapshot-view magic, no
-//   uncertain window enumeration, no missing layers.
-//
-//   We also iterate UIApplication.windows for any windows ABOVE the
-//   cover-sheet window (e.g. SBStatusBarWindow on top of
-//   SBCoverSheetWindow on iOS 15) to capture the status bar too.
-static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
-    if (!coverSheet) return nil;
-    UIWindow *coverWindow = coverSheet.window;
-    if (!coverWindow) return nil;
-
-    CGRect screenRect = [UIScreen mainScreen].bounds;
-    if (screenRect.size.width < 1.0 || screenRect.size.height < 1.0) {
-        return nil;
-    }
-
-    UIGraphicsBeginImageContextWithOptions(screenRect.size, NO, 0.0);
-    if (!UIGraphicsGetCurrentContext()) {
-        UIGraphicsEndImageContext();
-        return nil;
-    }
-
-    // Iteration history of capture approaches, all of which have failed
-    // in different ways:
-    //
-    //   1) [coverSheet snapshotViewAfterScreenUpdates:NO]
-    //      -- missed wallpaper (it's not a subview of cover sheet on
-    //         iOS 15, lives in a separate window).
-    //   2) [UIScreen mainScreen snapshotViewAfterScreenUpdates:YES]
-    //      -- returns iOS-private view that goes blank on reparent.
-    //   3) Iterate UIApplication.windows + CALayer renderInContext:
-    //      -- captured wallpaper but missed our LFClockOverlay because
-    //         CSCoverSheetWindow doesn't always show up in
-    //         UIApplication.windows on jailbroken SpringBoard.
-    //   4) coverWindow.layer renderInContext: + sibling windows
-    //      -- still missed clock+date for reasons that are likely
-    //         related to renderInContext: not handling
-    //         hardware-composited / backing-store layers (CABackdrop,
-    //         visual effects, etc.) correctly on iOS 15.
-    //
-    // Attempt 5 (this one): use -drawViewHierarchyInRect:afterScreen-
-    // Updates:YES on the cover sheet's window.
-    //
-    // Why this should work where renderInContext: didn't:
-    //
-    //   - drawViewHierarchyInRect:afterScreenUpdates:YES is documented
-    //     to render the view hierarchy "as it appears on screen" --
-    //     i.e. it forces the system to perform a full off-screen
-    //     render pass that includes ALL hardware-composited content
-    //     (wallpaper layers, blur effects, backdrop layers,
-    //     UIVisualEffectViews etc.). renderInContext: only walks the
-    //     CALayer tree by software and skips anything backed by the
-    //     window server / hardware compositor.
-    //
-    //   - afterScreenUpdates:YES forces a fresh layout pass before
-    //     the snapshot, so we can never get a half-rendered or
-    //     pre-clock-attached state.
-    //
-    //   - The function is called once per long-press, so the
-    //     additional cost (one layout pass + one off-screen render)
-    //     is invisible to the user.
-    //
-    // Render order:
-    //   1) cover sheet window (wallpaper + cover-sheet content +
-    //      LFClockOverlay -- everything below the status bar)
-    //   2) any sibling window with HIGHER windowLevel (status bar,
-    //      system alerts) so it composites on top
-    BOOL ok = [coverWindow drawViewHierarchyInRect:screenRect
-                                afterScreenUpdates:YES];
-    (void)ok;
-
-    NSArray<UIWindow *> *windows = [[UIApplication sharedApplication] windows];
-    for (UIWindow *win in windows) {
-        if (win == coverWindow) continue;
-        if (win.hidden || win.alpha < 0.01) continue;
-        if (win.windowLevel <= coverWindow.windowLevel) continue;
-
-        [win drawViewHierarchyInRect:win.frame afterScreenUpdates:YES];
-    }
-
-    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return img;
-}
-
-// One preview card. Filled with a snapshot of the cover-sheet view,
-// rounded with the iOS 26 card radius, and decorated with a Focus
-// pill at the bottom. Tapping the card has no action in PR-A but
-// bringing the carousel up already lets the user inspect it.
-- (UIView *)buildCard {
+// Build one preview card for a given lock-screen uuid. The active
+// screen at the time the selector was presented gets the live
+// snapshot (with clock + widgets); all others get a wallpaper-only
+// preview. This is the iOS 26 behaviour exactly -- the picker shows
+// a static thumbnail per saved screen, only the centred (active)
+// one is "live".
+- (UIView *)buildCardForUUID:(NSString *)uuid library:(LFLockScreenLibrary *)lib {
     UIView *card = [UIView new];
+    objc_setAssociatedObject(card, &kLFCardUUIDKey, uuid,
+                             OBJC_ASSOCIATION_COPY_NONATOMIC);
     card.backgroundColor       = [UIColor blackColor];
     card.layer.cornerRadius    = kLFCardCornerRadius;
     card.layer.masksToBounds   = YES;
@@ -316,38 +201,30 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     card.layer.borderColor     =
         [[UIColor colorWithWhite:1.0 alpha:0.08] CGColor];
 
-    // Render the live lock screen to a static UIImage covering ALL
-    // visible windows (wallpaper + cover sheet + clock overlay), then
-    // display via UIImageView. See LFCaptureLockScreenImage() doc-
-    // comment for why we don't use snapshotViewAfterScreenUpdates:
-    // any more (it returns a special iOS-private view that goes blank
-    // when reparented into a foreign hierarchy on iOS 15).
-    UIImage *snapImage = LFCaptureLockScreenImage(_sourceCoverSheet);
-    if (snapImage) {
-        UIImageView *snap = [[UIImageView alloc] initWithImage:snapImage];
+    // Layer 1 -- wallpaper image (always present if the screen has a
+    // custom wallpaper). Sits at the bottom of the card.
+    NSString *wallpaperPath = [lib wallpaperPathForId:uuid];
+    if (wallpaperPath) {
+        UIImageView *wp = [[UIImageView alloc] initWithImage:
+                           [UIImage imageWithContentsOfFile:wallpaperPath]];
+        wp.tag                    = kLFTagWallpaperImg;
+        wp.contentMode            = UIViewContentModeScaleAspectFill;
+        wp.clipsToBounds          = YES;
+        wp.userInteractionEnabled = NO;
+        [card addSubview:wp];
+    }
+
+    // Layer 2 -- live overlay (only the originally-active screen).
+    if ([uuid isEqualToString:_liveSnapshotForUUID] && _liveSnapshotAtPresent) {
+        UIImageView *snap = [[UIImageView alloc] initWithImage:_liveSnapshotAtPresent];
         snap.tag                     = kLFTagSnapshot;
         snap.userInteractionEnabled  = NO;
         snap.contentMode             = UIViewContentModeScaleAspectFill;
         snap.clipsToBounds           = YES;
         [card addSubview:snap];
-    } else {
-        // Last-ditch fallback: try the legacy snapshot path. Better
-        // to show a degraded card than a totally black one.
-        UIView *snap = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:YES];
-        if (!snap) {
-            snap = [_sourceCoverSheet snapshotViewAfterScreenUpdates:YES];
-        }
-        if (snap) {
-            snap.tag                = kLFTagSnapshot;
-            snap.userInteractionEnabled = NO;
-            [card addSubview:snap];
-        }
     }
 
-    // Focus pill -- visually 1:1 with iOS 26 (rounded translucent pill,
-    // small moon icon + "Focus" label). Not wired to a real Focus mode
-    // on iOS 15 (their Focus API is too different from 16+). Future
-    // work could mock it as a setting per saved lock screen.
+    // Focus pill (decorative, same on every card).
     UIView *pill = [UIView new];
     pill.tag                = kLFTagFocusPill;
     pill.backgroundColor    = [UIColor colorWithWhite:0.0 alpha:0.35];
@@ -374,24 +251,41 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     focusLabel.font      = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [pill addSubview:focusLabel];
 
+    // Swipe-up gesture for delete. Apple's iOS 16+ flow is long-press
+    // -> context menu. The user explicitly DISABLED long-press for
+    // delete ("ни какого удержания"); swipe-up is the cleanest
+    // alternative because it's an unambiguous gesture (the card
+    // doesn't otherwise scroll vertically) and it's also what iOS 26
+    // uses to remove cards from the multitasking switcher, so the
+    // mental model carries over.
+    UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onCardSwipeUp:)];
+    swipe.direction = UISwipeGestureRecognizerDirectionUp;
+    [card addGestureRecognizer:swipe];
+
     return card;
 }
 
-// Page-dots strip below the cards. Hidden when only one card exists
-// (matches Apple's behaviour exactly -- no dots for a single page).
 - (void)buildPageDots {
     _pageDotsContainer = [UIView new];
     _pageDots          = [NSMutableArray array];
-    for (NSInteger i = 0; i < _numCards; i++) {
+    [self.view addSubview:_pageDotsContainer];
+    [self rebuildPageDots];
+}
+
+- (void)rebuildPageDots {
+    for (UIView *d in _pageDots) [d removeFromSuperview];
+    [_pageDots removeAllObjects];
+    NSInteger n = (NSInteger)_lockScreenIds.count;
+    for (NSInteger i = 0; i < n; i++) {
         UIView *d = [UIView new];
         d.layer.cornerRadius  = kLFPageDotSize / 2.0;
         d.layer.masksToBounds = YES;
         [_pageDotsContainer addSubview:d];
         [_pageDots addObject:d];
     }
-    _pageDotsContainer.hidden = (_numCards <= 1);
+    _pageDotsContainer.hidden = (n <= 1);
     [self refreshDotColors];
-    [self.view addSubview:_pageDotsContainer];
 }
 
 - (void)refreshDotColors {
@@ -403,10 +297,6 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     }
 }
 
-// "Customize" pill on the left, blue "+" circle on the right.
-// Colors are matched to iOS 26 system tokens on dark mode:
-//   Customize bg = systemGray6 (RGB 28, 28, 30)
-//   "+" bg       = systemBlue  (RGB 0, 122, 255)
 - (void)buildBottomBar {
     _customizeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_customizeButton setTitle:@"Customize" forState:UIControlStateNormal];
@@ -444,13 +334,49 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     [self.view addSubview:_plusButton];
 }
 
-// Swipe-down to dismiss -- matches the Apple gesture on the customize
-// sheet. Tap-on-empty-area also dismisses.
 - (void)installDismissGesture {
     UISwipeGestureRecognizer *swipe = [[UISwipeGestureRecognizer alloc]
         initWithTarget:self action:@selector(onDismissGesture)];
     swipe.direction = UISwipeGestureRecognizerDirectionDown;
     [self.view addGestureRecognizer:swipe];
+}
+
+#pragma mark - Library bitmap capture
+
+// Capture the live lock screen as a static UIImage. Same renderer the
+// previous build used; kept as a free function so it's easy to call
+// from -viewDidLoad without holding a reference to the live window.
+static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
+    if (!coverSheet) return nil;
+    UIWindow *coverWindow = coverSheet.window;
+    if (!coverWindow) return nil;
+
+    CGRect screenRect = [UIScreen mainScreen].bounds;
+    if (screenRect.size.width < 1.0 || screenRect.size.height < 1.0) {
+        return nil;
+    }
+
+    UIGraphicsBeginImageContextWithOptions(screenRect.size, NO, 0.0);
+    if (!UIGraphicsGetCurrentContext()) {
+        UIGraphicsEndImageContext();
+        return nil;
+    }
+
+    BOOL ok = [coverWindow drawViewHierarchyInRect:screenRect
+                                afterScreenUpdates:YES];
+    (void)ok;
+
+    NSArray<UIWindow *> *windows = [[UIApplication sharedApplication] windows];
+    for (UIWindow *win in windows) {
+        if (win == coverWindow) continue;
+        if (win.hidden || win.alpha < 0.01) continue;
+        if (win.windowLevel <= coverWindow.windowLevel) continue;
+        [win drawViewHierarchyInRect:win.frame afterScreenUpdates:YES];
+    }
+
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return img;
 }
 
 #pragma mark - Layout
@@ -460,15 +386,11 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     UIEdgeInsets safe = self.view.safeAreaInsets;
     CGRect b = self.view.bounds;
 
-    // 1) Top "PHOTOS" label, anchored just under the safe-area top.
     _categoryLabel.frame = CGRectMake(0,
                                       safe.top + kLFTopLabelTopMargin,
                                       b.size.width,
                                       kLFTopLabelHeight);
 
-    // 2) Bottom action bar. iOS 26 layout: Customize pill CENTERED,
-    //    "+" circle on the right. The Customize button is the visual
-    //    anchor of the bar; "+" is auxiliary and inset from the right.
     CGFloat bottomY = b.size.height - safe.bottom -
                       kLFBottomBarMargin - kLFCustomizeBtnH;
     _customizeButton.frame = CGRectMake((b.size.width - kLFCustomizeBtnW) / 2.0,
@@ -478,9 +400,9 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
                                         bottomY,
                                         kLFPlusBtnSize, kLFPlusBtnSize);
 
-    // 3) Page dots row (just above the action bar).
-    CGFloat dotsTotalW = (CGFloat)_numCards * kLFPageDotSize +
-                         (CGFloat)(_numCards - 1) * kLFPageDotSpacing;
+    NSInteger numCards = (NSInteger)_lockScreenIds.count;
+    CGFloat dotsTotalW = numCards * kLFPageDotSize +
+                         (numCards - 1) * kLFPageDotSpacing;
     if (dotsTotalW < 0) dotsTotalW = 0;
     CGFloat dotsY = bottomY - kLFPageDotsBottomGap - kLFPageDotSize;
     _pageDotsContainer.frame = CGRectMake((b.size.width - dotsTotalW) / 2.0,
@@ -493,24 +415,6 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
                              kLFPageDotSize, kLFPageDotSize);
     }
 
-    // 4) Card geometry. The card matches the DEVICE aspect ratio MINUS
-    //    the bottom-crop strip so what the user sees inside the card
-    //    is just wallpaper + clock, no home bar / camera / flashlight.
-    //    The snapshot view itself is FULL device aspect (so its
-    //    contents render at the same scale as the live lock screen),
-    //    but it overflows the card's bottom by kLFSnapshotBottomCrop *
-    //    scale, and the card's clipsToBounds hides that overflow.
-    //
-    //    If the aspect-correct height would overflow the available
-    //    vertical area, we shrink the card width down so the height
-    //    fits -- the carousel still looks correct because aspect is
-    //    preserved.
-    //
-    //    Source dimensions come from UIScreen (not _sourceCoverSheet)
-    //    because we snapshot the WHOLE screen now -- the snapshot view
-    //    bounds match the screen bounds, so aspect math has to use
-    //    screen dimensions to scale the snapshot correctly inside the
-    //    card without distortion.
     CGRect screenB = [UIScreen mainScreen].bounds;
     CGFloat sourceW = screenB.size.width;
     CGFloat sourceH = screenB.size.height;
@@ -527,28 +431,17 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     CGFloat areaH      = MAX(0, areaBottom - areaTop);
 
     if (cardH > areaH) {
-        // Aspect-preserving shrink so the card stays a mini-phone.
         cardH = areaH;
         cardW = floor(cardH / cardAspect);
     }
 
     CGFloat cardY = areaTop + (areaH - cardH) / 2.0;
 
-    // 5) Scroll view spans the FULL viewport width. Side peek is
-    //    achieved by making the contentInset half the leftover space
-    //    on each side, which centers the first card and naturally
-    //    leaves the next/prev cards peeking in.
     _cardsScroll.frame = CGRectMake(0, cardY, b.size.width, cardH);
 
     CGFloat sideInset = (b.size.width - cardW) / 2.0;
     _cardsScroll.contentInset = UIEdgeInsetsMake(0, sideInset, 0, sideInset);
 
-    // 6) Lay out the actual cards inside the scroll view.
-    //
-    //    Snap height = full device aspect at cardW (i.e. it represents
-    //    the WHOLE lock screen, including the bottom strip we want to
-    //    hide). Card height < snap height by exactly the crop, so the
-    //    bottom strip falls outside card.bounds and gets clipped.
     CGFloat snapScale = cardW / sourceW;
     CGFloat snapH     = sourceH * snapScale;
     CGFloat x = 0;
@@ -557,14 +450,16 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
         card.frame = CGRectMake(x, 0, cardW, cardH);
         x += cardW + kLFCardInterSpacing;
 
-        // Card subviews: snapshot fills width (full device aspect),
-        // overflows bottom; focus pill anchored above the (visible)
-        // card bottom.
+        UIView *wp     = [card viewWithTag:kLFTagWallpaperImg];
         UIView *snap   = [card viewWithTag:kLFTagSnapshot];
         UIView *pill   = [card viewWithTag:kLFTagFocusPill];
         UIImageView *moon = (UIImageView *)[card viewWithTag:kLFTagFocusIcon];
         UILabel *flbl  = (UILabel *)[card viewWithTag:kLFTagFocusLabel];
 
+        // Wallpaper fills the full card; snapshot (when present)
+        // overflows below to crop home affordances exactly the way
+        // the previous single-card path did.
+        wp.frame   = CGRectMake(0, 0, cardW, cardH);
         snap.frame = CGRectMake(0, 0, cardW, snapH);
 
         pill.frame = CGRectMake((cardW - kLFFocusPillW) / 2.0,
@@ -582,7 +477,7 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     CGFloat contentW = (_cards.count > 0) ? (x - kLFCardInterSpacing) : 0;
     _cardsScroll.contentSize = CGSizeMake(contentW, cardH);
 
-    // Snap to the active card. -sideInset is x=0 of the first card.
+    // Snap to whichever index is currently active.
     _cardsScroll.contentOffset = CGPointMake(-sideInset +
         _currentIndex * (cardW + kLFCardInterSpacing), 0);
 }
@@ -590,28 +485,64 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
 #pragma mark - Buttons
 
 - (void)onCustomize {
-    // Tell the tweak's gesture target to spawn the editor; we'll
-    // animate ourselves out of the way after.
+    // Customize edits the CENTRED card (which we keep in sync with
+    // library.activeId via the scroll-snap delegate), so by the time
+    // the user taps this, library.activeId already reflects what
+    // they're looking at.
     [self.delegate selectorDidRequestEditor:self];
     [self dismissAnimated];
 }
 
 - (void)onPlus {
-    // PR-A: multi-lockscreens not implemented yet; show a friendly
-    // notice rather than silently doing nothing.
-    UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"New lock screen"
-                         message:@"Multiple lock screens are coming in the next update. For now you have a single editable lock screen."
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK"
-                                          style:UIAlertActionStyleDefault
-                                        handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
+    // iOS 26 "+" presents the photo picker. We accept any photo, scale
+    // it to screen size on import, and create a new lock-screen
+    // initialised to defaults with that wallpaper.
+    UIImagePickerController *picker = [UIImagePickerController new];
+    picker.sourceType    = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.allowsEditing = NO;
+    picker.delegate      = self;
+    [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)onDismissGesture {
     [self.delegate selectorDidDismiss:self];
     [self dismissAnimated];
+}
+
+- (void)onCardSwipeUp:(UISwipeGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    UIView *card = g.view;
+    NSString *uuid = objc_getAssociatedObject(card, &kLFCardUUIDKey);
+    if (![uuid isKindOfClass:[NSString class]]) return;
+
+    LFLockScreenLibrary *lib = [LFLockScreenLibrary shared];
+    if (lib.count <= 1) {
+        // Last screen: don't allow delete -- explain via alert.
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"Can't Delete"
+                             message:@"You need at least one lock screen."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+
+    // Animate card UP off screen, then mutate library + reload.
+    [UIView animateWithDuration:0.20
+                     animations:^{
+        card.transform = CGAffineTransformMakeTranslation(0, -200);
+        card.alpha     = 0;
+    }
+                     completion:^(BOOL _) {
+        [lib removeId:uuid];
+        // Library posts LFLockScreenLibraryChangedNotification, our
+        // observer reloads the cards array and the layout pass re-
+        // snaps to the new active index. (active-changed notification
+        // is also posted if we removed the active card, which the
+        // tweak picks up to refresh wallpaper / clock.)
+    }];
 }
 
 - (void)dismissAnimated {
@@ -621,6 +552,16 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     } completion:^(BOOL ok) {
         [weakSelf.view removeFromSuperview];
     }];
+}
+
+#pragma mark - Library notifications
+
+- (void)onLibraryChanged:(NSNotification *)n {
+    LFLockScreenLibrary *lib = [LFLockScreenLibrary shared];
+    _lockScreenIds = [lib.lockScreenIds copy];
+    NSInteger idx = [_lockScreenIds indexOfObject:lib.activeId];
+    _currentIndex = (idx == NSNotFound) ? 0 : idx;
+    [self reloadCards];
 }
 
 #pragma mark - Presentation
@@ -634,36 +575,81 @@ static UIImage *LFCaptureLockScreenImage(UIView *coverSheet) {
     }];
 }
 
-#pragma mark - UIScrollViewDelegate (snap + dot sync)
+#pragma mark - UIScrollViewDelegate (snap + active sync)
 
-// Snap to the nearest card boundary on deceleration. This is what
-// gives the carousel its "click into place" feel like Apple's. Manual
-// snap (vs. pagingEnabled) is required because we want side cards to
-// peek -- pagingEnabled forces one viewport per page, which would hide
-// the peeks.
 - (void)scrollViewWillEndDragging:(UIScrollView *)sv
                      withVelocity:(CGPoint)v
               targetContentOffset:(inout CGPoint *)target {
-    if (_numCards <= 1) {
+    NSInteger numCards = (NSInteger)_lockScreenIds.count;
+    if (numCards <= 1) {
         target->x = -sv.contentInset.left;
         return;
     }
-    // Card width is whatever was put in the cards on the most recent
-    // layout pass -- read it directly so we don't drift if the layout
-    // changes (rotation, multitasking).
     CGFloat cardW  = (_cards.count > 0) ? _cards.firstObject.frame.size.width
                                         : sv.bounds.size.width;
     CGFloat stride = cardW + kLFCardInterSpacing;
     CGFloat origin = target->x + sv.contentInset.left;
     NSInteger idx  = (NSInteger)round(origin / stride);
-    idx = MAX(0, MIN(_numCards - 1, idx));
+    idx = MAX(0, MIN(numCards - 1, idx));
     target->x = -sv.contentInset.left + idx * stride;
     _currentIndex = idx;
     [self refreshDotColors];
+
+    // Apply the new active immediately on snap so the live lockscreen
+    // beneath us swaps wallpaper / clock to match by the time the
+    // selector fades. Library does the right thing if the uuid is
+    // already active (no-op).
+    NSString *uuid = _lockScreenIds[idx];
+    [[LFLockScreenLibrary shared] setActiveId:uuid];
 }
 
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)sv {
     [self refreshDotColors];
+}
+
+#pragma mark - UIImagePickerControllerDelegate (+ flow)
+
+- (void)imagePickerController:(UIImagePickerController *)picker
+        didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    UIImage *raw = info[UIImagePickerControllerOriginalImage];
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (!raw) return;
+        UIImage *cropped = [self imageScaledToScreen:raw];
+        NSString *uuid = [[LFLockScreenLibrary shared]
+            addLockScreenWithWallpaperImage:cropped];
+        // Library posts both LFLockScreenLibraryChangedNotification
+        // and LFActiveLockScreenChangedNotification. -onLibraryChanged
+        // rebuilds cards; the active-changed notification reaches the
+        // wallpaper view + clock overlay via the tweak.
+        (void)uuid;
+    }];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+// Aspect-fill the picked image to the device screen size, then JPEG-
+// encode at quality 0.9. Keeps file size around 200-400KB on 6s and
+// avoids storing 10+MB raw images.
+- (UIImage *)imageScaledToScreen:(UIImage *)img {
+    CGSize target = [UIScreen mainScreen].bounds.size;
+    CGFloat scale = [UIScreen mainScreen].scale;
+    CGSize px = CGSizeMake(target.width * scale, target.height * scale);
+
+    CGFloat sx = px.width  / img.size.width;
+    CGFloat sy = px.height / img.size.height;
+    CGFloat s  = MAX(sx, sy);   // aspect-fill
+    CGSize fit = CGSizeMake(img.size.width * s, img.size.height * s);
+    CGRect drawRect = CGRectMake((px.width  - fit.width)  / 2.0,
+                                 (px.height - fit.height) / 2.0,
+                                 fit.width, fit.height);
+
+    UIGraphicsBeginImageContextWithOptions(px, YES, 1.0);
+    [img drawInRect:drawRect];
+    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return out ?: img;
 }
 
 @end

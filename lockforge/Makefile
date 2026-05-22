@@ -20,6 +20,8 @@ TWEAK_NAME = LockForge
 LockForge_FILES = \
     Tweak.x \
     LFClockSettings.m \
+    LFLockScreenLibrary.m \
+    LFLockScreenWallpaperView.m \
     LFLiquidGlassView.m \
     LFLiquidGlassMetalView.m \
     LFGyroscopeManager.m \

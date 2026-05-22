@@ -19,14 +19,18 @@
 //   │  [Customize]            [+]    │  <- bottom action bar
 //   └────────────────────────────────┘
 //
-// On Customize tap -> ask delegate to spawn the editor.
-// On + tap -> (PR-A) shows "Coming soon" alert. PR-B will add the
-// new-lockscreen flow.
-// On swipe-down -> dismiss back to lockscreen.
-//
-// PR-A only has 1 card (matches the single saved lockscreen we keep).
-// Page dots, peek of side cards, and scroll snap are still implemented
-// so the UI looks right; PR-B will fill in additional cards.
+// Multi-lockscreen carousel:
+//   * Scroll between cards; the snap delegate calls
+//     LFLockScreenLibrary.setActiveId on the centred card so the live
+//     lock-screen behind us swaps to that screen's wallpaper +
+//     settings as the user scrolls.
+//   * Customize tap -> ask delegate to spawn the editor on the active
+//     (centred) screen.
+//   * + tap -> UIImagePickerController, picked image becomes a new
+//     lock-screen via library.addLockScreenWithWallpaperImage.
+//   * Swipe-up on a card -> remove that lock-screen (library enforces
+//     a minimum of 1).
+//   * Swipe-down anywhere -> dismiss back to lockscreen.
 
 #import <UIKit/UIKit.h>
 
