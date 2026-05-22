@@ -159,10 +159,16 @@ static NSInteger lf_unitsForFamily(LFWidgetFamily f) {
     if (self.isEditing && self.usedUnits < kLFTrayMaxUnits) {
         // Use a circular empty slot for the trailing plus -- if the
         // user wants rectangular they pick it from inside the picker.
-        // Created lazily.
-        if (![[self valueForKey:@"_emptySlotCached"] isKindOfClass:[LFLockScreenWidgetSlot class]]) {
-            // no-op; handled below by viewWithTag fallback
-        }
+        // Created lazily on first edit-mode layout via the tag below;
+        // we don't keep a separate ivar/property because the view
+        // tree itself is the source of truth for "does the empty
+        // slot exist yet".
+        //
+        // (An earlier draft of this method probed `valueForKey:@"_emptySlotCached"`
+        // which was a non-existent KVC key -- on iOS 15 SpringBoard
+        // that throws NSUndefinedKeyException straight out of NSObject
+        // and the whole process crashes. Two of those crashes within
+        // 30s puts SpringBoard into safe mode. Removed.)
         LFLockScreenWidgetSlot *empty = (LFLockScreenWidgetSlot *)[self viewWithTag:0xEEFA];
         if (!empty) {
             empty = [[LFLockScreenWidgetSlot alloc] initWithFamily:LFWidgetFamilyCircular];
