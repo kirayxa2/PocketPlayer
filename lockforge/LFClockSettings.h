@@ -2,13 +2,18 @@
 //
 // Single source of truth for: font choice, color choice, scale (drag-resize
 // handle in iOS 26), explicit position offset, Liquid Glass intensity,
-// adaptive-color toggle. Read by LFClockOverlay every render frame, written
-// by LFLockEditor when the user finishes editing.
+// adaptive-color toggle, the inline widget that replaces the date pill,
+// AND the below-clock widget tray (slots + position).
 //
 // Backed by /var/mobile/Library/LockForge/clock.plist so settings persist
 // across SpringBoard respawns and tweak reloads.
 
 #import <UIKit/UIKit.h>
+
+// Pulled in for LFWidgetKind / LFWidgetFamily that the new tray + inline
+// fields use. Forward-declaring is enough but we want the enum values
+// to be visible to callers without a separate import.
+#import "LFLockScreenWidget.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -76,6 +81,15 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
     LFClockColorPink     = 6,
     LFClockColorCustom   = 7,  // freeform; reads customColorRGBA
     LFClockColorModeCount,
+};
+
+// Where the widget tray sits relative to the clock in iOS 26 customize
+// mode. Stored as an int in clock.plist so values are stable across
+// versions; only ever appended.
+typedef NS_ENUM(NSInteger, LFTrayPosition) {
+    LFTrayPositionUnderClock = 0,   // immediately below the clock-box
+    LFTrayPositionAtBottom   = 1,   // pinned just above the camera /
+                                    // flashlight affordances
 };
 
 @interface LFClockSettings : NSObject
@@ -156,6 +170,41 @@ typedef NS_ENUM(NSInteger, LFClockColorMode) {
 // (renders empty in custom mode -- the editor pre-fills with a
 // suggestion the first time the user enters custom mode).
 @property (nonatomic, copy) NSString *dateCustomText;
+
+// === Inline (date-pill) widget kind, iOS 26 expanded picker ==========
+//
+// The legacy `dateWidget` field above is a 4-value enum (Date / Battery
+// / DayCounter / CustomText). iOS 26's inline picker offers ~10
+// categories. We keep `dateWidget` for migration but the canonical
+// field is now `dateInlineKind`, an LFWidgetKind that maps onto the
+// catalog (LFWidgetKindDate, LFWidgetKindWeatherInline, ...).
+//
+// On load, if a plist is found that contains the legacy `dateWidget`
+// but no `dateInlineKind`, we migrate the value. Going forward the
+// editor writes to `dateInlineKind` only.
+@property (nonatomic, assign) LFWidgetKind dateInlineKind;
+
+// Per-inline-widget config dictionary. JSON-friendly types only
+// (string/number/bool/array/dict). For LFWidgetKindCustomText we
+// expect dateInlineConfig[@"text"] = NSString.
+@property (nonatomic, copy) NSDictionary *dateInlineConfig;
+
+// === iOS 26 widget tray (below the clock OR pinned to the bottom) ===
+// LFTrayPosition is declared at file scope above; only the property
+// itself lives inside the @interface.
+@property (nonatomic, assign) LFTrayPosition trayPosition;
+
+// The tray contents, persisted as a plist-friendly array. Each
+// element is an NSDictionary:
+//   {
+//     "kind":   <NSNumber: LFWidgetKind>,
+//     "family": <NSNumber: LFWidgetFamily>,
+//     "config": <NSDictionary or {}>
+//   }
+//
+// Total "units" capacity = 4. A circular slot is 1 unit; a
+// rectangular slot is 2 units. Editor enforces the cap when adding.
+@property (nonatomic, copy) NSArray<NSDictionary *> *traySlots;
 
 // Resolves the current settings to a concrete UIFont at the requested
 // reference height (in points). Used by LFClockOverlay each render.

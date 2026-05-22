@@ -1,6 +1,9 @@
 #import "LFLockEditor.h"
 #import "LFClockOverlay.h"
 #import "LFClockSettings.h"
+#import "LFLockScreenWidgetTray.h"
+#import "LFLockScreenWidgetPicker.h"
+#import "LFLockScreenWidgetCatalog.h"
 
 // =====================================================================
 // LFPassthroughView -- transparent container for the editor.
@@ -42,7 +45,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 // are always centred; the row served no purpose and just made the
 // panel taller than necessary.)
 
-@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate, UITextFieldDelegate>
+@interface LFLockEditor () <UICollectionViewDataSource, UICollectionViewDelegate, UIGestureRecognizerDelegate, UITextFieldDelegate, LFLockScreenWidgetTrayDelegate>
 @property (nonatomic, weak)   LFClockOverlay      *clockOverlay;
 @property (nonatomic, weak)   UIView              *clockOriginalParent;  // remember home for re-parenting on dismiss
 @property (nonatomic, strong) UIVisualEffectView  *dimmer;       // covers wallpaper
@@ -88,6 +91,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 // delegate can compare against them by identity (not just class) --
 // we want VERY specific behaviour for clock-tap vs outside-tap, see
 // gestureRecognizerShouldBegin:.
+@property (nonatomic, copy)   NSArray<LFLockScreenWidgetDescriptor *> *inlineDescriptors;
 @property (nonatomic, strong) UITapGestureRecognizer *clockTap;
 @property (nonatomic, strong) UITapGestureRecognizer *outsideTap;
 @end
@@ -116,6 +120,22 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
+
+    // Build the inline-descriptor list ONCE for use by the date-pill
+    // picker row. Drawn from the central catalog so adding a new
+    // inline widget kind shows up here automatically without editor-
+    // side code changes.
+    NSMutableArray *inl = [NSMutableArray array];
+    for (LFLockScreenWidgetDescriptor *d in [LFLockScreenWidgetCatalog allDescriptors]) {
+        for (NSNumber *n in d.supportedFamilies) {
+            if ([n integerValue] == LFWidgetFamilyInline) {
+                [inl addObject:d];
+                break;
+            }
+        }
+    }
+    _inlineDescriptors = inl;
+
     [self buildDimmer];
     [self buildBottomPanel];
 }
@@ -349,7 +369,10 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 }
 
 - (void)onCustomTextChanged {
-    [LFClockSettings shared].dateCustomText = _customTextField.text ?: @"";
+    NSString *t = _customTextField.text ?: @"";
+    LFClockSettings *s = [LFClockSettings shared];
+    s.dateCustomText = t;                                  // legacy field
+    s.dateInlineConfig = @{ @"text": t };                  // canonical field
     [_clockOverlay refreshFromSettings];
 }
 
@@ -398,8 +421,8 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     // and (conditionally) the custom-text field. Font + Color rows
     // are shared across both targets.
     BOOL isDate = (_activeTarget == kLFEditorTargetDate);
-    LFDateWidget dw = [LFClockSettings shared].dateWidget;
-    BOOL needsCustomField = (isDate && dw == LFDateWidgetCustomText);
+    LFWidgetKind inlineKind = [LFClockSettings shared].dateInlineKind;
+    BOOL needsCustomField = (isDate && inlineKind == LFWidgetKindCustomText);
 
     _modeToggleContainer.hidden  = isDate;
     _dateWidgetPickerRow.hidden  = !isDate;
@@ -649,6 +672,17 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
 
 - (void)dismissEditor {
     _clockOverlay.isEditing = NO;
+
+    // Detach ourselves from the widget tray so it stops calling our
+    // picker handlers after we've animated away. The tray itself
+    // stays in the cover-sheet view tree to render the live widgets;
+    // its `isEditing` flips to NO via clockOverlay.isEditing setter.
+    UIView *trayCandidate = _clockOverlay.widgetTray;
+    if ([trayCandidate isKindOfClass:[LFLockScreenWidgetTray class]]) {
+        LFLockScreenWidgetTray *tray = (LFLockScreenWidgetTray *)trayCandidate;
+        if (tray.delegate == (id)self) tray.delegate = nil;
+    }
+
     __weak __typeof(self) weakSelf = self;
     [UIView animateWithDuration:0.25 animations:^{
         self.view.alpha = 0;
@@ -741,6 +775,19 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     [self installEditorTapRecognizers];
 
     _clockOverlay.isEditing = YES;
+
+    // Wire ourselves as the widget tray's delegate. The tray was
+    // created lazily by the clock overlay and lives in the cover-
+    // sheet's view tree (not inside our editor view), but the editor
+    // is the right place to handle picker presentation since the
+    // alert/UIViewController API needs a presenter.
+    UIView *trayCandidate = _clockOverlay.widgetTray;
+    if ([trayCandidate isKindOfClass:[LFLockScreenWidgetTray class]]) {
+        LFLockScreenWidgetTray *tray = (LFLockScreenWidgetTray *)trayCandidate;
+        tray.delegate  = self;
+        tray.isEditing = YES;
+    }
+
     [UIView animateWithDuration:0.25 animations:^{
         self.view.alpha = 1;
     }];
@@ -752,7 +799,7 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
      numberOfItemsInSection:(NSInteger)section {
     if (cv.tag == 1) return LFClockFontCount;
     if (cv.tag == 2) return LFClockColorModeCount;
-    if (cv.tag == 3) return LFDateWidgetCount;
+    if (cv.tag == 3) return _inlineDescriptors.count;
     return 0;
 }
 
@@ -812,15 +859,33 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
                                                                    forIndexPath:idx];
         for (UIView *v in cell.contentView.subviews) [v removeFromSuperview];
 
+        // Cells now mirror the iOS 26 inline picker: each cell shows
+        // a small SF Symbol icon next to the descriptor display name.
+        // Selected cell is highlighted with the same chrome treatment
+        // the legacy enum-based picker used.
+        LFLockScreenWidgetDescriptor *d = _inlineDescriptors[idx.item];
+
+        UIImageView *iv = [UIImageView new];
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.tintColor   = [UIColor whiteColor];
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration
+                configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
+            iv.image = [UIImage systemImageNamed:d.sfSymbolName
+                              withConfiguration:cfg];
+        }
+        iv.frame = CGRectMake(8, (cell.contentView.bounds.size.height - 16) / 2.0, 16, 16);
+        [cell.contentView addSubview:iv];
+
         UILabel *lab = [UILabel new];
-        lab.text          = [self dateWidgetTitleForIndex:idx.item];
-        lab.font          = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+        lab.text          = d.displayName;
+        lab.font          = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
         lab.textAlignment = NSTextAlignmentCenter;
         lab.textColor     = [UIColor whiteColor];
-        lab.frame         = cell.contentView.bounds;
+        lab.frame         = CGRectMake(28, 0, cell.contentView.bounds.size.width - 36, cell.contentView.bounds.size.height);
         [cell.contentView addSubview:lab];
 
-        BOOL selected = (idx.item == [LFClockSettings shared].dateWidget);
+        BOOL selected = ((LFWidgetKind)d.kind == [LFClockSettings shared].dateInlineKind);
         cell.contentView.backgroundColor =
             selected ? [UIColor colorWithWhite:1.0 alpha:0.18]
                      : [UIColor colorWithWhite:0.0 alpha:0.30];
@@ -835,20 +900,11 @@ static const CGFloat kLFPanelBotPad     = 16;  // breathing room above safe area
     return [UICollectionViewCell new];
 }
 
-// Localized labels for the four built-in single-line date widgets.
-// Free-standing helper so adding a new case (Phase 2: Calendar /
-// Reminders / Astronomy) only needs ONE switch update here -- the
-// rest of the picker plumbing handles count + state automatically
-// via LFDateWidgetCount.
-- (NSString *)dateWidgetTitleForIndex:(NSInteger)i {
-    switch (i) {
-        case LFDateWidgetDate:        return @"Date";
-        case LFDateWidgetBattery:     return @"Battery";
-        case LFDateWidgetDayCounter:  return @"Day";
-        case LFDateWidgetCustomText:  return @"Custom";
-        default:                      return @"";
-    }
-}
+// Per-cell display strings for the inline-kind picker now come from
+// catalog descriptors (`LFLockScreenWidgetCatalog allDescriptors`),
+// not a hardcoded switch -- adding a new inline kind to the catalog
+// shows up here automatically. The legacy +dateWidgetTitleForIndex:
+// helper used for the 4-value LFDateWidget enum has been retired.
 
 - (void)collectionView:(UICollectionView *)cv
 didSelectItemAtIndexPath:(NSIndexPath *)idx {
@@ -857,18 +913,37 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     } else if (cv.tag == 2) {
         [LFClockSettings shared].colorMode = (LFClockColorMode)idx.item;
     } else if (cv.tag == 3) {
-        [LFClockSettings shared].dateWidget = (LFDateWidget)idx.item;
-        // Selecting Custom shows the text field; any other widget
-        // hides it. Trigger a layout pass so the panel resizes.
+        // Inline picker: write to dateInlineKind, preserve any
+        // existing config dict where it makes sense (e.g. user re-
+        // selecting CustomText shouldn't clear their saved string).
+        LFLockScreenWidgetDescriptor *d = _inlineDescriptors[idx.item];
+        LFClockSettings *s = [LFClockSettings shared];
+        s.dateInlineKind = d.kind;
+        if (d.kind != LFWidgetKindCustomText) {
+            s.dateInlineConfig = @{};
+        }
+        // Keep the legacy dateWidget enum loosely in sync so older
+        // tweak builds rollback-loaded against this plist still see
+        // a sensible value.
+        switch (d.kind) {
+            case LFWidgetKindBatteryInline:   s.dateWidget = LFDateWidgetBattery;     break;
+            case LFWidgetKindDayCounter:      s.dateWidget = LFDateWidgetDayCounter;  break;
+            case LFWidgetKindCustomText:      s.dateWidget = LFDateWidgetCustomText;  break;
+            default:                          s.dateWidget = LFDateWidgetDate;        break;
+        }
+
+        // Layout pass so the custom-text field appears/disappears
+        // depending on the new kind.
         [self.view setNeedsLayout];
         [UIView animateWithDuration:0.20 animations:^{
             [self.view layoutIfNeeded];
         }];
         // Pre-fill the field with the saved text so the user can
         // edit on entry rather than retyping.
-        if ((LFDateWidget)idx.item == LFDateWidgetCustomText) {
+        if (d.kind == LFWidgetKindCustomText) {
             _customTextField.text =
-                [LFClockSettings shared].dateCustomText ?: @"";
+                ([LFClockSettings shared].dateInlineConfig[@"text"]
+                 ?: [LFClockSettings shared].dateCustomText) ?: @"";
         }
     }
     [_clockOverlay refreshFromSettings];
@@ -891,6 +966,67 @@ didSelectItemAtIndexPath:(NSIndexPath *)idx {
     UIColor *c = [[LFClockSettings shared] resolvedColorForBackgroundLuminance:nil];
     [LFClockSettings shared].colorMode = saved;
     return c;
+}
+
+#pragma mark - LFLockScreenWidgetTrayDelegate
+
+// Tray asks us to present the picker. We instantiate
+// LFLockScreenWidgetPicker, present it modally over our own view, and
+// on completion call back into the tray + persist settings.
+- (void)trayDidRequestPicker:(LFLockScreenWidgetTray *)tray
+                       family:(LFWidgetFamily)family {
+    __weak __typeof(self) ws = self;
+    LFLockScreenWidgetPicker *picker = [[LFLockScreenWidgetPicker alloc]
+        initForFamily:family
+            completion:^(LFWidgetKind kind, LFWidgetFamily fam, NSDictionary *cfg) {
+        __strong __typeof(self) ss = ws;
+        if (!ss || !cfg) return;     // user cancelled
+        BOOL ok = [tray addWidgetWithKind:kind family:fam config:cfg];
+        if (ok) {
+            // Persist to settings.traySlots so the layout survives a
+            // SpringBoard respawn. -trayDidUpdateContents: also fires
+            // when an internal slot is removed; we re-serialize there
+            // too.
+            [LFClockSettings shared].traySlots = [tray serializedSlots];
+            [[LFClockSettings shared] save];
+        } else {
+            // Tray refused (capacity exceeded). Friendly inline
+            // explanation; a heavy modal alert would be overkill.
+            UIAlertController *a = [UIAlertController
+                alertControllerWithTitle:@"Tray Full"
+                                 message:@"There's no room for that widget. Remove an existing one first."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+            [ss presentViewController:a animated:YES completion:nil];
+        }
+    }];
+    [picker presentFromViewController:self];
+}
+
+- (void)trayDidUpdateContents:(LFLockScreenWidgetTray *)tray {
+    [LFClockSettings shared].traySlots = [tray serializedSlots];
+    [[LFClockSettings shared] save];
+}
+
+// User pan'd the tray vertically. iOS 26 lets the user drag the tray
+// from under-clock to bottom-of-screen and snap. We track translation
+// while the gesture is in flight (no-op visually -- the tray's frame
+// is not driven by the pan in this iteration), and on release we
+// snap to whichever edge the cumulative drag is closer to.
+- (void)tray:(LFLockScreenWidgetTray *)tray
+   didDragWithTranslationY:(CGFloat)dy
+                     ended:(BOOL)ended {
+    if (!ended) return;
+    LFTrayPosition cur  = [LFClockSettings shared].trayPosition;
+    LFTrayPosition want = cur;
+    if (cur == LFTrayPositionUnderClock && dy >  60.0) want = LFTrayPositionAtBottom;
+    if (cur == LFTrayPositionAtBottom   && dy < -60.0) want = LFTrayPositionUnderClock;
+    if (want == cur) return;
+    [LFClockSettings shared].trayPosition = want;
+    [[LFClockSettings shared] save];
+    [_clockOverlay refreshFromSettings];
 }
 
 @end

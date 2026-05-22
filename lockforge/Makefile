@@ -25,7 +25,23 @@ LockForge_FILES = \
     LFGyroscopeManager.m \
     LFClockOverlay.m \
     LFLockEditor.m \
-    LFLockScreenSelector.m
+    LFLockScreenSelector.m \
+    LFLockScreenWidget.m \
+    LFLockScreenWidgetCatalog.m \
+    LFLockScreenWidgetSlot.m \
+    LFLockScreenWidgetTray.m \
+    LFLockScreenWidgetPicker.m \
+    LFOpenMeteoClient.m \
+    LFLocationService.m \
+    LFWidgetBattery.m \
+    LFWidgetWeather.m \
+    LFWidgetMusic.m \
+    LFWidgetCalendar.m \
+    LFWidgetMoonPhase.m \
+    LFWidgetSteps.m \
+    LFWidgetWorldClock.m \
+    LFWidgetReminders.m \
+    LFWidgetInline.m
 
 LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
 # CoreText: registers the bundled ADTNumeric.ttc (Apple's iOS 26 Adaptive-
@@ -44,8 +60,24 @@ LockForge_CFLAGS      = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-vari
 #
 # CoreVideo: CVPixelBuffer + CVMetalTextureCache for the zero-copy
 # CGContext<->MTLTexture bridge (mirrors LiquidGlassKit's ZeroCopyBridge).
+#
+# CoreLocation: iOS 26 Weather widget needs lat/lon for the Open-Meteo
+# API call. We attempt CLLocationManager first (SpringBoard already has
+# location entitlements) and fall back to ipapi.co IP geolocation when
+# CL is denied or quiet. See LFLocationService for the full path.
+#
+# MediaPlayer: MPNowPlayingInfoCenter for the Music / Now Playing
+# widgets. iOS 15-era API, available system-wide without permission.
+#
+# EventKit: EKEventStore for Calendar + Reminders widgets. Both kinds
+# request permission via prompt on first use.
+#
+# CoreMotion was already linked for LFGyroscopeManager (parallax shimmer
+# on the Liquid Glass digits); the same framework provides CMPedometer
+# for the Steps widget.
 LockForge_FRAMEWORKS  = UIKit QuartzCore Foundation CoreGraphics CoreMotion CoreText \
-                       Metal MetalKit MetalPerformanceShaders CoreVideo
+                       Metal MetalKit MetalPerformanceShaders CoreVideo \
+                       CoreLocation MediaPlayer EventKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

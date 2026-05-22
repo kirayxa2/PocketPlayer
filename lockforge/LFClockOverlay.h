@@ -44,6 +44,14 @@ NS_ASSUME_NONNULL_BEGIN
 // identical-width selection rectangles.
 @property (nonatomic, strong, readonly) UIView *datePillView;
 
+// Below-clock widget tray. Owned by the overlay so its lifecycle is
+// tied to the clock's, but the tray view is REPARENTED into the
+// overlay's superview when -didMoveToSuperview fires -- the tray
+// needs to sit either right under the clock OR at the bottom of the
+// screen depending on settings.trayPosition, both of which require
+// freedom from the overlay's bounds.
+@property (nonatomic, strong, readonly) UIView *widgetTray;
+
 // Frame of the date pill in self's coordinate space. Editor's tap
 // handler uses this to discriminate "tap on date pill" vs "tap on
 // clock body" within a single tap recognizer.

@@ -36,6 +36,10 @@ static NSString *const kLFSettingsPath =
     _gyroEffectsEnabled   = YES;
     _dateWidget           = LFDateWidgetDate;
     _dateCustomText       = @"";
+    _dateInlineKind       = LFWidgetKindDate;
+    _dateInlineConfig     = @{};
+    _trayPosition         = LFTrayPositionUnderClock;
+    _traySlots            = @[];
 }
 
 - (UIFont *)resolvedFontForReferenceSize:(CGFloat)refSize {
@@ -183,6 +187,46 @@ static NSString *const kLFSettingsPath =
     if (d[@"gyroEffectsEnabled"])   _gyroEffectsEnabled   = [d[@"gyroEffectsEnabled"]   boolValue];
     if (d[@"dateWidget"])           _dateWidget           = (LFDateWidget)[d[@"dateWidget"] integerValue];
     if (d[@"dateCustomText"])       _dateCustomText       = d[@"dateCustomText"];
+
+    // === Migration & load of the iOS 26 inline-kind / widget-tray fields.
+    if (d[@"dateInlineKind"]) {
+        _dateInlineKind = (LFWidgetKind)[d[@"dateInlineKind"] integerValue];
+    } else {
+        // Legacy plist: project the 4-value LFDateWidget enum onto the
+        // canonical LFWidgetKind so the user keeps their selection.
+        switch (_dateWidget) {
+            case LFDateWidgetDate:        _dateInlineKind = LFWidgetKindDate;          break;
+            case LFDateWidgetBattery:     _dateInlineKind = LFWidgetKindBatteryInline; break;
+            case LFDateWidgetDayCounter:  _dateInlineKind = LFWidgetKindDayCounter;    break;
+            case LFDateWidgetCustomText:  _dateInlineKind = LFWidgetKindCustomText;    break;
+            default:                      _dateInlineKind = LFWidgetKindDate;          break;
+        }
+    }
+    if ([d[@"dateInlineConfig"] isKindOfClass:[NSDictionary class]]) {
+        _dateInlineConfig = d[@"dateInlineConfig"];
+    } else if (_dateInlineKind == LFWidgetKindCustomText &&
+               _dateCustomText.length) {
+        // Migrate legacy custom text into the inline-config dict.
+        _dateInlineConfig = @{ @"text": _dateCustomText };
+    }
+    if (d[@"trayPosition"]) {
+        _trayPosition = (LFTrayPosition)[d[@"trayPosition"] integerValue];
+    }
+    if ([d[@"traySlots"] isKindOfClass:[NSArray class]]) {
+        // Sanity-validate each slot dict before keeping it -- a bad
+        // plist shouldn't crash the tweak.
+        NSMutableArray *clean = [NSMutableArray array];
+        for (NSDictionary *e in d[@"traySlots"]) {
+            if (![e isKindOfClass:[NSDictionary class]]) continue;
+            if (!e[@"kind"] || !e[@"family"]) continue;
+            NSDictionary *cfg = e[@"config"];
+            if (![cfg isKindOfClass:[NSDictionary class]]) cfg = @{};
+            [clean addObject:@{ @"kind":   e[@"kind"],
+                                @"family": e[@"family"],
+                                @"config": cfg }];
+        }
+        _traySlots = clean;
+    }
 }
 
 - (void)save {
@@ -206,6 +250,10 @@ static NSString *const kLFSettingsPath =
         @"gyroEffectsEnabled":   @(_gyroEffectsEnabled),
         @"dateWidget":           @(_dateWidget),
         @"dateCustomText":       _dateCustomText ?: @"",
+        @"dateInlineKind":       @(_dateInlineKind),
+        @"dateInlineConfig":     _dateInlineConfig ?: @{},
+        @"trayPosition":         @(_trayPosition),
+        @"traySlots":            _traySlots ?: @[],
     };
     [d writeToFile:kLFSettingsPath atomically:YES];
 }

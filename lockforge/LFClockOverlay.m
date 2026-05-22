@@ -2,6 +2,8 @@
 #import "LFClockSettings.h"
 #import "LFLiquidGlassView.h"
 #import "LFGyroscopeManager.h"
+#import "LFLockScreenWidgetTray.h"
+#import "LFWidgetInline.h"
 #import <CoreText/CoreText.h>
 
 // Reference digit size at scale=1.0. Matches the size Apple uses on a
@@ -154,6 +156,7 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
 }
 @property (nonatomic, strong, readwrite) LFLiquidGlassView *glassBackground;
 @property (nonatomic, strong, readwrite) UIView            *datePillView;
+@property (nonatomic, strong, readwrite) UIView            *widgetTray;
 // Selection box: rounded-rect chrome that wraps the time digits.
 // Always present as a layout container (so the time has a stable
 // local coord system), but the visible border only appears in edit
@@ -280,6 +283,17 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     [_selectionBoxView addSubview:_timeLabel];
 
     [self buildResizeHandle];
+
+    // Widget tray. Created here but parented to the overlay's
+    // superview in -didMoveToSuperview so it can occupy areas of
+    // the screen that lie outside the overlay's own bounds (e.g.
+    // pinned at the bottom of the lockscreen above the camera /
+    // flashlight buttons). This mirrors how iOS 26 lets the user
+    // drag the tray to the bottom of the screen.
+    LFLockScreenWidgetTray *tray = [[LFLockScreenWidgetTray alloc]
+        initWithFrame:CGRectZero];
+    [tray reloadFromSlotDictionaries:[LFClockSettings shared].traySlots];
+    _widgetTray = tray;
 }
 
 // 44pt invisible touch view + a CAShapeLayer arc drawn directly on
@@ -775,6 +789,11 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     // every recomputeMetrics ensures resize, font swaps, and minute
     // changes all converge to the same fixed top.
     [self centerInParentApplyingSettings];
+
+    // Tray placement depends on overlay frame (under-clock position
+    // anchors to the overlay bottom) -- recompute every time geometry
+    // changes so the tray follows the clock when it grows downward.
+    [self repositionWidgetTray];
 }
 
 // Apply the clock's DEFAULT iOS 16/26 position. The clock is locked to
@@ -825,6 +844,23 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
         // parent's bounds are known. The init pass used a 393pt
         // fallback because superview was still nil at that point.
         [self recomputeMetrics];
+
+        // Mount the widget tray as a sibling of self in the
+        // superview, behind self in z-order so the clock's chrome
+        // is always on top of any tray content. This is what gives
+        // the iOS 26 "tray pinned to the bottom of the screen even
+        // though the clock is at the top" behaviour -- the tray's
+        // frame is computed in superview coords without dragging
+        // the clock's bounds along with it.
+        if (_widgetTray && _widgetTray.superview != self.superview) {
+            [_widgetTray removeFromSuperview];
+            [self.superview insertSubview:_widgetTray belowSubview:self];
+            [self repositionWidgetTray];
+        }
+    } else if (_widgetTray) {
+        // Detached from screen -- pull the tray with us so it doesn't
+        // leak into a stale superview.
+        [_widgetTray removeFromSuperview];
     }
 }
 
@@ -834,6 +870,9 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     if (_isEditing == e) return;
     _isEditing = e;
     [self recomputeMetrics];
+    if ([_widgetTray respondsToSelector:@selector(setIsEditing:)]) {
+        ((LFLockScreenWidgetTray *)_widgetTray).isEditing = e;
+    }
 }
 
 #pragma mark - Refresh from settings
@@ -842,6 +881,54 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
     [self updateTimeText];
     [self recomputeMetrics];
     [self centerInParentApplyingSettings];
+
+    // Pull the latest tray slot list from settings. Cheap to do here
+    // -- editor mutations call refreshFromSettings after each picker
+    // confirmation, so the live tray stays in sync with disk.
+    if ([_widgetTray respondsToSelector:@selector(reloadFromSlotDictionaries:)]) {
+        [(LFLockScreenWidgetTray *)_widgetTray
+            reloadFromSlotDictionaries:[LFClockSettings shared].traySlots];
+        [self repositionWidgetTray];
+    }
+}
+
+// Position the tray either right under the clock OR pinned to the
+// bottom-area of the parent (above the camera/flashlight affordances
+// that sit ~110pt above the safe-area bottom). Read once per
+// recomputeMetrics so vertical-stretch resize keeps the tray flush
+// against the bottom of the (now taller) clock-box when the user is
+// in the under-clock position.
+- (void)repositionWidgetTray {
+    UIView *parent = self.superview;
+    if (!parent || !_widgetTray) return;
+    LFLockScreenWidgetTray *tray = (LFLockScreenWidgetTray *)_widgetTray;
+    CGSize natural = tray.naturalSize;
+    if (natural.width < 1 || natural.height < 1) {
+        tray.hidden = YES;
+        return;
+    }
+    tray.hidden = NO;
+    LFTrayPosition pos = [LFClockSettings shared].trayPosition;
+    CGFloat parentW = parent.bounds.size.width;
+    CGFloat parentH = parent.bounds.size.height;
+    UIEdgeInsets safe = parent.safeAreaInsets;
+
+    CGFloat trayY;
+    if (pos == LFTrayPositionAtBottom) {
+        // ~110pt of bottom-strip is reserved for camera/flashlight on
+        // iPhone X+ and the home-indicator. iPhone 6s has none of
+        // those affordances but the tray still reads better with a
+        // generous margin.
+        trayY = parentH - safe.bottom - 110.0 - natural.height;
+    } else {
+        // Just below the clock-overlay's frame, with a comfortable
+        // gap so the tray doesn't kiss the selection-box border.
+        trayY = CGRectGetMaxY(self.frame) + 12.0;
+    }
+    CGRect f = CGRectMake((parentW - natural.width) / 2.0,
+                          trayY,
+                          natural.width, natural.height);
+    tray.frame = f;
 }
 
 - (void)updateTimeText {
@@ -882,61 +969,19 @@ static UIFont *lf_makeAdaptiveNumericFont(CGFloat size,
 // other contexts use sentence-case).
 - (NSString *)resolvedDateWidgetTextForDate:(NSDate *)now
                                   formatter:(NSDateFormatter *)dateFmt {
+    // The legacy resolver lived here when LFDateWidget was a 4-value
+    // enum (Date/Battery/Day/Custom). The catalog now exposes ~10
+    // inline kinds matching iOS 26's expanded inline picker; settings
+    // store the chosen kind in `dateInlineKind` (with migration from
+    // `dateWidget` happening at load time, see LFClockSettings.m).
+    //
+    // We delegate to LFWidgetInline's class-level resolver so any new
+    // inline kind we add to the catalog (Stocks, Sports, Apple TV...)
+    // is picked up automatically without touching this method.
     LFClockSettings *s = [LFClockSettings shared];
-    switch (s.dateWidget) {
-        case LFDateWidgetDate:
-        default: {
-            return [[dateFmt stringFromDate:now] localizedUppercaseString];
-        }
-        case LFDateWidgetBattery: {
-            UIDevice *dev = [UIDevice currentDevice];
-            // Apple gates batteryLevel behind `batteryMonitoringEnabled`.
-            // Turn it on lazily on first read; cheap, no observable
-            // side-effects on SpringBoard performance.
-            if (!dev.batteryMonitoringEnabled) {
-                dev.batteryMonitoringEnabled = YES;
-            }
-            float lvl = dev.batteryLevel;
-            if (lvl < 0) {
-                // Either monitoring still off, or simulator. Show a
-                // clear placeholder rather than 0% which would scare
-                // the user.
-                return @"BATTERY";
-            }
-            int pct = (int)roundf(lvl * 100.0f);
-            UIDeviceBatteryState state = dev.batteryState;
-            if (state == UIDeviceBatteryStateCharging ||
-                state == UIDeviceBatteryStateFull) {
-                return [NSString stringWithFormat:@"CHARGING %d%%", pct];
-            }
-            return [NSString stringWithFormat:@"BATTERY %d%%", pct];
-        }
-        case LFDateWidgetDayCounter: {
-            // Day-of-year in the current calendar. ordinalityOfUnit
-            // returns NSNotFound for some weird calendars; cheap to
-            // guard against.
-            NSCalendar *cal = [NSCalendar currentCalendar];
-            NSUInteger dayOfYear = [cal ordinalityOfUnit:NSCalendarUnitDay
-                                                  inUnit:NSCalendarUnitYear
-                                                 forDate:now];
-            NSDateComponents *yc = [cal components:NSCalendarUnitYear fromDate:now];
-            NSRange r = [cal rangeOfUnit:NSCalendarUnitDay
-                                  inUnit:NSCalendarUnitYear
-                                 forDate:now];
-            NSUInteger total = (r.length == NSNotFound) ? 365 : r.length;
-            if (dayOfYear == NSNotFound) dayOfYear = 1;
-            return [NSString stringWithFormat:@"DAY %lu OF %lu",
-                    (unsigned long)dayOfYear, (unsigned long)total];
-        }
-        case LFDateWidgetCustomText: {
-            NSString *t = s.dateCustomText ?: @"";
-            // Trim to a sane length so an over-long custom string
-            // can't push the pill beyond the screen edges. 60 chars
-            // covers any reasonable line.
-            if (t.length > 60) t = [t substringToIndex:60];
-            return t.length ? [t localizedUppercaseString] : @"CUSTOM";
-        }
-    }
+    NSString *txt = [LFWidgetInline resolvedTextForKind:s.dateInlineKind
+                                                  config:s.dateInlineConfig];
+    return txt.length ? txt : [[dateFmt stringFromDate:now] localizedUppercaseString];
 }
 
 - (void)applyAdaptiveColorWithBackgroundImage:(UIImage *)bgImage {
