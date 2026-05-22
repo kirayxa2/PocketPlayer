@@ -1,4 +1,5 @@
 #import "LFLockScreenWidget.h"
+#import <CoreText/SFNTLayoutTypes.h>
 
 @implementation LFLockScreenWidgetDescriptor
 @end
